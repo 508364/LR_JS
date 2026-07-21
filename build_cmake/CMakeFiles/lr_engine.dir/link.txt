@@ -1,2 +1,0 @@
-/usr/bin/ar qc lib/liblr_engine.a CMakeFiles/lr_engine.dir/src/engine/lr_engine.c.o CMakeFiles/lr_engine.dir/src/engine/lr_lexer.c.o CMakeFiles/lr_engine.dir/src/engine/lr_parser.c.o CMakeFiles/lr_engine.dir/src/engine/lr_interp.c.o
-/usr/bin/ranlib lib/liblr_engine.a
