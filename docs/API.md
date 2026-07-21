@@ -1,0 +1,1676 @@
+# L/R_JS API Reference
+
+> 全功能轻量级浏览器 JS 运行器 | Pure C | ES2022+ | Multithreaded | Async Sandbox
+
+---
+
+## 1. 概述
+
+L/R_JS 是一个用纯 C 语言实现的轻量级浏览器 JavaScript 运行器，支持 ES2022+ 特性，提供多线程、多任务、异步沙箱执行环境，内建高性能 JS 引擎。
+
+### 1.1 支持平台
+
+| 平台 | 架构 | 编译器 | 最低版本 |
+|------|------|--------|----------|
+| **Linux** | x86_64, aarch64, armv7 | GCC 9+, Clang 12+ | kernel 3.10+ |
+| **macOS** | x86_64, arm64 (Apple Silicon) | Clang 14+ | macOS 11+ |
+| **Windows** | x86_64, aarch64 | MSVC 2022+, MinGW-w64 | Windows 10+ |
+| **FreeBSD** | x86_64, aarch64 | Clang 14+ | FreeBSD 13+ |
+| **OpenBSD** | x86_64, aarch64 | Clang 14+ | OpenBSD 7.0+ |
+| **NetBSD** | x86_64, aarch64 | GCC 10+ | NetBSD 9.0+ |
+| **Android** | aarch64, armv7, x86_64 | NDK r25+ | API 24+ |
+| **iOS** | arm64 | Xcode 15+ | iOS 14+ |
+
+### 1.2 通过条件编译支持跨平台
+
+```c
+// 内存检测
+#ifdef __linux__
+    // /proc/meminfo
+#elif defined(__APPLE__)
+    // sysctl
+#elif defined(_WIN32)
+    // GlobalMemoryStatusEx
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    // sysctl
+#endif
+
+// UUID 生成
+#ifdef _WIN32
+    // CryptGenRandom
+#else
+    // /dev/urandom
+#endif
+
+// 文件系统
+#ifdef _WIN32
+    #define lr_mkdir(p) _mkdir(p)
+#else
+    #define lr_mkdir(p) mkdir(p, 0755)
+#endif
+```
+
+---
+
+## 2. 快速开始
+
+### 2.1 命令行使用
+
+```bash
+# 基本用法
+./lr_js script.js
+./lr_js -e "console.log('Hello, L/R_JS!')"
+./lr_js --interactive       # 启动 REPL
+
+# 完整示例
+./lr_js \
+    --no-memory-check \
+    --gc-incremental \
+    --gc-pause-target 5 \
+    --bytecode-cache ./cache \
+    --sandbox-log ./logs \
+    --gc-stats \
+    --bytecode-stats \
+    script.js
+```
+
+### 2.2 C API 基本使用
+
+```c
+#include "lr_js.h"
+
+int main() {
+    // 1. 配置运行时
+    LR_Config cfg;
+    lr_config_default(&cfg);
+    cfg.memory_limit = 128 * 1024 * 1024;  // 128MB 堆限制
+    cfg.gc_incremental = 1;                // 启用增量 GC
+    cfg.bytecode_cache_dir = "./cache";    // 启用字节码缓存
+    cfg.skip_memory_check = 1;             // 跳过系统内存检查
+
+    // 2. 创建运行时
+    LR_Runtime *rt = lr_runtime_new(&cfg);
+    if (!rt) {
+        fprintf(stderr, "Failed to create runtime\n");
+        return 1;
+    }
+
+    // 3. 执行脚本
+    lr_eval(rt, "console.log('Hello!')", 20, "<eval>");
+    // 或执行文件
+    lr_eval_file(rt, "script.js");
+
+    // 4. 清理
+    lr_runtime_free(rt);
+    return 0;
+}
+```
+
+### 2.3 编译链接
+
+```bash
+# Linux / macOS / BSD
+gcc -o myapp myapp.c -I/path/to/LR_JS/include -L/path/to/LR_JS/build -llr_js -lpthread -ldl -lm
+
+# Windows (MSVC)
+cl myapp.c /I path\to\LR_JS\include /link path\to\LR_JS\build\lr_js.lib
+
+# Windows (MinGW)
+gcc -o myapp.exe myapp.c -I/path/to/LR_JS/include -L/path/to/LR_JS/build -llr_js -lpthread -lws2_32
+```
+
+---
+
+## 3. 核心 API
+
+### 3.1 运行时管理
+
+| 函数 | 说明 |
+|------|------|
+| `LR_Runtime *lr_runtime_new(LR_Config *cfg)` | 创建运行时 |
+| `void lr_runtime_free(LR_Runtime *rt)` | 销毁运行时 |
+| `const char *lr_version(void)` | 获取版本号 |
+
+### 3.2 脚本执行
+
+| 函数 | 说明 |
+|------|------|
+| `int lr_eval(rt, src, len, filename)` | 执行字符串脚本 |
+| `int lr_eval_file(rt, filename)` | 执行文件脚本 |
+| `int lr_eval_module(rt, src, len, filename)` | 执行 ES Module |
+| `int lr_eval_module_file(rt, filename)` | 执行 ES Module 文件 |
+
+### 3.3 事件循环
+
+| 函数 | 说明 |
+|------|------|
+| `int lr_event_loop_pending(rt)` | 检查是否有待处理任务 |
+| `void lr_event_loop_run(rt)` | 运行事件循环 |
+| `void lr_event_loop_stop(rt)` | 停止事件循环 |
+
+### 3.4 内存管理
+
+| 函数 | 说明 |
+|------|------|
+| `void lr_gc(rt)` | 手动触发 GC |
+| `void lr_gc_print_stats(rt, fp)` | 打印 GC 统计 |
+| `void lr_gc_reset_stats(rt)` | 重置 GC 统计 |
+| `void lr_compute_memory_usage(rt, usage)` | 获取内存使用详情 |
+| `void lr_dump_memory_usage(rt, fp)` | 打印内存使用详情 |
+| `int64_t lr_get_available_memory(void)` | 获取系统可用内存 |
+| `int lr_check_system_memory(min_bytes)` | 检查系统内存是否充足 |
+
+### 3.5 字节码缓存
+
+| 函数 | 说明 |
+|------|------|
+| `void lr_bytecode_cache_stats(rt, fp)` | 打印缓存统计 |
+| `void lr_bytecode_cache_clear(rt)` | 清空缓存 |
+
+### 3.6 错误处理
+
+| 函数 | 说明 |
+|------|------|
+| `int lr_get_last_error(rt, buf, size)` | 获取最后的错误信息 |
+| `void lr_clear_last_error(rt)` | 清除错误状态 |
+
+---
+
+## 4. 配置结构
+
+### 4.1 LR_Config
+
+```c
+typedef struct LR_Config {
+    // 内存
+    size_t  memory_limit;           // 最大堆内存 (bytes), 0=无限制
+    size_t  gc_threshold;           // 自动 GC 阈值, 0=默认
+    LR_GCMode gc_mode;             // GC 模式
+
+    // GC 调优
+    int     gc_generational;        // 启用分代 GC (默认 1)
+    int     gc_incremental;         // 启用增量 GC (默认 1)
+    size_t  gc_nursery_size;        // nursery 大小, 0=默认 4MB
+    int64_t gc_pause_target_ns;     // 目标最大暂停, 0=默认 5ms
+
+    // 字节码缓存
+    char   *bytecode_cache_dir;     // .lrfile 缓存目录, NULL=禁用
+
+    // 沙箱日志
+    char   *sandbox_log_dir;        // 沙箱日志目录, NULL=禁用
+
+    // 系统内存
+    size_t  min_system_memory;      // 最小系统可用内存, 0=禁用
+    int     skip_memory_check;      // 跳过系统内存检查
+
+    // 栈
+    size_t  max_stack_size;         // 最大栈大小, 0=默认 1MB
+
+    // 执行
+    int     timeout_ms;             // 执行超时, 0=无限制
+    int     strict_mode;            // 严格模式
+    int     debug_mode;             // 调试模式
+
+    // 日志
+    int     log_level;              // 日志级别: 0=关闭, 1=错误, 2=警告, 3=信息, 4=调试
+    FILE   *log_file;               // 日志输出文件, NULL=stderr
+
+    // 编译
+    int     dump_bytecode;          // 导出字节码
+    int     strip_debug_info;       // 剥离调试信息
+} LR_Config;
+```
+
+### 4.2 GC 模式
+
+```c
+typedef enum {
+    LR_GC_MODE_AUTO          = 0,  // 自动 GC
+    LR_GC_MODE_MANUAL        = 1,  // 手动 GC
+    LR_GC_MODE_STRESS        = 2,  // 压力测试 (每次分配后 GC)
+    LR_GC_MODE_GENERATIONAL  = 3,  // 分代 GC (nursery + old gen)
+    LR_GC_MODE_INCREMENTAL   = 4,  // 增量 GC (时间切片 + 分代)
+} LR_GCMode;
+```
+
+### 4.3 内存使用
+
+```c
+typedef struct LR_MemoryUsage {
+    int64_t malloc_size;          // 已分配内存
+    int64_t malloc_limit;         // 内存限制
+    int64_t memory_used_size;     // 已使用内存
+    int64_t memory_used_count;    // 使用中的块数
+    int64_t atom_count;           // 原子数
+    int64_t atom_size;            // 原子大小
+    int64_t str_count;            // 字符串数
+    int64_t str_size;             // 字符串大小
+    int64_t obj_count;            // 对象数
+    int64_t obj_size;             // 对象大小
+    int64_t prop_count;           // 属性数
+    int64_t prop_size;            // 属性大小
+    int64_t shape_count;          // 形状数
+    int64_t shape_size;           // 形状大小
+    int64_t js_func_count;        // JS 函数数
+    int64_t js_func_size;         // JS 函数大小
+    int64_t js_func_code_size;    // JS 函数代码大小
+    int64_t js_func_pc2line_count;// 行号映射条目
+    int64_t js_func_pc2line_size; // 行号映射大小
+    int64_t c_func_count;         // C 函数数
+    int64_t array_count;          // 数组数
+    int64_t fast_array_count;     // 快速数组数
+    int64_t fast_array_elements;  // 快速数组元素数
+    int64_t binary_object_count;  // 二进制对象数
+    int64_t binary_object_size;   // 二进制对象大小
+} LR_MemoryUsage;
+```
+
+---
+
+## 5. 沙箱 API
+
+### 5.1 沙箱管理器
+
+```c
+#include "lr_sandbox.h"
+#include "lr_sandbox_log.h"
+
+// 创建沙箱管理器
+LR_SandboxManager *mgr = lr_sandbox_manager_create(16);  // 最多 16 个沙箱
+
+// 销毁沙箱管理器
+lr_sandbox_manager_destroy(mgr);
+```
+
+### 5.2 沙箱配置
+
+```c
+typedef struct LR_SandboxConfig {
+    char   *name;              // 沙箱名称
+    char   *log_dir;           // 日志目录 (NULL=禁用)
+    size_t  memory_limit;      // 堆限制, 0=继承
+    size_t  stack_size;        // 栈大小, 0=默认
+    int     timeout_ms;        // 超时, 0=无限制
+    int     max_eval_depth;    // 最大嵌套深度
+    int     allow_network;     // 允许网络 API
+    int     allow_filesystem;  // 允许文件 API
+    int     allow_workers;     // 允许 Worker
+    int     isolated_context;  // 隔离上下文
+} LR_SandboxConfig;
+```
+
+### 5.3 沙箱操作
+
+```c
+// 创建沙箱
+LR_SandboxConfig cfg = {
+    .name = "my-sandbox",
+    .log_dir = "./sandbox_logs",     // 启用日志
+    .memory_limit = 64 * 1024 * 1024,
+    .timeout_ms = 5000,
+    .allow_network = 0,
+    .isolated_context = 1,
+};
+LR_Sandbox *sb = lr_sandbox_create(mgr, &cfg);
+
+// 获取 UUID
+printf("Sandbox UUID: %s\n", sb->uuid);
+// 输出: Sandbox UUID: a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6
+
+// 执行脚本
+lr_sandbox_eval(sb, "console.log('sandbox running')", 30, "<sandbox>");
+
+// 获取状态
+LR_SandboxState state = lr_sandbox_get_state(sb);
+
+// 销毁沙箱
+lr_sandbox_destroy(mgr, sb);
+```
+
+### 5.4 沙箱日志系统
+
+每个沙箱自动获得独立的日志文件：
+
+```
+{sandbox_log_dir}/{YYYY-MM-DD}-{run_count}-{uuid}.log
+```
+
+示例：
+```
+./sandbox_logs/2026-07-19-3-a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6.log
+```
+
+日志格式：
+```
+[2026-07-19 14:30:25.123456] [INFO ] [eval:1] Sandbox created: my-sandbox (uuid=a1b2c3d4-...)
+[2026-07-19 14:30:25.234567] [INFO ] [eval:1] Eval started: <sandbox>
+[2026-07-19 14:30:25.245678] [INFO ] [eval:1] Eval completed in 11.11 ms
+[2026-07-19 14:30:30.123456] [INFO ] [eval:2] Eval started: <sandbox>
+[2026-07-19 14:30:30.234567] [ERROR] [eval:2] Eval failed after 111.11 ms: <sandbox>
+```
+
+日志 API：
+```c
+// 写入日志 (线程安全, 非阻塞)
+lr_slog_info(sb->log, eval_id, "Custom message: %s", "value");
+lr_slog_error(sb->log, eval_id, "Error: %d", error_code);
+lr_slog_debug(sb->log, eval_id, "Debug info: %p", ptr);
+
+// 强制刷新
+lr_sandbox_log_flush(sb->log);
+
+// 打印统计
+lr_sandbox_log_stats(sb->log, stdout);
+```
+
+---
+
+## 6. 字节码缓存
+
+### 6.1 概述
+
+`.lrfile` 字节码缓存将编译后的 JS 字节码持久化到磁盘，避免重复编译。
+
+**缓存文件格式**：
+```
+Magic    "LRBC"          4 bytes
+Version  uint32          4 bytes
+Flags    uint32          4 bytes
+Hash     FNV-1a 64-bit   8 bytes
+Mtime    int64           8 bytes
+SrcSize  uint64          8 bytes
+BcLen    uint32          4 bytes
+Bytecode variable        N bytes
+```
+
+### 6.2 API
+
+```c
+// 配置缓存目录
+LR_Config cfg;
+lr_config_default(&cfg);
+cfg.bytecode_cache_dir = "./my_cache";  // 绝对或相对路径
+
+// 或运行时设置
+lr_bytecode_cache_set_dir(&rt->bytecode_cache, "./my_cache");
+
+// 查看统计
+lr_bytecode_cache_stats(rt, stdout);
+```
+
+### 6.3 缓存失效
+
+- 源文件修改后（mtime 变化），缓存自动失效
+- 源文件内容变化后（FNV-1a hash 变化），缓存自动失效
+- 可手动失效：`lr_bytecode_cache_invalidate(&rt->bytecode_cache, "script.js")`
+
+---
+
+## 7. 内置浏览器 API
+
+### 7.1 Console
+
+```js
+console.log("message");
+console.error("error");
+console.warn("warning");
+console.info("info");
+console.debug("debug");
+console.trace("trace");
+console.time("label");
+console.timeEnd("label");
+console.assert(condition, "message");
+```
+
+### 7.2 Timers
+
+```js
+setTimeout(() => console.log("delayed"), 1000);
+setInterval(() => console.log("tick"), 100);
+clearTimeout(id);
+clearInterval(id);
+```
+
+### 7.3 URL
+
+```js
+const url = new URL("https://example.com/path?q=1#hash");
+console.log(url.hostname);    // "example.com"
+console.log(url.pathname);    // "/path"
+console.log(url.searchParams.get("q"));  // "1"
+```
+
+### 7.4 Encoding
+
+```js
+const enc = new TextEncoder();
+const bytes = enc.encode("Hello");     // Uint8Array
+
+const dec = new TextDecoder();
+const str = dec.decode(bytes);         // "Hello"
+
+const b64 = btoa("Hello");             // "SGVsbG8="
+const raw = atob(b64);                 // "Hello"
+```
+
+### 7.5 Crypto
+
+```js
+const uuid = crypto.randomUUID();
+// "a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6"
+
+const bytes = new Uint8Array(32);
+crypto.getRandomValues(bytes);
+```
+
+### 7.6 Performance
+
+```js
+const now = performance.now();   // 高精度时间戳
+const then = performance.now();
+console.log("Elapsed:", then - now, "ms");
+```
+
+### 7.7 Storage
+
+```js
+localStorage.setItem("key", "value");
+const val = localStorage.getItem("key");
+localStorage.removeItem("key");
+localStorage.clear();
+```
+
+### 7.8 Fetch
+
+```js
+const resp = await fetch("https://api.example.com/data");
+const json = await resp.json();
+console.log(json);
+```
+
+### 7.9 Event
+
+```js
+const emitter = new EventTarget();
+emitter.addEventListener("custom", (e) => console.log(e.detail));
+emitter.dispatchEvent(new CustomEvent("custom", { detail: 42 }));
+```
+
+### 7.10 Worker
+
+```js
+const worker = new Worker("worker.js");
+worker.postMessage("Hello from main");
+worker.onmessage = (e) => console.log("Worker says:", e.data);
+worker.terminate();
+```
+
+---
+
+## 8. 高级特性
+
+### 8.1 分代 GC
+
+```bash
+# 启用分代 GC
+./lr_js --gc-generational script.js
+
+# 自定义 nursery 大小
+./lr_js --gc-generational --gc-nursery-size 8 script.js
+```
+
+```c
+cfg.gc_mode = LR_GC_MODE_GENERATIONAL;
+cfg.gc_generational = 1;
+cfg.gc_nursery_size = 8 * 1024 * 1024;  // 8MB nursery
+```
+
+### 8.2 增量 GC
+
+```bash
+# 启用增量 GC (默认)
+./lr_js --gc-incremental script.js
+
+# 自定义暂停目标
+./lr_js --gc-incremental --gc-pause-target 3 script.js
+```
+
+```c
+cfg.gc_mode = LR_GC_MODE_INCREMENTAL;
+cfg.gc_incremental = 1;
+cfg.gc_pause_target_ns = 3000000;  // 3ms 目标暂停
+```
+
+### 8.3 内存限制
+
+```bash
+# 要求至少 2GB 系统可用内存
+./lr_js --min-memory 2147483648 script.js
+
+# 跳过内存检查
+./lr_js --no-memory-check script.js
+```
+
+### 8.4 渲染器桥接
+
+```c
+// 选择渲染后端
+LR_RendererConfig rcfg = {
+    .type = LR_RENDERER_SKIA,
+    .socket_path = "/tmp/lr_render.sock",
+    .width = 800,
+    .height = 600,
+};
+lr_renderer_init(&rt->renderer, &rcfg);
+```
+
+### 8.5 线程池
+
+```c
+// 创建线程池
+LR_ThreadPoolConfig tcfg = {
+    .thread_count = 4,
+    .queue_size = 128,
+};
+lr_thread_pool_init(&rt->thread_pool, &tcfg);
+
+// 提交任务
+lr_thread_pool_submit(&rt->thread_pool, my_task, my_data);
+```
+
+---
+
+## 9. CLI 参考
+
+### 9.1 完整参数列表
+
+| 参数 | 说明 |
+|------|------|
+| `-e <code>` | 执行字符串代码 |
+| `-m <file>` | 作为 ES Module 执行 |
+| `-i, --interactive` | 启动 REPL 交互模式 |
+| `-h, --help` | 显示帮助 |
+| `-v, --version` | 显示版本 |
+| `--strict` | 启用严格模式 |
+| `--debug` | 启用调试模式 |
+| `--memory-limit <bytes>` | 堆内存限制 |
+| `--gc-threshold <bytes>` | GC 阈值 |
+| `--gc-stress` | GC 压力测试模式 |
+| `--gc-generational` | 启用分代 GC |
+| `--gc-incremental` | 启用增量 GC（默认） |
+| `--gc-manual` | 禁用自动 GC |
+| `--gc-nursery-size <mb>` | 设置 nursery 大小 |
+| `--gc-pause-target <ms>` | 设置目标最大暂停 |
+| `--gc-stats` | 退出时打印 GC 统计 |
+| `--bytecode-cache <dir>` | 启用 .lrfile 字节码缓存 |
+| `--bytecode-stats` | 退出时打印缓存统计 |
+| `--sandbox-log <dir>` | 启用沙箱日志 |
+| `--min-memory <bytes>` | 最小系统内存要求 |
+| `--no-memory-check` | 跳过系统内存检查 |
+| `--dump-bytecode` | 导出编译字节码 |
+| `--strip-debug` | 剥离调试信息 |
+| `--timeout <ms>` | 执行超时 |
+| `--log-level <0-4>` | 日志级别 |
+| `--stack-size <bytes>` | 栈大小 |
+
+### 9.2 REPL 命令
+
+| 命令 | 说明 |
+|------|------|
+| `.exit`, `.quit` | 退出 REPL |
+| `.help` | 显示帮助 |
+| `.clear` | 清屏 |
+| `.gc` | 触发 GC |
+| `.gc_stats` | 显示 GC 统计 |
+| `.bc_stats` | 显示字节码缓存统计 |
+| `.memory` | 显示内存使用 |
+
+---
+
+## 10. 构建指南
+
+### 10.1 Linux
+
+```bash
+# 依赖
+sudo apt install build-essential  # Debian/Ubuntu
+sudo dnf install gcc make         # Fedora
+
+# 构建
+cd LR_JS
+make clean && make -j$(nproc)
+
+# 输出: build/lr_js, build/liblr_js.a
+```
+
+### 10.2 macOS
+
+```bash
+# 依赖
+xcode-select --install
+
+# 构建
+cd LR_JS
+make clean && make -j$(sysctl -n hw.logicalcpu)
+
+# 输出: build/lr_js, build/liblr_js.a
+```
+
+### 10.3 Windows
+
+```powershell
+# MinGW-w64
+pacman -S mingw-w64-x86_64-gcc make
+cd LR_JS
+make clean && make -j%NUMBER_OF_PROCESSORS%
+
+# MSVC
+cl /I include /I engine /O2 /Fe:build\lr_js.exe cli\main.c src\*.c engine\*.c
+```
+
+### 10.4 FreeBSD
+
+```bash
+pkg install gcc gmake
+cd LR_JS
+gmake clean && gmake -j$(sysctl -n hw.ncpu)
+```
+
+### 10.5 移动端 (Android NDK)
+
+```bash
+export ANDROID_NDK=/path/to/ndk
+export TOOLCHAIN=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64
+
+# arm64
+export CC=$TOOLCHAIN/bin/aarch64-linux-android24-clang
+export AR=$TOOLCHAIN/bin/llvm-ar
+
+cd LR_JS
+make CC=$CC AR=$AR clean && make CC=$CC AR=$AR
+```
+
+### 10.6 移动端 (iOS)
+
+```bash
+# arm64
+export SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+export CC="xcrun --sdk iphoneos clang -arch arm64 -isysroot $SDK -miphoneos-version-min=14.0"
+
+cd LR_JS
+make CC="$CC" clean && make CC="$CC"
+```
+
+---
+
+## 11. 性能基准
+
+| 测试项目 | 耗时 | 说明 |
+|----------|------|------|
+| 空脚本启动 | < 1ms | 运行时创建 |
+| console.log | < 1ms | 基本 I/O |
+| 100K 对象循环 | ~50ms | 内存分配 |
+| 50K 对象 (分代 GC) | ~45ms | GC 暂停 < 4ms |
+| 50K 对象 (增量 GC) | ~48ms | GC 暂停 < 2ms |
+| 字节码缓存命中 | < 5ms | 跳过编译 |
+
+---
+
+## 12. 错误码
+
+| 错误码 | 说明 |
+|--------|------|
+| -1 | 通用错误 |
+| -2 | 内存不足 |
+| -3 | 超时 |
+| -4 | 语法错误 |
+| -5 | 运行时错误 |
+| -6 | 系统内存不足 |
+| -7 | 沙箱限制 |
+| -8 | 网络错误 |
+
+---
+
+## 13. 版本历史
+
+| 版本 | 日期 | 说明 |
+|------|------|------|
+| 0.1.0 | 2026-07 | 初始版本，ES2022+ 支持 |
+| 0.2.0 | 2026-07 | 多线程沙箱、渲染器桥接 |
+| 0.3.0 | 2026-07 | 系统内存限制 |
+| 0.4.0 | 2026-07 | 分代 GC + 增量 GC |
+| 0.5.0 | 2026-07 | .lrfile 字节码缓存 + 沙箱日志 |
+
+---
+
+## 14. 许可证
+
+MIT License
+
+---
+
+## 参考链接
+
+- FNV-1a: https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function
+
+---
+
+## 15. Promise API
+
+L/R_JS 实现完整的 Promise/A+ 规范，支持 ES2022 所有 Promise 静态方法。
+
+### 15.1 构造函数
+
+```javascript
+const promise = new Promise((resolve, reject) => {
+    resolve(42);
+    // 或 reject(new Error("failed"));
+});
+```
+
+### 15.2 静态方法
+
+```javascript
+// Promise.resolve(value)
+Promise.resolve(42).then(v => console.log(v));
+
+// Promise.reject(reason)
+Promise.reject(new Error("fail")).catch(e => console.log(e.message));
+
+// Promise.all(iterable) — 所有成功则返回结果数组，任一失败则立即 reject
+Promise.all([
+    Promise.resolve(1),
+    Promise.resolve(2),
+    Promise.resolve(3),
+]).then(results => console.log(results));  // [1, 2, 3]
+
+// Promise.race(iterable) — 返回第一个完成的 Promise（不论 resolve 或 reject）
+Promise.race([
+    new Promise(resolve => setTimeout(() => resolve("fast"), 10)),
+    new Promise(resolve => setTimeout(() => resolve("slow"), 100)),
+]).then(v => console.log(v));  // "fast"
+
+// Promise.allSettled(iterable) — 等待所有 Promise 完成，返回每个的结果状态
+Promise.allSettled([
+    Promise.resolve(1),
+    Promise.reject("error"),
+]).then(results => {
+    results.forEach(r => console.log(r.status, r.value || r.reason));
+});
+
+// Promise.any(iterable) — 返回第一个成功的 Promise，全部失败则 reject AggregateError
+Promise.any([
+    Promise.reject("err1"),
+    Promise.resolve("ok"),
+    Promise.reject("err3"),
+]).then(v => console.log(v));  // "ok"
+```
+
+### 15.3 实例方法
+
+```javascript
+const promise = new Promise(resolve => resolve(42));
+
+// promise.then(onFulfilled, onRejected)
+promise.then(
+    value => console.log("Fulfilled:", value),
+    reason => console.log("Rejected:", reason)
+);
+
+// promise.catch(onRejected)
+promise.catch(reason => console.error("Error:", reason));
+
+// promise.finally(callback) — 无论成功或失败都会执行
+promise
+    .then(v => v * 2)
+    .catch(e => 0)
+    .finally(() => console.log("Cleanup"));
+```
+
+### 15.4 链式调用
+
+```javascript
+fetch("https://api.example.com/data")
+    .then(resp => resp.json())
+    .then(data => {
+        console.log("Data:", data);
+        return process(data);
+    })
+    .then(result => {
+        console.log("Result:", result);
+    })
+    .catch(error => {
+        console.error("Error:", error);
+    });
+```
+
+---
+
+## 16. Worker API
+
+L/R_JS 支持 Web Worker 多线程执行，每个 Worker 在独立线程中运行隔离的 JS 运行时，通过消息传递与主线程通信。
+
+### 16.1 构造函数
+
+```javascript
+// 创建一个 Worker，执行指定脚本文件
+const worker = new Worker("worker.js");
+
+// 第二个参数支持配置选项
+const worker = new Worker("worker.js", {
+    /* 未来扩展 */
+});
+```
+
+### 16.2 实例方法
+
+```javascript
+// worker.postMessage(data) — 向 Worker 发送消息
+worker.postMessage("Hello from main");
+worker.postMessage({cmd: "compute", data: [1, 2, 3]});
+worker.postMessage(new Uint8Array([1, 2, 3]));  // 支持 Transferable
+
+// worker.terminate() — 立即终止 Worker
+worker.terminate();
+```
+
+### 16.3 事件处理
+
+```javascript
+// worker.onmessage — 接收 Worker 发来的消息
+worker.onmessage = (event) => {
+    console.log("Received from worker:", event.data);
+};
+
+// worker.onerror — 处理 Worker 中的错误
+worker.onerror = (event) => {
+    console.error("Worker error:", event.message);
+};
+```
+
+### 16.4 Worker 端 API
+
+```javascript
+// worker.js — 在 Worker 线程中执行
+
+// 监听主线程消息
+self.onmessage = (event) => {
+    const data = event.data;
+    console.log("Worker received:", data);
+
+    // 发送结果回主线程
+    self.postMessage({result: data.cmd + " done"});
+};
+
+// 也可以使用 addEventListener
+self.addEventListener("message", (event) => {
+    self.postMessage("Processed: " + event.data);
+});
+```
+
+### 16.5 完整示例
+
+```javascript
+// main.js
+const worker = new Worker("worker.js");
+
+worker.onmessage = (e) => {
+    console.log("Result:", e.data.result);
+    worker.terminate();
+};
+
+worker.onerror = (e) => {
+    console.error("Worker error:", e.message);
+};
+
+worker.postMessage({numbers: [10, 20, 30]});
+```
+
+```javascript
+// worker.js
+self.onmessage = (e) => {
+    const {numbers} = e.data;
+    const sum = numbers.reduce((a, b) => a + b, 0);
+    self.postMessage({result: sum});
+};
+```
+
+---
+
+## 17. 无锁队列（C API）
+
+L/R_JS 提供基于 CAS 的无锁队列（MPSC：Multiple Producer, Single Consumer），使用链表 + stub 节点设计避免 ABA 问题。
+
+### 17.1 数据结构
+
+```c
+/* 队列节点（嵌入到用户数据结构中） */
+typedef struct LR_LFQNode {
+    struct LR_LFQNode *next;
+} LR_LFQNode;
+
+/* 无锁队列 */
+typedef struct LR_LFQueue {
+    LR_LFQNode *head;        /* Consumer 从 head 弹出 */
+    LR_LFQNode *tail;        /* Producer 向 tail 推入 */
+    volatile int32_t count;  /* 近似元素数量（仅诊断用途） */
+} LR_LFQueue;
+
+/* 静态初始化器 */
+#define LR_LFQ_INIT { NULL, NULL, 0 }
+```
+
+### 17.2 API
+
+```c
+// 初始化队列（必须在使用前调用）
+LR_LFQueue queue = LR_LFQ_INIT;
+lr_lfq_init(&queue);
+
+// 推入节点（多生产者安全）
+MyData *node = malloc(sizeof(MyData));
+node->value = 42;
+lr_lfq_push(&queue, &node->lfq_node);
+
+// 弹出节点（单消费者）
+LR_LFQNode *node = lr_lfq_pop(&queue);
+if (node) {
+    MyData *data = (MyData *)((char *)node - offsetof(MyData, lfq_node));
+    printf("Value: %d\n", data->value);
+    free(data);
+}
+
+// 获取近似队列长度
+int32_t count = lr_lfq_count(&queue);
+
+// 检查是否为空
+int empty = lr_lfq_is_empty(&queue);
+
+// 排空队列
+LR_LFQNode *all = lr_lfq_drain(&queue);
+
+// 销毁队列
+lr_lfq_destroy(&queue, NULL);           // 不释放数据
+lr_lfq_destroy(&queue, free_data_cb);   // 回调释放每个节点
+```
+
+### 17.3 线程安全说明
+
+| 操作 | 安全性 |
+|------|--------|
+| `lr_lfq_push` | 多生产者安全（CAS 循环，有限重试） |
+| `lr_lfq_pop` | 仅单消费者安全（或外部序列化） |
+| `lr_lfq_peek` | 仅单消费者安全 |
+| `lr_lfq_count` | 近似值，仅诊断用途 |
+| `lr_lfq_drain` | 仅单消费者安全 |
+
+### 17.4 嵌入示例
+
+```c
+#include "lr_lockfree_queue.h"
+
+typedef struct {
+    LR_LFQNode lfq_node;  /* 必须为第一个成员或使用 offsetof */
+    int   id;
+    char  data[256];
+} MyTask;
+
+void producer(LR_LFQueue *queue) {
+    for (int i = 0; i < 100; i++) {
+        MyTask *task = malloc(sizeof(MyTask));
+        task->id = i;
+        lr_lfq_push(queue, &task->lfq_node);
+    }
+}
+
+void consumer(LR_LFQueue *queue) {
+    LR_LFQNode *node;
+    while ((node = lr_lfq_pop(queue)) != NULL) {
+        MyTask *task = (MyTask *)node;
+        printf("Task %d processed\n", task->id);
+        free(task);
+    }
+}
+```
+
+---
+
+## 18. 跨平台兼容层
+
+L/R_JS 通过 `lr_platform.h` 提供统一的跨平台抽象层，支持 Linux、macOS、Windows 7+、FreeBSD、OpenBSD、NetBSD。
+
+### 18.1 支持的平台
+
+| 宏 | 平台 |
+|-----|------|
+| `LR_PLATFORM_WINDOWS` | Windows 7+ (MSVC/MinGW) |
+| `LR_PLATFORM_LINUX` | Linux (GCC/Clang) |
+| `LR_PLATFORM_MACOS` | macOS (Apple Clang) |
+| `LR_PLATFORM_BSD` | FreeBSD / OpenBSD / NetBSD |
+
+### 18.2 编译器检测
+
+| 宏 | 编译器 |
+|-----|---------|
+| `LR_COMPILER_MSVC` | MSVC (cl.exe) |
+| 默认 | GCC / Clang |
+
+### 18.3 编译选项
+
+```bash
+# MSVC (Windows)
+cl /I include /I src /I src/engine /O2 /Fe:build\lr_js.exe cli\main.c src\*.c engine\*.c
+
+# GCC (Linux/macOS)
+gcc -O2 -g -Wall -Wextra -D_GNU_SOURCE -pthread \
+    -I include -I src -I src/engine \
+    -o build/lr_js cli/main.c src/*.c src/engine/*.c \
+    -lm -lpthread -ldl
+
+# MinGW-w64 (Windows cross-compile)
+x86_64-w64-mingw32-gcc -O2 -g -Wall -Wextra -D_GNU_SOURCE -pthread \
+    -I include -I src -I src/engine \
+    -o build/lr_js.exe cli/main.c src/*.c src/engine/*.c \
+    -lm -lpthread -lws2_32
+```
+
+### 18.4 原子操作 API
+
+L/R_JS 提供统一的原子操作层，在 Windows 上使用 `Interlocked*` 系列函数，在 POSIX 系统上使用 GCC `__sync_*` 内置函数。
+
+```c
+// 32 位 CAS
+int32_t lr_atomic_cas_32(volatile int32_t *ptr, int32_t oldval, int32_t newval);
+
+// 指针 CAS
+void *lr_atomic_cas_ptr(volatile void **ptr, void *oldval, void *newval);
+
+// 原子交换
+int32_t lr_atomic_xchg_32(volatile int32_t *ptr, int32_t val);
+void *lr_atomic_xchg_ptr(volatile void **ptr, void *val);
+
+// 原子 fetch-and-add
+int32_t lr_atomic_fetch_add_32(volatile int32_t *ptr, int32_t val);
+
+// 原子存储/加载
+void  lr_atomic_store_32(volatile int32_t *ptr, int32_t val);
+void  lr_atomic_store_ptr(volatile void **ptr, void *val);
+int32_t lr_atomic_load_32(volatile int32_t *ptr);
+void *lr_atomic_load_ptr(volatile void **ptr);
+
+// 64 位原子操作
+int64_t lr_atomic_cas_64(volatile int64_t *ptr, int64_t oldval, int64_t newval);
+int64_t lr_atomic_load_64(volatile int64_t *ptr);
+
+// 内存屏障
+void lr_memory_barrier(void);
+void lr_write_barrier(void);
+void lr_read_barrier(void);
+```
+
+### 18.5 便捷宏
+
+```c
+// 原子自增/自减
+#define LR_ATOMIC_INC(ptr)    lr_atomic_fetch_add_32((ptr), 1)
+#define LR_ATOMIC_DEC(ptr)    lr_atomic_fetch_add_32((ptr), -1)
+
+// 原子 test-and-set（返回 1 表示已设置，0 表示未设置）
+#define LR_ATOMIC_TEST_AND_SET(ptr)  (lr_atomic_xchg_32((ptr), 1) != 0)
+
+// 原子清除标志
+#define LR_ATOMIC_CLEAR(ptr)  lr_atomic_store_32((ptr), 0)
+```
+
+### 18.6 跨平台 API 映射
+
+| 功能 | POSIX | Windows |
+|------|-------|---------|
+| 文件操作 | `open/close/read/write/lseek` | `_open/_close/_read/_write/_lseek` |
+| Socket 关闭 | `close(s)` | `closesocket(s)` |
+| 动态库加载 | `dlopen/dlsym/dlclose` | `LoadLibrary/GetProcAddress/FreeLibrary` |
+| 线程 | `pthread` | `lr_pthread_win.h` 兼容层 |
+| 高精度时间 | `gettimeofday` | `QueryPerformanceCounter` |
+| 随机数 | `/dev/urandom` | `CryptGenRandom` |
+| 内存信息 | `sysconf` | `GlobalMemoryStatusEx` |
+| Socket 初始化 | 无需操作 | `WSAStartup` |
+| 目录分隔符 | `/` | `\\` |
+
+### 18.7 平台特定头文件
+
+```c
+// 所有源文件包含 lr_platform.h 替代平台特定头文件
+#include "lr_platform.h"   // 自动处理 pthread、socket、动态库等
+
+// Windows 额外兼容层
+#include "lr_pthread_win.h"  // MSVC 的 pthread 模拟
+```
+
+---
+
+## 19. 任务调度器（C API）
+
+L/R_JS 提供基于优先级的异步任务调度器，支持一次性、重复和定时任务。
+
+### 19.1 API
+
+```c
+// 创建调度器
+LR_Scheduler *sched = lr_scheduler_create(thread_pool);
+
+// 调度重复任务
+int task_id = lr_scheduler_schedule(sched, task,
+    LR_TASK_PRIORITY_NORMAL, 1000000 /* 1秒间隔 */, -1 /* 无限重复 */);
+
+// 调度延迟任务
+lr_scheduler_schedule_delayed(sched, task,
+    LR_TASK_PRIORITY_HIGH, 500000 /* 500ms 延迟 */);
+
+// 调度立即执行
+lr_scheduler_schedule_now(sched, task, LR_TASK_PRIORITY_CRITICAL);
+
+// 取消任务
+lr_scheduler_cancel(sched, task_id);
+
+// 运行事件循环（阻塞）
+lr_scheduler_run(sched);
+
+// 处理待处理任务（非阻塞）
+lr_scheduler_process(sched);
+
+// 停止调度器
+lr_scheduler_stop(sched);
+
+// 销毁调度器
+lr_scheduler_destroy(sched);
+```
+
+### 19.2 任务优先级
+
+```c
+typedef enum {
+    LR_TASK_PRIORITY_LOW      = 0,
+    LR_TASK_PRIORITY_NORMAL   = 1,
+    LR_TASK_PRIORITY_HIGH     = 2,
+    LR_TASK_PRIORITY_CRITICAL = 3,
+} LR_TaskPriority;
+```
+
+---
+
+## 20. Map & Set API
+
+L/R_JS 实现完整的 ES2022 Map 和 Set 对象，使用 C 哈希表作为底层存储。
+
+### 20.1 Map
+
+```javascript
+// 构造函数
+const map = new Map();
+const map2 = new Map([['key1', 'val1'], ['key2', 'val2']]);
+
+// 实例方法
+map.set(key, value);          // 设置键值对，返回 map 自身（支持链式）
+map.get(key);                 // 获取值，不存在返回 undefined
+map.has(key);                 // 检查键是否存在
+map.delete(key);              // 删除键，返回 true/false
+map.clear();                  // 清空所有条目
+map.size;                     // 条目数（只读 getter）
+map.forEach(callback, thisArg); // 遍历所有条目
+```
+
+### 20.2 Set
+
+```javascript
+// 构造函数
+const set = new Set();
+const set2 = new Set([1, 2, 3]);
+
+// 实例方法
+set.add(value);               // 添加值，返回 set 自身（支持链式）
+set.has(value);               // 检查值是否存在
+set.delete(value);            // 删除值，返回 true/false
+set.clear();                  // 清空所有值
+set.size;                     // 条目数（只读 getter）
+set.forEach(callback, thisArg); // 遍历所有值
+```
+
+---
+
+## 21. Proxy & Reflect API
+
+L/R_JS 支持 ES2022 Proxy 和 Reflect，实现 7 个核心 trap。
+
+### 21.1 Proxy
+
+```javascript
+// 构造函数
+const proxy = new Proxy(target, handler);
+
+// 支持的 trap
+const handler = {
+    get(target, prop, receiver) { return Reflect.get(target, prop, receiver); },
+    set(target, prop, value, receiver) { return Reflect.set(target, prop, value, receiver); },
+    has(target, prop) { return Reflect.has(target, prop); },
+    deleteProperty(target, prop) { return Reflect.deleteProperty(target, prop); },
+    ownKeys(target) { return Reflect.ownKeys(target); },
+    apply(target, thisArg, args) { return Reflect.apply(target, thisArg, args); },
+    construct(target, args, newTarget) { return Reflect.construct(target, args); },
+};
+```
+
+### 21.2 Reflect
+
+```javascript
+// 静态方法
+Reflect.get(target, propertyKey, receiver);
+Reflect.set(target, propertyKey, value, receiver);
+Reflect.has(target, propertyKey);
+Reflect.deleteProperty(target, propertyKey);
+Reflect.ownKeys(target);
+Reflect.apply(target, thisArg, args);
+Reflect.construct(target, args);
+Reflect.defineProperty(target, propertyKey, attributes);
+Reflect.getPrototypeOf(target);
+Reflect.setPrototypeOf(target, proto);
+Reflect.isExtensible(target);
+```
+
+---
+
+## 22. 错误与堆栈跟踪
+
+L/R_JS 支持完整的错误堆栈跟踪，格式兼容 V8。
+
+### 22.1 Error.prototype.stack
+
+```javascript
+try {
+    throw new Error("something went wrong");
+} catch (e) {
+    console.log(e.stack);
+    // 输出:
+    // Error: something went wrong
+    //     at <eval> (input:1)
+}
+```
+
+### 22.2 Error.captureStackTrace
+
+```javascript
+function MyError(message) {
+    this.message = message;
+    Error.captureStackTrace(this, MyError);
+}
+
+const err = new MyError("custom error");
+console.log(err.stack);  // 带有堆栈信息，但不包含 captureStackTrace 调用
+```
+
+### 22.3 Error.stackTraceLimit
+
+```javascript
+Error.stackTraceLimit = 20;  // 控制堆栈帧数上限（默认 10）
+```
+
+---
+
+## 23. 性能优化
+
+L/R_JS 引擎包含多项性能优化：
+
+### 23.1 AST 节点池
+- 解析器预分配 4096 个 AST 节点，减少 `malloc` 调用
+- 全局缓存常量节点（0、1、true、false、null、undefined）
+
+### 23.2 字符串驻留
+- 256 槽哈希表对标识符和字符串字面量进行原子化
+- 避免重复的 `strdup` 和字符串比较
+
+### 23.3 直接线程化
+- 解释器使用函数指针表替代 `switch` 语句
+- 减少分支预测失败，提高执行效率
+
+### 23.4 内联缓存
+- 64 槽属性访问缓存，缓存最近访问的属性偏移
+- 减少属性查找的开销
+
+### 23.5 整数快速路径
+- 二元运算的 `int32 + int32` 快速路径（14 种运算）
+- 避免对象装箱和函数调用开销
+
+### 23.6 形状缓存
+- 128 槽形状缓存，缓存 `get_property`/`set_property` 的 (对象, 属性) 对
+- 加速属性访问
+
+### 23.7 小字符串缓存
+- 128 槽缓存长度 <= 32 的字符串
+- 避免短字符串的重复分配
+
+### 23.8 GC 调优
+- 初始 GC 阈值: 1MB
+- 新生代大小: 8MB
+- GC 暂停目标: 10ms
+
+---
+
+## 24. ES2022 核心内置对象
+
+L/R_JS 实现完整的 ES2022 核心内置对象，包括 Object、Array、String、Number、Boolean、Function、Math、JSON、Date、RegExp、Symbol、Error 子类、WeakMap、WeakSet。
+
+### 24.1 Object
+
+```javascript
+// 静态方法
+Object.keys(obj);           // 返回可枚举自有属性名数组
+Object.values(obj);         // 返回可枚举自有属性值数组
+Object.entries(obj);        // 返回 [key, value] 对数组
+Object.fromEntries(entries); // 从 [key, value] 对创建对象
+Object.assign(target, ...sources); // 复制属性
+Object.create(proto);       // 创建指定原型的对象
+Object.defineProperty(obj, prop, desc); // 定义属性
+Object.defineProperties(obj, props);    // 定义多个属性
+Object.freeze(obj);         // 冻结对象
+Object.seal(obj);           // 密封对象
+Object.isExtensible(obj);   // 检查是否可扩展
+Object.preventExtensions(obj); // 阻止扩展
+Object.is(v1, v2);          // SameValue 比较
+Object.hasOwn(obj, prop);   // ES2022 自有属性检查
+Object.getPrototypeOf(obj); // 获取原型
+Object.setPrototypeOf(obj, proto); // 设置原型
+Object.getOwnPropertyNames(obj);   // 获取自有属性名
+Object.getOwnPropertyDescriptor(obj, prop); // 获取属性描述符
+Object.getOwnPropertyDescriptors(obj);      // 获取所有属性描述符
+
+// 原型方法
+Object.prototype.toString();
+Object.prototype.hasOwnProperty(prop);
+Object.prototype.isPrototypeOf(obj);
+Object.prototype.propertyIsEnumerable(prop);
+Object.prototype.valueOf();
+```
+
+### 24.2 Array
+
+```javascript
+// 静态方法
+Array.isArray(val);         // 检查是否为数组
+Array.from(arrayLike);      // 从类数组/可迭代对象创建
+Array.of(...items);         // 从参数创建
+
+// 原型方法 (ES2022+)
+Array.prototype.at(index);       // ES2022 索引访问
+Array.prototype.concat(...arrs);
+Array.prototype.copyWithin(target, start, end);
+Array.prototype.entries();
+Array.prototype.every(callback);
+Array.prototype.fill(value, start, end);
+Array.prototype.filter(callback);
+Array.prototype.find(callback);
+Array.prototype.findIndex(callback);
+Array.prototype.findLast(callback);      // ES2023
+Array.prototype.findLastIndex(callback); // ES2023
+Array.prototype.flat(depth);            // ES2019
+Array.prototype.flatMap(callback);      // ES2019
+Array.prototype.forEach(callback);
+Array.prototype.includes(value);        // ES2016
+Array.prototype.indexOf(value);
+Array.prototype.join(separator);
+Array.prototype.keys();
+Array.prototype.lastIndexOf(value);
+Array.prototype.map(callback);
+Array.prototype.pop();
+Array.prototype.push(...items);
+Array.prototype.reduce(callback, initial);
+Array.prototype.reduceRight(callback, initial);
+Array.prototype.reverse();
+Array.prototype.shift();
+Array.prototype.slice(start, end);
+Array.prototype.some(callback);
+Array.prototype.sort(compareFn);
+Array.prototype.splice(start, deleteCount, ...items);
+Array.prototype.toReversed();           // ES2023
+Array.prototype.toSorted(compareFn);    // ES2023
+Array.prototype.toSpliced(start, delCount, ...items); // ES2023
+Array.prototype.toString();
+Array.prototype.unshift(...items);
+Array.prototype.values();
+Array.prototype.with(index, value);     // ES2023
+```
+
+### 24.3 String
+
+```javascript
+// 静态方法
+String.fromCharCode(...codes);
+String.fromCodePoint(...points);
+
+// 原型方法
+String.prototype.at(index);           // ES2022
+String.prototype.charAt(index);
+String.prototype.charCodeAt(index);
+String.prototype.codePointAt(index);
+String.prototype.concat(...strs);
+String.prototype.includes(searchString, position);
+String.prototype.indexOf(searchString, position);
+String.prototype.lastIndexOf(searchString, position);
+String.prototype.match(regexp);
+String.prototype.matchAll(regexp);     // ES2020
+String.prototype.replace(searchValue, replaceValue);
+String.prototype.replaceAll(searchValue, replaceValue); // ES2021
+String.prototype.search(regexp);
+String.prototype.slice(start, end);
+String.prototype.split(separator, limit);
+String.prototype.substring(start, end);
+String.prototype.toLowerCase();
+String.prototype.toUpperCase();
+String.prototype.trim();
+String.prototype.trimStart();  // ES2019
+String.prototype.trimEnd();    // ES2019
+String.prototype.padStart(targetLength, padString); // ES2017
+String.prototype.padEnd(targetLength, padString);   // ES2017
+String.prototype.startsWith(searchString, position); // ES2015
+String.prototype.endsWith(searchString, endPosition); // ES2015
+String.prototype.repeat(count);   // ES2015
+String.prototype.toString();
+String.prototype.valueOf();
+```
+
+### 24.4 Number
+
+```javascript
+// 静态属性
+Number.MAX_VALUE;       // 1.7976931348623157e+308
+Number.MIN_VALUE;       // 5e-324
+Number.NaN;
+Number.NEGATIVE_INFINITY;
+Number.POSITIVE_INFINITY;
+Number.EPSILON;         // 2.220446049250313e-16
+Number.MAX_SAFE_INTEGER; // 9007199254740991
+Number.MIN_SAFE_INTEGER; // -9007199254740991
+
+// 静态方法
+Number.isNaN(value);
+Number.isFinite(value);
+Number.isInteger(value);
+Number.isSafeInteger(value);
+Number.parseFloat(string);
+Number.parseInt(string, radix);
+
+// 原型方法
+Number.prototype.toFixed(digits);
+Number.prototype.toPrecision(precision);
+Number.prototype.toString(radix);
+Number.prototype.valueOf();
+```
+
+### 24.5 Boolean
+
+```javascript
+// 原型方法
+Boolean.prototype.toString();
+Boolean.prototype.valueOf();
+```
+
+### 24.6 Function
+
+```javascript
+// 原型方法
+Function.prototype.bind(thisArg, ...args);
+Function.prototype.call(thisArg, ...args);
+Function.prototype.apply(thisArg, argsArray);
+Function.prototype.toString();
+```
+
+### 24.7 Math
+
+```javascript
+// 常量
+Math.E;     Math.LN2;    Math.LN10;   Math.LOG2E;
+Math.LOG10E; Math.PI;    Math.SQRT1_2; Math.SQRT2;
+
+// 方法
+Math.abs(x);     Math.acos(x);    Math.acosh(x);    Math.asin(x);
+Math.asinh(x);   Math.atan(x);    Math.atan2(y, x); Math.atanh(x);
+Math.cbrt(x);    Math.ceil(x);    Math.clz32(x);    Math.cos(x);
+Math.cosh(x);    Math.exp(x);     Math.expm1(x);    Math.floor(x);
+Math.fround(x);  Math.hypot(...); Math.imul(a, b);  Math.log(x);
+Math.log10(x);   Math.log1p(x);   Math.log2(x);     Math.max(...);
+Math.min(...);   Math.pow(x, y);  Math.random();    Math.round(x);
+Math.sign(x);    Math.sin(x);     Math.sinh(x);     Math.sqrt(x);
+Math.tan(x);     Math.tanh(x);    Math.trunc(x);
+```
+
+### 24.8 JSON
+
+```javascript
+JSON.stringify(value, replacer, space);  // 序列化
+JSON.parse(text, reviver);               // 解析
+```
+
+### 24.9 Date
+
+```javascript
+// 静态方法
+Date.now();
+Date.parse(dateString);
+Date.UTC(year, month, day, hour, min, sec, ms);
+
+// 原型方法
+Date.prototype.getFullYear();
+Date.prototype.getMonth();
+Date.prototype.getDate();
+Date.prototype.getDay();
+Date.prototype.getHours();
+Date.prototype.getMinutes();
+Date.prototype.getSeconds();
+Date.prototype.getMilliseconds();
+Date.prototype.getTime();
+Date.prototype.setFullYear(year);
+Date.prototype.setMonth(month);
+Date.prototype.setDate(day);
+Date.prototype.setHours(hour);
+Date.prototype.setMinutes(min);
+Date.prototype.setSeconds(sec);
+Date.prototype.setMilliseconds(ms);
+Date.prototype.setTime(time);
+Date.prototype.toString();
+Date.prototype.toISOString();
+Date.prototype.toJSON(key);
+Date.prototype.toLocaleDateString();
+Date.prototype.toLocaleTimeString();
+Date.prototype.valueOf();
+```
+
+### 24.10 RegExp
+
+```javascript
+// 构造函数
+new RegExp(pattern, flags);
+
+// 原型方法
+RegExp.prototype.exec(str);
+RegExp.prototype.test(str);
+RegExp.prototype.toString();
+
+// 属性
+reg.lastIndex;     reg.source;    reg.flags;
+reg.global;        reg.ignoreCase; reg.multiline;
+reg.dotAll;        reg.sticky;    reg.unicode;
+```
+
+### 24.11 Symbol
+
+```javascript
+// 构造函数
+Symbol(description);
+Symbol.for(key);
+Symbol.keyFor(sym);
+
+// Well-known symbols
+Symbol.iterator;         Symbol.asyncIterator;
+Symbol.hasInstance;      Symbol.isConcatSpreadable;
+Symbol.match;            Symbol.replace;
+Symbol.search;           Symbol.split;
+Symbol.toPrimitive;      Symbol.toStringTag;
+Symbol.unscopables;      Symbol.species;
+Symbol.matchAll;
+```
+
+### 24.12 Error 子类
+
+```javascript
+TypeError     // 类型错误
+RangeError    // 范围错误
+SyntaxError   // 语法错误
+ReferenceError // 引用错误
+EvalError     // 求值错误
+URIError      // URI 错误
+```
+
+### 24.13 WeakMap / WeakSet
+
+```javascript
+// WeakMap
+const wm = new WeakMap();
+wm.set(key, value);
+wm.get(key);
+wm.has(key);
+wm.delete(key);
+
+// WeakSet
+const ws = new WeakSet();
+ws.add(value);
+ws.has(value);
+ws.delete(value);
+```
+
+---
+
+## 25. ES2022+ 语法特性
+
+### 25.1 globalThis
+```javascript
+globalThis === window;  // true
+```
+
+### 25.2 for...of 循环
+```javascript
+for (const v of [1, 2, 3]) {
+    console.log(v);
+}
+```
+
+### 25.3 逻辑赋值运算符
+```javascript
+x ||= y;  // x = x || y
+x &&= y;  // x = x && y
+x ??= y;  // x = x ?? y
+```
+
+### 25.4 数字分隔符
+```javascript
+const million = 1_000_000;  // 1000000
+const bits = 0xFF_FF_FF;    // 16777215
+const binary = 0b1010_0001; // 161
+```
