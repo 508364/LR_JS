@@ -50,3 +50,9 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+.gitignore
+
+build/
+build_cmake/
+Project-Record/
