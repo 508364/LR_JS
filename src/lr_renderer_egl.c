@@ -122,193 +122,17 @@ static void lr_egl_identity(float *m)
     m[0] = m[5] = m[10] = m[15] = 1.0f;
 }
 
-/* ── Custom Renderer callbacks (forwarded to LR_EGLRenderer) ───────────── */
+/* ── Native handle getters ──────────────────────────────────────────────── */
 
-#define EGL_FROM_USER(p)  ((LR_EGLRenderer *)(p))
-
-static int egl_cb_init(void *ud, int w, int h)
+void *lr_egl_renderer_get_display(LR_EGLRenderer *egl)
 {
-    LR_EGLRenderer *egl = EGL_FROM_USER(ud);
-    egl->width = w;
-    egl->height = h;
-    return 0;
+    return egl ? (void *)egl->display : NULL;
 }
 
-static void egl_cb_destroy(void *ud)
+void *lr_egl_renderer_get_context(LR_EGLRenderer *egl)
 {
-    lr_egl_renderer_destroy(EGL_FROM_USER(ud));
+    return egl ? (void *)egl->context : NULL;
 }
-
-static int egl_cb_begin_frame(void *ud)
-{
-    LR_EGLRenderer *egl = EGL_FROM_USER(ud);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glViewport(0, 0, egl->width, egl->height);
-    return 0;
-}
-
-static int egl_cb_end_frame(void *ud)
-{
-    (void)ud;
-    glFlush();
-    return 0;
-}
-
-static int egl_cb_present(void *ud)
-{
-    return lr_egl_renderer_swap_buffers(EGL_FROM_USER(ud));
-}
-
-static int egl_cb_resize(void *ud, int w, int h)
-{
-    return lr_egl_renderer_resize(EGL_FROM_USER(ud), w, h);
-}
-
-static int egl_cb_set_viewport(void *ud, int x, int y, int w, int h)
-{
-    glViewport(x, y, w, h);
-    return 0;
-}
-
-static int egl_cb_clear(void *ud, float r, float g, float b, float a)
-{
-    glClearColor(r, g, b, a);
-    glClear(GL_COLOR_BUFFER_BIT);
-    return 0;
-}
-
-static int egl_cb_draw_rect(void *ud, float x, float y, float w, float h,
-                            float r, float g, float b, float a)
-{
-    LR_EGLRenderer *egl = EGL_FROM_USER(ud);
-
-    glUseProgram(egl->program_2d);
-
-    /* Build orthographic projection */
-    float proj[16];
-    lr_egl_build_ortho(proj, 0.0f, (float)egl->width, (float)egl->height, 0.0f, -1.0f, 1.0f);
-    glUniformMatrix4fv(egl->uniform_proj, 1, GL_FALSE, proj);
-    glUniform4f(egl->uniform_color, r, g, b, a);
-
-    /* Vertices: two triangles */
-    float vertices[] = {
-        x,     y,
-        x + w, y,
-        x,     y + h,
-        x,     y + h,
-        x + w, y,
-        x + w, y + h,
-    };
-
-    glBindBuffer(GL_ARRAY_BUFFER, egl->vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
-    glVertexAttribPointer((GLuint)egl->attrib_pos, 2, GL_FLOAT, GL_FALSE, 0, 0);
-    glEnableVertexAttribArray((GLuint)egl->attrib_pos);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
-
-    return 0;
-}
-
-static int egl_cb_draw_text(void *ud, const char *text,
-                            float x, float y, float size,
-                            float r, float g, float b, float a)
-{
-    (void)ud; (void)text; (void)x; (void)y; (void)size;
-    (void)r; (void)g; (void)b; (void)a;
-    /* Text rendering requires a font system beyond GLES2 primitives.
-     * For now, this is a stub. Users can implement text via draw_image
-     * with pre-rendered glyph bitmaps. */
-    return 0;
-}
-
-static int egl_cb_draw_image(void *ud, const uint8_t *pixels,
-                             int pw, int ph, float x, float y, float w, float h)
-{
-    (void)ud; (void)pixels; (void)pw; (void)ph; (void)x; (void)y; (void)w; (void)h;
-    /* Image rendering requires texture support.
-     * Stub for now — can be extended with GLES texture upload. */
-    return 0;
-}
-
-static int egl_cb_begin_path(void *ud)  { (void)ud; return 0; }
-static int egl_cb_move_to(void *ud, float x, float y)  { (void)ud; (void)x; (void)y; return 0; }
-static int egl_cb_line_to(void *ud, float x, float y)  { (void)ud; (void)x; (void)y; return 0; }
-
-static int egl_cb_arc(void *ud, float cx, float cy, float r,
-                      float a0, float a1, int ccw)
-{
-    (void)ud; (void)cx; (void)cy; (void)r; (void)a0; (void)a1; (void)ccw;
-    return 0;
-}
-
-static int egl_cb_fill(void *ud)    { (void)ud; return 0; }
-static int egl_cb_stroke(void *ud)  { (void)ud; return 0; }
-
-static int egl_cb_save(void *ud)
-{
-    LR_EGLRenderer *egl = EGL_FROM_USER(ud);
-    if (egl->transform_depth >= 8) return -1;
-    /* Push current identity matrix (simplified) */
-    float *dst = egl->transform_stack + egl->transform_depth * 16;
-    lr_egl_identity(dst);
-    egl->transform_depth++;
-    return 0;
-}
-
-static int egl_cb_restore(void *ud)
-{
-    LR_EGLRenderer *egl = EGL_FROM_USER(ud);
-    if (egl->transform_depth <= 0) return -1;
-    egl->transform_depth--;
-    return 0;
-}
-
-static int egl_cb_translate(void *ud, float tx, float ty) { (void)ud; (void)tx; (void)ty; return 0; }
-static int egl_cb_scale(void *ud, float sx, float sy)     { (void)ud; (void)sx; (void)sy; return 0; }
-static int egl_cb_rotate(void *ud, float angle)           { (void)ud; (void)angle; return 0; }
-
-static int egl_cb_read_pixels(void *ud, uint32_t *out_buf, int x, int y, int w, int h)
-{
-    (void)ud; (void)out_buf; (void)x; (void)y; (void)w; (void)h;
-    return 0;
-}
-
-static void *egl_cb_get_native_gl(void *ud)
-{
-    LR_EGLRenderer *egl = EGL_FROM_USER(ud);
-    return (void *)egl->context;
-}
-
-/* ── Static vtable ─────────────────────────────────────────────────────── */
-
-static const LR_CustomRenderer g_egl_vtable = {
-    NULL,                    /* user_data — set per-instance */
-    egl_cb_init,
-    egl_cb_destroy,
-    egl_cb_begin_frame,
-    egl_cb_end_frame,
-    egl_cb_present,
-    egl_cb_resize,
-    egl_cb_set_viewport,
-    egl_cb_clear,
-    egl_cb_draw_rect,
-    egl_cb_draw_text,
-    egl_cb_draw_image,
-    egl_cb_begin_path,
-    egl_cb_move_to,
-    egl_cb_line_to,
-    egl_cb_arc,
-    egl_cb_fill,
-    egl_cb_stroke,
-    egl_cb_save,
-    egl_cb_restore,
-    egl_cb_translate,
-    egl_cb_scale,
-    egl_cb_rotate,
-    egl_cb_read_pixels,
-    egl_cb_get_native_gl,
-};
 
 /* ── Public API ────────────────────────────────────────────────────────── */
 
@@ -545,16 +369,6 @@ int lr_egl_renderer_resize(LR_EGLRenderer *egl, int width, int height)
     }
 
     return 0;
-}
-
-const LR_CustomRenderer *lr_egl_renderer_get_interface(LR_EGLRenderer *egl)
-{
-    if (!egl) return NULL;
-    /* Return a pointer to a mutable copy of the vtable with user_data set */
-    static LR_CustomRenderer vtable;
-    vtable = g_egl_vtable;
-    vtable.user_data = egl;
-    return &vtable;
 }
 
 #endif /* LR_EGL_AVAILABLE */

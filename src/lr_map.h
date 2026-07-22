@@ -43,4 +43,6 @@ void lr_map_init(struct LR_Runtime *rt);
 }
 #endif
 
+void lr_map_free_opaque(void *opaque);
+
 #endif /* LR_MAP_H */

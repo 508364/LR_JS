@@ -45,6 +45,15 @@ struct LR_Runtime {
     FILE         *stdin_fp;
     FILE         *stdout_fp;
     FILE         *stderr_fp;
+
+    /* HTTP fetch wrapper (delegates to host application) */
+    struct LR_HttpWrapper *http_wrapper;
+
+    /* File system wrapper (privileged operations) */
+    struct LR_FileWrapper *file_wrapper;
+
+    /* Terminal wrapper (privileged command execution) */
+    struct LR_TerminalWrapper *terminal_wrapper;
 };
 
 /* ── Internal helpers ─────────────────────────────────────────────────── */
@@ -69,6 +78,9 @@ void lr_register_builtins(LR_Runtime *rt);
 void lr_console_init(LR_Runtime *rt);
 void lr_timers_init(LR_Runtime *rt);
 void lr_fetch_init(LR_Runtime *rt);
+void lr_fs_init(LR_Runtime *rt);
+void lr_terminal_init(LR_Runtime *rt);
+void lr_sysinfo_init(LR_Runtime *rt);
 void lr_url_init(LR_Runtime *rt);
 void lr_encoding_init(LR_Runtime *rt);
 void lr_event_init(LR_Runtime *rt);
@@ -89,7 +101,6 @@ void lr_builtins_extra_init(struct LR_Runtime *rt);
 
 /* Per-module cleanup */
 void lr_timers_cleanup(LR_Runtime *rt);
-void lr_fetch_cleanup(LR_Runtime *rt);
 
 /* Timer processing (called from event loop) */
 void lr_timers_process(LR_Runtime *rt);

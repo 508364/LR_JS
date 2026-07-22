@@ -433,17 +433,8 @@ LR_Runtime *lr_runtime_new(const LR_Config *cfg)
         lr_gc_configure(&rt->gc_ctx, &gc_cfg);
     }
 
-    /* Initialize renderer bridge if enabled */
-    if (cfg->enable_renderer) {
-        LR_RendererConfig renderer_cfg;
-        lr_renderer_config_default(&renderer_cfg);
-        renderer_cfg.width  = 800;
-        renderer_cfg.height = 600;
-        g_lr_renderer_bridge = lr_renderer_create(&renderer_cfg);
-        if (g_lr_renderer_bridge) {
-            lr_renderer_connect(g_lr_renderer_bridge);
-        }
-    }
+    /* Initialize renderer bridge (lazy-init on first Canvas use) */
+    g_lr_renderer_bridge = NULL;
 
     /* Set up module loader */
     JS_SetModuleLoaderFunc(rt->lr_rt, lr_module_normalize,
@@ -466,7 +457,6 @@ void lr_runtime_free(LR_Runtime *rt)
 
     /* Cleanup per-module */
     lr_timers_cleanup(rt);
-    lr_fetch_cleanup(rt);
 
     /* Cleanup GC context */
     lr_gc_destroy(&rt->gc_ctx);
@@ -480,32 +470,47 @@ void lr_runtime_free(LR_Runtime *rt)
         g_lr_renderer_bridge = NULL;
     }
 
-    /* Free JS runtime */
+    /* Free JS runtime (breaks circular references, clears object values,
+     * frees atom table, but does NOT free the context struct itself so
+     * that obj->ctx remains valid for the object cleanup loop). */
     if (rt->lr_ctx) {
         JS_FreeContext(rt->lr_ctx);
     }
-    /* Force-clean remaining objects (circular refs like ctor↔proto) */
+    /* Clean remaining objects. After JS_FreeContext, circular references
+     * (ctor↔proto) are already broken, and all object values in properties
+     * are cleared to LR_VALUE_UNDEFINED. We need to:
+     * 1. Clear prop->key (atoms were freed by lr_free_context)
+     * 2. Free remaining objects */
     if (rt->lr_rt) {
         LRRuntime *eng_rt = rt->lr_rt;
-        /* Pass 1: clear all property values to break circular references */
+        /* Clear prop->key to prevent use-after-free on freed atom table */
         LRObject *obj = eng_rt->obj_list;
         while (obj) {
             LRProperty *prop = obj->prop_hash;
             while (prop) {
-                prop->value = LR_VALUE_UNDEFINED;
-                if (prop->setter.tag != LR_TYPE_UNDEFINED)
-                    prop->setter = LR_VALUE_UNDEFINED;
+                prop->key = NULL;
                 prop = prop->next;
-            }
-            for (uint32_t i = 0; i < obj->prop_count; i++) {
-                obj->props[i] = LR_VALUE_UNDEFINED;
             }
             obj = obj->gc_next;
         }
-        /* Pass 2: free all remaining objects */
-        while (eng_rt->obj_list) {
-            lr_free_object(eng_rt, eng_rt->obj_list);
+        /* Free remaining objects. Advance list head before each free
+         * to handle indirect freeing through data_free callbacks. */
+        {
+            int max_count = 100000;
+            while (eng_rt->obj_list && max_count-- > 0) {
+                LRObject *cur = eng_rt->obj_list;
+                eng_rt->obj_list = cur->gc_next;
+                cur->gc_next = NULL;
+                lr_free_object(eng_rt, cur);
+            }
+            eng_rt->obj_list = NULL;
         }
+    }
+    /* Free the context struct AFTER the object cleanup loop, since
+     * objects still reference ctx via obj->ctx for safe cleanup. */
+    if (rt->lr_ctx) {
+        free(rt->lr_ctx);
+        rt->lr_ctx = NULL;
     }
     if (rt->lr_rt) {
         JS_FreeRuntime(rt->lr_rt);
@@ -933,6 +938,9 @@ void lr_register_builtins(LR_Runtime *rt)
     lr_crypto_init(rt);
     lr_storage_init(rt);
     lr_fetch_init(rt);
+    lr_fs_init(rt);
+    lr_terminal_init(rt);
+    lr_sysinfo_init(rt);
     lr_worker_init(rt);
     lr_canvas_init(rt);
     lr_promise_init(rt);

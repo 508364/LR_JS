@@ -143,6 +143,7 @@ struct LRObject {
     LRValue       proto;          /* prototype */
     void         *extra;          /* type-specific data (array data, function code, etc.) */
     void         *opaque;         /* user data (for JS_SetOpaque/JS_GetOpaque) */
+    void         (*opaque_free)(void *opaque); /* destructor for opaque data, NULL = free() */
     LRContext    *ctx;            /* owning context */
     uint8_t       is_exotic;      /* has special behavior */
     uint8_t       is_extensible;  /* can add new properties */
@@ -164,6 +165,7 @@ struct LRCFunction {
     int              length;  /* expected arg count */
     int              magic;   /* for magic-based dispatch */
     void            *data;    /* user data */
+    void (*data_free)(void *data); /* destructor for data, NULL = don't free */
 };
 
 /* ── TypedArray Data (stored in opaque) ────────────────────────────────── */
@@ -613,6 +615,8 @@ void *lr_get_context_opaque(LRContext *ctx);
 
 /* Set/get opaque user data on a JS object. */
 void  lr_set_opaque(LRValue obj, void *opaque);
+void  lr_set_opaque_with_free(LRValue obj, void *opaque,
+                               void (*free_func)(void *opaque));
 void *lr_get_opaque(LRValue obj);
 
 /* Define a property with getter/setter functions. */
@@ -868,6 +872,7 @@ LRValue lr_get_typed_array_buffer(LRContext *ctx, LRValue obj,
 #define JS_NewArrayBufferCopy(ctx, buf, len) \
     lr_new_array_buffer_copy(ctx, buf, len)
 LRValue lr_new_array_buffer_copy(LRContext *ctx, const uint8_t *buf, size_t len);
+void lr_array_buffer_free(void *opaque, void *ptr);
 
 #define JS_NewInt64(ctx, val)       lr_new_int32(ctx, (int32_t)(val))  /* simplified */
 #define JS_NewUint32(ctx, val)      lr_new_int32(ctx, (int32_t)(val))

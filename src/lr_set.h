@@ -42,4 +42,6 @@ void lr_set_init(struct LR_Runtime *rt);
 }
 #endif
 
+void lr_set_free_opaque(void *opaque);
+
 #endif /* LR_SET_H */

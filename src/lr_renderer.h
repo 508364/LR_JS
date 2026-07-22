@@ -1,255 +1,286 @@
 /*
- * L/R_JS - Renderer Bridge Module
- * Pure C, IPC-based rendering delegation to external renderers,
- * plus a plugin-based custom renderer interface (EGL, Vulkan, etc.).
- * Uses Unix domain sockets for high-performance local IPC.
- * Protocol: length-prefixed JSON messages.
+ * L/R_JS - Render Pipeline Module
+ * Pure C, all rendering output is forwarded through the render pipeline
+ * to external renderers. No built-in software renderer.
+ *
+ * All rendering (Canvas 2D, WebGL) is wrapped into LR_RenderFrame and
+ * dispatched through LR_RendererWrapper to arbitrary external renderers.
+ * The wrapper is the unified interface — the pipeline does not know
+ * what the external renderer is, it only calls wrapper->submit_frame().
+ *
+ * Built-in sinks (socket, shared memory, callback, file) are available
+ * as additional side-outputs alongside the wrapper.
  */
 #ifndef LR_RENDERER_H
 #define LR_RENDERER_H
 
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
 
-/* Forward declarations */
+/* ── Renderer bridge (thin container for pipeline + shared memory) ──────── */
+
 typedef struct LR_RendererBridge LR_RendererBridge;
-typedef struct LR_RendererConfig LR_RendererConfig;
-typedef struct LR_CustomRenderer LR_CustomRenderer;
-
-/* ── Renderer types ────────────────────────────────────────────────────── */
-
-typedef enum {
-    LR_RENDERER_NONE       = 0,
-    LR_RENDERER_SKIA       = 1,   /* Skia graphics library */
-    LR_RENDERER_HEADLESS   = 2,   /* Headless browser (Chromium/WebKit) */
-    LR_RENDERER_WEBGPU     = 3,   /* WebGPU/Dawn renderer */
-    LR_RENDERER_CUSTOM     = 4,   /* Custom external renderer */
-    LR_RENDERER_INTERNAL   = 5,   /* Internal framebuffer renderer */
-    LR_RENDERER_EGL        = 6,   /* EGL/GLES2 GPU-accelerated renderer */
-    LR_RENDERER_PLUGIN     = 7,   /* User-provided LR_CustomRenderer plugin */
-} LR_RendererType;
-
-/* ── Render command ────────────────────────────────────────────────────── */
-
-typedef enum {
-    LR_RCMD_PAINT           = 0,   /* Full paint request */
-    LR_RCMD_SET_VIEWPORT    = 1,   /* Set viewport size */
-    LR_RCMD_DRAW_RECT       = 2,   /* Draw rectangle */
-    LR_RCMD_DRAW_TEXT       = 3,   /* Draw text */
-    LR_RCMD_DRAW_IMAGE      = 4,   /* Draw image */
-    LR_RCMD_CLEAR           = 5,   /* Clear canvas */
-    LR_RCMD_FLUSH           = 6,   /* Flush render buffer */
-    LR_RCMD_SNAPSHOT        = 7,   /* Take snapshot */
-    LR_RCMD_SET_STYLE       = 8,   /* Set paint style */
-    LR_RCMD_COMPOSITE       = 9,   /* Composite layers */
-    LR_RCMD_CUSTOM          = 99,  /* Custom command */
-} LR_RenderCommand;
-
-/* ── Renderer config ───────────────────────────────────────────────────── */
-
-struct LR_RendererConfig {
-    LR_RendererType  type;
-    char            *socket_path;     /* Unix socket path for IPC */
-    char            *exec_path;       /* External renderer executable */
-    int              width;           /* Default viewport width */
-    int              height;          /* Default viewport height */
-    int              fps;             /* Target FPS */
-    int              double_buffer;   /* Use double buffering */
-    int              use_shm;         /* Use shared memory for buffers */
-    int              shm_size;        /* Shared memory buffer size */
-};
-
-/* ── Custom renderer plugin (vtable) ───────────────────────────────────── */
-
-/*
- * LR_CustomRenderer is a vtable-based plugin interface.
- * Implement this struct and pass it to lr_renderer_set_custom_renderer()
- * to replace the default rendering pipeline with your own.
- *
- * All callbacks receive `user_data` as their first argument.
- * Return 0 on success, non-zero on error.
- */
-struct LR_CustomRenderer {
-    void *user_data;
-
-    /* Lifecycle */
-    int  (*init)         (void *user_data, int width, int height);
-    void (*destroy)      (void *user_data);
-
-    /* Frame lifecycle */
-    int  (*begin_frame)  (void *user_data);
-    int  (*end_frame)    (void *user_data);
-    int  (*present)      (void *user_data);      /* swap/present to display */
-
-    /* Viewport / state */
-    int  (*resize)       (void *user_data, int width, int height);
-    int  (*set_viewport) (void *user_data, int x, int y, int w, int h);
-
-    /* Clear */
-    int  (*clear)        (void *user_data, float r, float g, float b, float a);
-
-    /* 2D drawing primitives */
-    int  (*draw_rect)    (void *user_data, float x, float y, float w, float h,
-                          float r, float g, float b, float a);
-    int  (*draw_text)    (void *user_data, const char *text,
-                          float x, float y, float size,
-                          float r, float g, float b, float a);
-    int  (*draw_image)   (void *user_data, const uint8_t *pixels,
-                          int pw, int ph, float x, float y, float w, float h);
-
-    /* Path / shape */
-    int  (*begin_path)   (void *user_data);
-    int  (*move_to)      (void *user_data, float x, float y);
-    int  (*line_to)      (void *user_data, float x, float y);
-    int  (*arc)          (void *user_data, float cx, float cy, float r,
-                          float start_angle, float end_angle, int counter_clockwise);
-    int  (*fill)         (void *user_data);
-    int  (*stroke)       (void *user_data);
-
-    /* Transform */
-    int  (*save)         (void *user_data);
-    int  (*restore)      (void *user_data);
-    int  (*translate)    (void *user_data, float tx, float ty);
-    int  (*scale)        (void *user_data, float sx, float sy);
-    int  (*rotate)       (void *user_data, float angle_rad);
-
-    /* Pixel readback (for offscreen rendering) */
-    int  (*read_pixels)  (void *user_data, uint32_t *out_buf,
-                          int x, int y, int w, int h);
-
-    /* WebGL / GLES direct access */
-    void *(*get_native_gl) (void *user_data);  /* returns GLES context handle */
-};
-
-/* ── Renderer bridge ───────────────────────────────────────────────────── */
 
 struct LR_RendererBridge {
-    LR_RendererConfig  config;
-    int                socket_fd;     /* Unix domain socket fd */
-    int                connected;
-    int                running;
-
-    /* Shared memory for pixel buffers */
+    /* Shared memory for pixel buffers (optional, for external renderers) */
     int                shm_fd;
     uint8_t           *shm_buf;
     size_t             shm_size;
 
-    /* Frame buffer (internal renderer) */
-    uint32_t          *framebuffer;
-    int                fb_width;
-    int                fb_height;
-
-    /* Custom renderer plugin (EGL, Vulkan, or user-provided) */
-    LR_CustomRenderer  custom_renderer;
-    int                custom_renderer_active;
+    /* Render pipeline (external renderer output) */
+    struct LR_RenderPipeline *pipeline;
 
     /* Stats */
     int64_t            frames_rendered;
     int64_t            total_render_time_us;
 };
 
-/* ── API ───────────────────────────────────────────────────────────────── */
-
-/* Initialize renderer bridge with config. */
-LR_RendererBridge *lr_renderer_create(const LR_RendererConfig *config);
-
-/* Connect to external renderer. */
-int lr_renderer_connect(LR_RendererBridge *rb);
-
-/* Disconnect from renderer. */
-void lr_renderer_disconnect(LR_RendererBridge *rb);
-
-/* Send a render command. */
-int lr_renderer_send_command(LR_RendererBridge *rb, LR_RenderCommand cmd,
-                             const char *json_params);
-
-/* Send raw data to renderer. */
-int lr_renderer_send_raw(LR_RendererBridge *rb, const uint8_t *data,
-                         size_t len);
-
-/* Receive response from renderer (non-blocking). */
-int lr_renderer_recv_response(LR_RendererBridge *rb, char *buf, size_t buf_size);
-
-/* Render a frame using internal framebuffer (no external renderer needed). */
-int lr_renderer_paint_internal(LR_RendererBridge *rb,
-                               const uint32_t *pixels,
-                               int width, int height);
-
-/* Get framebuffer pointer for direct pixel access. */
-uint32_t *lr_renderer_get_framebuffer(LR_RendererBridge *rb,
-                                      int *width, int *height);
-
-/* Output framebuffer as PPM to file. */
-int lr_renderer_save_ppm(LR_RendererBridge *rb, const char *filename);
+/* Create a renderer bridge (initially no pipeline attached). */
+LR_RendererBridge *lr_renderer_create(void);
 
 /* Destroy renderer bridge. */
 void lr_renderer_destroy(LR_RendererBridge *rb);
 
-/* Default config. */
-void lr_renderer_config_default(LR_RendererConfig *cfg);
+/* ── Pipeline integration with renderer bridge ────────────────────────── */
 
-/* Get renderer type string. */
-const char *lr_renderer_type_str(LR_RendererType type);
+/* Forward declaration (defined below in "Render Pipeline" section) */
+typedef struct LR_RenderPipeline LR_RenderPipeline;
 
-/* ── Custom renderer plugin API ────────────────────────────────────────── */
+/* Attach a render pipeline to the bridge. Any existing pipeline is detached. */
+void lr_renderer_set_pipeline(LR_RendererBridge *rb,
+                              LR_RenderPipeline *pipeline);
 
-/*
- * Set a custom renderer plugin on the bridge.
- * This replaces the default rendering pipeline with the provided vtable.
- * The custom renderer takes ownership of the rendering process;
- * IPC and internal framebuffer are bypassed when a custom renderer is active.
+/* Get the currently attached pipeline, or NULL. */
+LR_RenderPipeline *lr_renderer_get_pipeline(LR_RendererBridge *rb);
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  LR_RenderFrame — Unified Frame Wrapper
  *
- * Pass NULL to deactivate the custom renderer and return to default.
- */
-int lr_renderer_set_custom_renderer(LR_RendererBridge *rb,
-                                    const LR_CustomRenderer *renderer);
+ *  Every rendered frame (Canvas 2D, WebGL, etc.) is wrapped into this
+ *  structure before being dispatched to the external renderer.
+ *  This is the universal container that the renderer wrapper receives.
+ * ══════════════════════════════════════════════════════════════════════════ */
 
-/*
- * Get the currently active custom renderer, or NULL if none.
- */
-const LR_CustomRenderer *lr_renderer_get_custom_renderer(LR_RendererBridge *rb);
+/* Pixel format identifiers */
+#define LR_PIXEL_FORMAT_RGBA_U32  0   /* uint32_t ARGB: 0xAARRGGBB */
 
-/*
- * Initialize an EGL-based custom renderer and attach it to the bridge.
- * This is a convenience wrapper that creates an LR_EGLRenderer internally.
+/* Maximum source identifier length */
+#define LR_RENDER_FRAME_SOURCE_LEN  32
+
+typedef struct LR_RenderFrame {
+    /* Frame dimensions */
+    int                width;
+    int                height;
+
+    /* Pixel format and channel count */
+    int                channels;       /* 4 for RGBA */
+    int                pixel_format;   /* LR_PIXEL_FORMAT_* */
+
+    /* Raw pixel data (RGBA 32-bit, width*height*4 bytes) */
+    const uint32_t    *pixels;
+
+    /* Frame metadata */
+    int64_t            timestamp_us;   /* Monotonic timestamp at submission */
+    uint32_t           frame_id;       /* Auto-incrementing frame counter */
+    char               source[LR_RENDER_FRAME_SOURCE_LEN];  /* "canvas2d", "webgl", etc. */
+} LR_RenderFrame;
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  LR_RendererWrapper — External Renderer Interface
  *
- *   offscreen: 1 = headless pbuffer, 0 = on-screen window
- *   native_display: platform display handle (NULL = default)
- *   native_window:  platform window handle (NULL = offscreen only)
+ *  The pipeline does NOT know what the external renderer is.
+ *  Users implement this interface to connect any renderer backend.
+ *
+ *  Lifecycle:
+ *    1. Call lr_render_pipeline_set_wrapper(pipe, &my_wrapper) to attach.
+ *    2. On first frame, the pipeline calls wrapper->init() (if non-NULL).
+ *    3. Each frame is wrapped into LR_RenderFrame and dispatched via
+ *       wrapper->submit_frame().
+ *    4. On pipeline destroy, wrapper->destroy() is called (if non-NULL).
+ *
+ *  The user_data pointer is passed back to all callbacks.
+ *  All callbacks are optional (may be NULL).
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct LR_RendererWrapper {
+    /* Opaque user data passed to all callbacks */
+    void *user_data;
+
+    /*
+     * Initialize the external renderer.
+     * Called once on the first frame submission.
+     * The first frame is provided so the renderer knows the initial format.
+     * Return 0 on success, -1 on error.
+     */
+    int (*init)(void *user_data, const LR_RenderFrame *frame);
+
+    /*
+     * Submit a rendered frame to the external renderer.
+     * Called for every frame. The frame data is valid only during this call.
+     * Return 0 on success, -1 on error.
+     */
+    int (*submit_frame)(void *user_data, const LR_RenderFrame *frame);
+
+    /*
+     * Destroy the external renderer.
+     * Called when the pipeline is destroyed.
+     * Clean up any resources allocated by init().
+     */
+    void (*destroy)(void *user_data);
+} LR_RendererWrapper;
+
+/* ── Render Pipeline (external renderer output) ────────────────────────── */
+
+/*
+ * The render pipeline receives rendered frames from Canvas 2D and WebGL,
+ * wraps them into LR_RenderFrame, and dispatches them through the
+ * LR_RendererWrapper to the external renderer.
+ *
+ * Additionally, built-in side-output sinks (socket, shared memory, callback,
+ * file) can be attached for debugging or parallel output.
+ *
+ * Usage:
+ *   1. Create a pipeline:         lr_render_pipeline_create(w, h)
+ *   2. (Optional) Set a wrapper:  lr_render_pipeline_set_wrapper(pipe, &w)
+ *   3. (Optional) Add side-sinks: lr_render_pipeline_add_sink(pipe, ...)
+ *   4. Canvas 2D submits:         lr_render_pipeline_submit(pipe, pixels, w, h, "canvas2d")
+ *   5. WebGL submits:             lr_render_pipeline_submit_gl(pipe, gl_ctx, w, h)
+ *   6. Destroy:                   lr_render_pipeline_destroy(pipe)
+ */
+
+/* Pipeline sink types (side-outputs alongside the wrapper) */
+typedef enum {
+    LR_PIPE_SINK_SOCKET,    /* Forward via Unix socket / TCP */
+    LR_PIPE_SINK_SHM,       /* Write to shared memory buffer */
+    LR_PIPE_SINK_CALLBACK,  /* Invoke user callback with frame data */
+    LR_PIPE_SINK_FILE,      /* Write frame as PPM (debug) */
+} LR_PipeSinkType;
+
+/* Pipeline output sink configuration */
+typedef struct LR_PipeSink {
+    LR_PipeSinkType type;
+    int              active;     /* 1 = enabled, 0 = disabled */
+
+    /* Socket sink */
+    int              fd;         /* Connected socket fd */
+
+    /* Shared memory sink */
+    void            *shm_ptr;    /* Shared memory buffer pointer */
+    size_t           shm_size;   /* Buffer size */
+
+    /* Callback sink */
+    void            *user_data;  /* Opaque user pointer */
+    void (*on_frame)(void *user_data, const uint32_t *pixels,
+                     int width, int height);  /* Frame callback */
+
+    /* File sink */
+    char            *file_path;  /* Output file path */
+    FILE            *file;       /* Opened file handle */
+    int              frame_no;   /* Frame counter for unique filenames */
+} LR_PipeSink;
+
+/* Render pipeline - receives rendered frames and distributes to wrapper + sinks */
+typedef struct LR_RenderPipeline {
+    int              width;          /* Frame width */
+    int              height;         /* Frame height */
+
+    /* External renderer wrapper (primary output) */
+    LR_RendererWrapper *wrapper;     /* Pluggable external renderer interface */
+
+    /* Side-output sinks (secondary output, alongside wrapper) */
+    LR_PipeSink     *sinks;          /* Array of output sinks */
+    int              sink_count;     /* Number of sinks */
+    int              sink_capacity;  /* Allocated sink capacity */
+
+    /* Internal working buffer */
+    uint32_t        *frame_buffer;   /* Internal working buffer */
+    int              frame_ready;    /* Whether a frame has been submitted */
+
+    /* Auto-incrementing frame counter */
+    uint32_t         frame_counter;
+} LR_RenderPipeline;
+
+/* Create a render pipeline with the given frame dimensions. */
+LR_RenderPipeline *lr_render_pipeline_create(int width, int height);
+
+/* Destroy a render pipeline and all its resources (wrapper + sinks). */
+void lr_render_pipeline_destroy(LR_RenderPipeline *pipe);
+
+/* ── Wrapper management (primary output) ───────────────────────────────── */
+
+/*
+ * Set the external renderer wrapper.
+ * The wrapper is owned by the caller and must remain valid until
+ * the pipeline is destroyed or the wrapper is replaced.
+ * Pass NULL to clear the wrapper.
+ */
+void lr_render_pipeline_set_wrapper(LR_RenderPipeline *pipe,
+                                    LR_RendererWrapper *wrapper);
+
+/* Get the currently attached wrapper, or NULL. */
+LR_RendererWrapper *lr_render_pipeline_get_wrapper(LR_RenderPipeline *pipe);
+
+/* ── Side-output sink management ───────────────────────────────────────── */
+
+/* Add an output sink to the pipeline. Returns sink index, or -1 on error. */
+int lr_render_pipeline_add_sink(LR_RenderPipeline *pipe,
+                                const LR_PipeSink *sink);
+
+/* Remove an output sink by index. */
+int lr_render_pipeline_remove_sink(LR_RenderPipeline *pipe, int index);
+
+/* Enable/disable a sink. */
+int lr_render_pipeline_set_sink_active(LR_RenderPipeline *pipe,
+                                       int index, int active);
+
+/* ── Frame submission ──────────────────────────────────────────────────── */
+
+/*
+ * Submit a rendered frame from Canvas 2D to the pipeline.
+ * The frame is wrapped into LR_RenderFrame and dispatched to:
+ *   1. The external renderer wrapper (if set)
+ *   2. All active side-output sinks (if any)
+ *
+ *   pixels: RGBA 32-bit pixel data (width*height*4 bytes)
+ *   w, h:   frame dimensions
+ *   source: frame source identifier (e.g. "canvas2d"), max 31 chars
  *
  * Returns 0 on success, -1 on error.
  */
-int lr_renderer_init_egl(LR_RendererBridge *rb,
-                         int width, int height, int offscreen,
-                         void *native_display, void *native_window);
+int lr_render_pipeline_submit(LR_RenderPipeline *pipe,
+                              const uint32_t *pixels,
+                              int w, int h,
+                              const char *source);
 
 /*
- * Delegate a draw call to the custom renderer (if active).
- * Falls back to internal framebuffer if no custom renderer is set.
+ * Submit a rendered frame from WebGL/GLES context.
+ * Reads back the current GL framebuffer and dispatches to:
+ *   1. The external renderer wrapper (if set)
+ *   2. All active side-output sinks (if any)
+ *
+ *   gl_ctx:   opaque pointer to native GLES context
+ *   w, h:     viewport dimensions
+ *
+ * Returns 0 on success, -1 on error.
  */
+int lr_render_pipeline_submit_gl(LR_RenderPipeline *pipe,
+                                 void *gl_ctx, int w, int h);
 
-/* Begin a new frame using the custom renderer. */
-int lr_renderer_begin_frame(LR_RendererBridge *rb);
+/* ── Convenience: sink constructors ────────────────────────────────────── */
 
-/* End the current frame. */
-int lr_renderer_end_frame(LR_RendererBridge *rb);
+/* Create a socket sink connected to the given path. */
+LR_PipeSink lr_render_pipe_sink_socket(const char *socket_path);
 
-/* Present the rendered frame (swap buffers for on-screen, no-op for offscreen). */
-int lr_renderer_present(LR_RendererBridge *rb);
+/* Create a shared memory sink. */
+LR_PipeSink lr_render_pipe_sink_shm(void *shm_ptr, size_t shm_size);
 
-/* Clear the canvas. */
-int lr_renderer_clear(LR_RendererBridge *rb, float r, float g, float b, float a);
+/* Create a callback sink. */
+LR_PipeSink lr_render_pipe_sink_callback(
+    void (*on_frame)(void *user, const uint32_t *pixels, int w, int h),
+    void *user_data);
 
-/* Draw a filled rectangle. */
-int lr_renderer_draw_rect(LR_RendererBridge *rb,
-                          float x, float y, float w, float h,
-                          float r, float g, float b, float a);
-
-/* Read back pixels from the renderer. */
-int lr_renderer_read_pixels(LR_RendererBridge *rb,
-                            uint32_t *out_buf, int x, int y, int w, int h);
-
-/* Get native GL context handle (for WebGL interop). Returns NULL if not available. */
-void *lr_renderer_get_native_gl(LR_RendererBridge *rb);
+/* Create a file sink (writes PPM frames). */
+LR_PipeSink lr_render_pipe_sink_file(const char *file_pattern);
 
 #endif /* LR_RENDERER_H */

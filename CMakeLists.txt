@@ -31,6 +31,8 @@ if(MSVC)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /std:c11")
     # Disable noisy warnings
     add_compile_options(/wd4996 /wd4244 /wd4267 /wd4100 /wd4127)
+    # Set source and execution character sets to UTF-8 (fixes C4819)
+    add_compile_options(/utf-8)
     # Define NOMINMAX to avoid Windows.h min/max macros
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 elseif(WIN32)

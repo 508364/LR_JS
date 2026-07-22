@@ -1,10 +1,16 @@
 /*
- * L/R_JS - Renderer Bridge Implementation
- * Pure C, IPC-based rendering delegation + custom renderer plugin support.
+ * L/R_JS - Render Pipeline Implementation
+ * Pure C, no built-in software renderer.
+ * All rendering output is wrapped into LR_RenderFrame and dispatched
+ * through LR_RendererWrapper to external renderers.
+ *
+ * Canvas 2D manages its own framebuffer and submits to pipeline on flush.
+ * WebGL reads back GL framebuffer and submits to pipeline on flush.
  */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include "lr_platform.h"
 
 #if !LR_PLATFORM_WINDOWS
@@ -12,79 +18,59 @@
 #endif
 
 #include "lr_renderer.h"
-#include "lr_renderer_egl.h"
 
-/* ── Helpers ───────────────────────────────────────────────────────────── */
+/* ── Internal helpers ──────────────────────────────────────────────────── */
 
-const char *lr_renderer_type_str(LR_RendererType type)
+/* Get monotonic timestamp in microseconds */
+static int64_t lr_now_us(void)
 {
-    switch (type) {
-    case LR_RENDERER_NONE:     return "none";
-    case LR_RENDERER_SKIA:     return "skia";
-    case LR_RENDERER_HEADLESS: return "headless";
-    case LR_RENDERER_WEBGPU:   return "webgpu";
-    case LR_RENDERER_CUSTOM:   return "custom";
-    case LR_RENDERER_INTERNAL: return "internal";
-    case LR_RENDERER_EGL:      return "egl";
-    case LR_RENDERER_PLUGIN:   return "plugin";
-    default:                   return "unknown";
-    }
+#if defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000000 + (int64_t)tv.tv_usec;
+#endif
 }
 
-void lr_renderer_config_default(LR_RendererConfig *cfg)
+/* Build an LR_RenderFrame from raw pixel data */
+static void lr_build_frame(LR_RenderFrame *frame,
+                           LR_RenderPipeline *pipe,
+                           const uint32_t *pixels,
+                           int w, int h,
+                           const char *source)
 {
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->type          = LR_RENDERER_INTERNAL;
-    cfg->socket_path   = NULL;
-    cfg->exec_path     = NULL;
-    cfg->width         = 800;
-    cfg->height        = 600;
-    cfg->fps           = 60;
-    cfg->double_buffer = 1;
-    cfg->use_shm       = 0;
-    cfg->shm_size      = 0;
+    frame->width       = w;
+    frame->height      = h;
+    frame->channels    = 4;
+    frame->pixel_format = LR_PIXEL_FORMAT_RGBA_U32;
+    frame->pixels      = pixels;
+    frame->timestamp_us = lr_now_us();
+    frame->frame_id    = ++pipe->frame_counter;
+    if (source) {
+        strncpy(frame->source, source, LR_RENDER_FRAME_SOURCE_LEN - 1);
+        frame->source[LR_RENDER_FRAME_SOURCE_LEN - 1] = '\0';
+    } else {
+        frame->source[0] = '\0';
+    }
 }
 
 /* ── Create / Destroy ──────────────────────────────────────────────────── */
 
-LR_RendererBridge *lr_renderer_create(const LR_RendererConfig *config)
+LR_RendererBridge *lr_renderer_create(void)
 {
     LR_RendererBridge *rb = calloc(1, sizeof(LR_RendererBridge));
     if (!rb) return NULL;
 
-    rb->config = *config;
-    rb->socket_fd = -1;
     rb->shm_fd = -1;
-    rb->connected = 0;
-    rb->running = 0;
-    rb->custom_renderer_active = 0;
-
-    /* Allocate internal framebuffer */
-    if (config->type == LR_RENDERER_INTERNAL) {
-        rb->fb_width = config->width;
-        rb->fb_height = config->height;
-        size_t fb_size = (size_t)config->width * (size_t)config->height * sizeof(uint32_t);
-        rb->framebuffer = calloc(1, fb_size);
-        if (!rb->framebuffer) {
-            free(rb);
-            return NULL;
-        }
-    }
-
     return rb;
 }
 
 void lr_renderer_destroy(LR_RendererBridge *rb)
 {
     if (!rb) return;
-
-    lr_renderer_disconnect(rb);
-
-    /* Destroy custom renderer if active */
-    if (rb->custom_renderer_active && rb->custom_renderer.destroy) {
-        rb->custom_renderer.destroy(rb->custom_renderer.user_data);
-        rb->custom_renderer_active = 0;
-    }
 
     if (rb->shm_buf && rb->shm_buf != LR_MMAP_FAILED) {
 #if !LR_PLATFORM_WINDOWS
@@ -97,404 +83,382 @@ void lr_renderer_destroy(LR_RendererBridge *rb)
 #endif
     }
 
-    free(rb->framebuffer);
+    /* Note: pipeline is owned by the caller, not destroyed here */
     free(rb);
 }
 
-/* ── Connection ────────────────────────────────────────────────────────── */
+/* ── Pipeline integration with renderer bridge ────────────────────────── */
 
-int lr_renderer_connect(LR_RendererBridge *rb)
+void lr_renderer_set_pipeline(LR_RendererBridge *rb,
+                              LR_RenderPipeline *pipeline)
 {
-    if (!rb || rb->connected) return -1;
+    if (!rb) return;
+    rb->pipeline = pipeline;
+}
 
-    if (rb->config.type == LR_RENDERER_INTERNAL) {
-        /* Internal renderer doesn't need connection */
-        rb->connected = 1;
-        rb->running = 1;
-        return 0;
-    }
+LR_RenderPipeline *lr_renderer_get_pipeline(LR_RendererBridge *rb)
+{
+    return rb ? rb->pipeline : NULL;
+}
 
-    if (!rb->config.socket_path) return -1;
+/* ══════════════════════════════════════════════════════════════════════════
+ *  Render Pipeline Implementation
+ *  Receives frames from Canvas 2D / WebGL, wraps them into LR_RenderFrame,
+ *  and dispatches to the external renderer wrapper + side-output sinks.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Convenience: create sink configurations ──────────────────────────── */
+
+LR_PipeSink lr_render_pipe_sink_socket(const char *socket_path)
+{
+    LR_PipeSink sink;
+    memset(&sink, 0, sizeof(sink));
+    sink.type = LR_PIPE_SINK_SOCKET;
+    sink.active = 1;
+    sink.fd = -1;
+
+    if (!socket_path) return sink;
 
 #if !LR_PLATFORM_WINDOWS
-    /* Create Unix domain socket */
-    rb->socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (rb->socket_fd < 0) return -1;
-
-    /* Set non-blocking */
-    lr_socket_set_nonblock(rb->socket_fd);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return sink;
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, rb->config.socket_path, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
-    if (connect(rb->socket_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        if (!lr_socket_einprog()) {
-            lr_socket_close(rb->socket_fd);
-            rb->socket_fd = -1;
-            return -1;
-        }
-    }
-
-    rb->connected = 1;
-    rb->running = 1;
-
-    /* Setup shared memory if configured */
-    if (rb->config.use_shm && rb->config.shm_size > 0) {
-        rb->shm_fd = shm_open("/lr_js_render_shm", O_CREAT | O_RDWR, 0600);
-        if (rb->shm_fd >= 0) {
-            if (ftruncate(rb->shm_fd, (off_t)rb->config.shm_size) != 0) {
-                /* ignore truncate error, mmap will fail if needed */
-            }
-            rb->shm_buf = mmap(NULL, rb->config.shm_size,
-                               PROT_READ | PROT_WRITE,
-                               MAP_SHARED, rb->shm_fd, 0);
-            rb->shm_size = rb->config.shm_size;
-        }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        sink.fd = fd;
+    } else {
+        lr_socket_close(fd);
     }
 #else
-    /* Windows: external renderer via TCP or internal fallback */
-    /* For now, fall back to internal renderer */
-    rb->connected = 1;
-    rb->running = 1;
+    (void)socket_path;
 #endif
 
+    return sink;
+}
+
+LR_PipeSink lr_render_pipe_sink_shm(void *shm_ptr, size_t shm_size)
+{
+    LR_PipeSink sink;
+    memset(&sink, 0, sizeof(sink));
+    sink.type = LR_PIPE_SINK_SHM;
+    sink.active = 1;
+    sink.shm_ptr = shm_ptr;
+    sink.shm_size = shm_size;
+    return sink;
+}
+
+LR_PipeSink lr_render_pipe_sink_callback(
+    void (*on_frame)(void *user, const uint32_t *pixels, int w, int h),
+    void *user_data)
+{
+    LR_PipeSink sink;
+    memset(&sink, 0, sizeof(sink));
+    sink.type = LR_PIPE_SINK_CALLBACK;
+    sink.active = 1;
+    sink.on_frame = on_frame;
+    sink.user_data = user_data;
+    return sink;
+}
+
+LR_PipeSink lr_render_pipe_sink_file(const char *file_path)
+{
+    LR_PipeSink sink;
+    memset(&sink, 0, sizeof(sink));
+    sink.type = LR_PIPE_SINK_FILE;
+    sink.active = 1;
+    sink.frame_no = 0;
+    if (file_path) {
+        sink.file_path = strdup(file_path);
+    }
+    return sink;
+}
+
+/* ── Pipeline create / destroy ──────────────────────────────────────────── */
+
+LR_RenderPipeline *lr_render_pipeline_create(int width, int height)
+{
+    LR_RenderPipeline *pipe = calloc(1, sizeof(LR_RenderPipeline));
+    if (!pipe) return NULL;
+
+    pipe->width = width > 0 ? width : 800;
+    pipe->height = height > 0 ? height : 600;
+    pipe->sink_capacity = 4;
+    pipe->sinks = calloc((size_t)pipe->sink_capacity, sizeof(LR_PipeSink));
+    if (!pipe->sinks) {
+        free(pipe);
+        return NULL;
+    }
+
+    /* Allocate internal frame buffer */
+    size_t fb_size = (size_t)pipe->width * (size_t)pipe->height * sizeof(uint32_t);
+    pipe->frame_buffer = calloc(1, fb_size);
+    if (!pipe->frame_buffer) {
+        free(pipe->sinks);
+        free(pipe);
+        return NULL;
+    }
+
+    /* Frame counter starts at 0 */
+    pipe->frame_counter = 0;
+
+    return pipe;
+}
+
+void lr_render_pipeline_destroy(LR_RenderPipeline *pipe)
+{
+    if (!pipe) return;
+
+    /* Call the wrapper's destroy callback */
+    if (pipe->wrapper && pipe->wrapper->destroy) {
+        pipe->wrapper->destroy(pipe->wrapper->user_data);
+    }
+
+    /* Close all side-output sinks */
+    for (int i = 0; i < pipe->sink_count; i++) {
+        LR_PipeSink *sink = &pipe->sinks[i];
+        if (sink->type == LR_PIPE_SINK_SOCKET && sink->fd >= 0) {
+            lr_socket_close(sink->fd);
+        }
+        if (sink->type == LR_PIPE_SINK_FILE && sink->file) {
+            fclose(sink->file);
+        }
+        free(sink->file_path);
+    }
+
+    free(pipe->sinks);
+    free(pipe->frame_buffer);
+    free(pipe);
+}
+
+/* ── Wrapper management ────────────────────────────────────────────────── */
+
+void lr_render_pipeline_set_wrapper(LR_RenderPipeline *pipe,
+                                    LR_RendererWrapper *wrapper)
+{
+    if (!pipe) return;
+    pipe->wrapper = wrapper;
+}
+
+LR_RendererWrapper *lr_render_pipeline_get_wrapper(LR_RenderPipeline *pipe)
+{
+    return pipe ? pipe->wrapper : NULL;
+}
+
+/* ── Sink management ────────────────────────────────────────────────────── */
+
+int lr_render_pipeline_add_sink(LR_RenderPipeline *pipe,
+                                const LR_PipeSink *sink)
+{
+    if (!pipe || !sink) return -1;
+
+    /* Grow array if needed */
+    if (pipe->sink_count >= pipe->sink_capacity) {
+        int new_cap = pipe->sink_capacity * 2;
+        LR_PipeSink *new_sinks = realloc(pipe->sinks,
+                                         (size_t)new_cap * sizeof(LR_PipeSink));
+        if (!new_sinks) return -1;
+        pipe->sinks = new_sinks;
+        pipe->sink_capacity = new_cap;
+    }
+
+    pipe->sinks[pipe->sink_count] = *sink;
+    return pipe->sink_count++;
+}
+
+int lr_render_pipeline_remove_sink(LR_RenderPipeline *pipe, int index)
+{
+    if (!pipe || index < 0 || index >= pipe->sink_count) return -1;
+
+    LR_PipeSink *sink = &pipe->sinks[index];
+    if (sink->type == LR_PIPE_SINK_SOCKET && sink->fd >= 0) {
+        lr_socket_close(sink->fd);
+    }
+    if (sink->type == LR_PIPE_SINK_FILE && sink->file) {
+        fclose(sink->file);
+    }
+    free(sink->file_path);
+
+    /* Shift remaining sinks */
+    int remaining = pipe->sink_count - index - 1;
+    if (remaining > 0) {
+        memmove(&pipe->sinks[index], &pipe->sinks[index + 1],
+                (size_t)remaining * sizeof(LR_PipeSink));
+    }
+    pipe->sink_count--;
     return 0;
 }
 
-void lr_renderer_disconnect(LR_RendererBridge *rb)
+int lr_render_pipeline_set_sink_active(LR_RenderPipeline *pipe,
+                                       int index, int active)
 {
-    if (!rb) return;
-
-    rb->running = 0;
-    rb->connected = 0;
-
-    if (rb->socket_fd >= 0) {
-        lr_socket_close(rb->socket_fd);
-        rb->socket_fd = -1;
-    }
+    if (!pipe || index < 0 || index >= pipe->sink_count) return -1;
+    pipe->sinks[index].active = !!active;
+    return 0;
 }
 
-/* ── Send / Receive ────────────────────────────────────────────────────── */
+/* ── Internal: send frame to a single side-output sink ──────────────────── */
 
-int lr_renderer_send_command(LR_RendererBridge *rb, LR_RenderCommand cmd,
-                             const char *json_params)
+static int pipe_sink_send_frame(LR_PipeSink *sink,
+                                const uint32_t *pixels,
+                                int width, int height)
 {
-    if (!rb || !rb->connected) return -1;
-
-    /* Build length-prefixed message */
+    size_t data_size = (size_t)width * (size_t)height * sizeof(uint32_t);
+    size_t header_size = 64;
     char header[64];
-    int header_len = 0;
-    if (json_params) {
-        header_len = snprintf(header, sizeof(header), "%d %zu\n", (int)cmd, strlen(json_params));
-    } else {
-        header_len = snprintf(header, sizeof(header), "%d 0\n", (int)cmd);
-    }
 
-    if (rb->config.type == LR_RENDERER_INTERNAL) {
-        /* Internal renderer processes commands directly */
-        return 0;
-    }
+    switch (sink->type) {
+    case LR_PIPE_SINK_SOCKET:
+        if (sink->fd < 0) return -1;
+        /* Send length-prefixed frame: "FRAME W H <size>\n" + raw pixel data */
+        snprintf(header, sizeof(header), "FRAME %d %d %zu\n", width, height, data_size);
+        if (send(sink->fd, header, strlen(header), MSG_NOSIGNAL) < 0) return -1;
+        if (send(sink->fd, (const char *)pixels, data_size, MSG_NOSIGNAL) < 0) return -1;
+        break;
 
-    /* Send header */
-    if (send(rb->socket_fd, header, (size_t)header_len, MSG_NOSIGNAL) < 0) {
-        return -1;
-    }
+    case LR_PIPE_SINK_SHM:
+        if (!sink->shm_ptr || sink->shm_size < data_size + header_size) return -1;
+        /* Write header + pixel data into shared memory */
+        snprintf((char *)sink->shm_ptr, header_size, "FRAME %d %d %zu\n", width, height, data_size);
+        memcpy((uint8_t *)sink->shm_ptr + header_size, pixels, data_size);
+        break;
 
-    /* Send JSON body */
-    if (json_params && strlen(json_params) > 0) {
-        if (send(rb->socket_fd, json_params, strlen(json_params), MSG_NOSIGNAL) < 0) {
-            return -1;
+    case LR_PIPE_SINK_CALLBACK:
+        if (sink->on_frame) {
+            sink->on_frame(sink->user_data, pixels, width, height);
         }
-    }
+        break;
 
-    return 0;
-}
-
-int lr_renderer_send_raw(LR_RendererBridge *rb, const uint8_t *data,
-                         size_t len)
-{
-    if (!rb || !rb->connected || !data) return -1;
-
-    if (rb->config.type == LR_RENDERER_INTERNAL) {
-        return 0;
-    }
-
-    if (send(rb->socket_fd, data, len, MSG_NOSIGNAL) < 0) {
-        return -1;
-    }
-
-    return 0;
-}
-
-int lr_renderer_recv_response(LR_RendererBridge *rb, char *buf, size_t buf_size)
-{
-    if (!rb || !rb->connected || !buf) return -1;
-
-    if (rb->config.type == LR_RENDERER_INTERNAL) {
-        return 0;
-    }
-
-    ssize_t n = recv(rb->socket_fd, buf, buf_size - 1, MSG_DONTWAIT);
-    if (n < 0) {
-        if (lr_socket_eagain()) return 0;
-        return -1;
-    }
-    if (n == 0) {
-        rb->connected = 0;
-        return -1;
-    }
-
-    buf[n] = '\0';
-    return (int)n;
-}
-
-/* ── Internal framebuffer ──────────────────────────────────────────────── */
-
-int lr_renderer_paint_internal(LR_RendererBridge *rb,
-                               const uint32_t *pixels,
-                               int width, int height)
-{
-    if (!rb || !pixels) return -1;
-
-    if (rb->config.type != LR_RENDERER_INTERNAL) {
-        /* Forward to external renderer */
-        return lr_renderer_send_command(rb, LR_RCMD_PAINT, NULL);
-    }
-
-    /* Resize framebuffer if needed */
-    if (width != rb->fb_width || height != rb->fb_height) {
-        size_t new_size = (size_t)width * (size_t)height * sizeof(uint32_t);
-        uint32_t *new_fb = realloc(rb->framebuffer, new_size);
-        if (!new_fb) return -1;
-        rb->framebuffer = new_fb;
-        rb->fb_width = width;
-        rb->fb_height = height;
-    }
-
-    /* Copy pixels */
-    size_t copy_size = (size_t)width * (size_t)height * sizeof(uint32_t);
-    memcpy(rb->framebuffer, pixels, copy_size);
-
-    rb->frames_rendered++;
-    return 0;
-}
-
-uint32_t *lr_renderer_get_framebuffer(LR_RendererBridge *rb,
-                                      int *width, int *height)
-{
-    if (!rb || !rb->framebuffer) return NULL;
-    if (width) *width = rb->fb_width;
-    if (height) *height = rb->fb_height;
-    return rb->framebuffer;
-}
-
-int lr_renderer_save_ppm(LR_RendererBridge *rb, const char *filename)
-{
-    if (!rb || !rb->framebuffer || !filename) return -1;
-
-    FILE *f = fopen(filename, "wb");
-    if (!f) return -1;
-
-    fprintf(f, "P6\n%d %d\n255\n", rb->fb_width, rb->fb_height);
-
-    for (int i = 0; i < rb->fb_height; i++) {
-        for (int j = 0; j < rb->fb_width; j++) {
-            uint32_t pixel = rb->framebuffer[i * rb->fb_width + j];
-            uint8_t rgb[3];
-            rgb[0] = (pixel >> 16) & 0xFF;  /* R */
-            rgb[1] = (pixel >> 8) & 0xFF;   /* G */
-            rgb[2] = pixel & 0xFF;          /* B */
-            fwrite(rgb, 1, 3, f);
+    case LR_PIPE_SINK_FILE: {
+        /* Write as PPM (frame_0001.ppm, frame_0002.ppm, ...) */
+        char filename[512];
+        if (sink->file_path) {
+            snprintf(filename, sizeof(filename), sink->file_path, sink->frame_no + 1);
+        } else {
+            snprintf(filename, sizeof(filename), "frame_%04d.ppm", sink->frame_no + 1);
         }
-    }
-
-    fclose(f);
-    return 0;
-}
-
-/* ── Custom Renderer Plugin API ────────────────────────────────────────── */
-
-int lr_renderer_set_custom_renderer(LR_RendererBridge *rb,
-                                    const LR_CustomRenderer *renderer)
-{
-    if (!rb) return -1;
-
-    /* Destroy existing custom renderer if active */
-    if (rb->custom_renderer_active && rb->custom_renderer.destroy) {
-        rb->custom_renderer.destroy(rb->custom_renderer.user_data);
-    }
-    rb->custom_renderer_active = 0;
-    memset(&rb->custom_renderer, 0, sizeof(rb->custom_renderer));
-
-    if (renderer) {
-        rb->custom_renderer = *renderer;
-        rb->custom_renderer_active = 1;
-
-        /* Initialize the custom renderer */
-        if (rb->custom_renderer.init) {
-            int w = rb->fb_width > 0 ? rb->fb_width : rb->config.width;
-            int h = rb->fb_height > 0 ? rb->fb_height : rb->config.height;
-            if (rb->custom_renderer.init(rb->custom_renderer.user_data, w, h) != 0) {
-                rb->custom_renderer_active = 0;
-                memset(&rb->custom_renderer, 0, sizeof(rb->custom_renderer));
-                return -1;
+        FILE *f = fopen(filename, "wb");
+        if (!f) return -1;
+        fprintf(f, "P6\n%d %d\n255\n", width, height);
+        for (int i = 0; i < height; i++) {
+            for (int j = 0; j < width; j++) {
+                uint32_t pixel = pixels[i * width + j];
+                uint8_t rgb[3];
+                rgb[0] = (pixel >> 16) & 0xFF;  /* R */
+                rgb[1] = (pixel >> 8) & 0xFF;   /* G */
+                rgb[2] = pixel & 0xFF;          /* B */
+                fwrite(rgb, 1, 3, f);
             }
         }
+        fclose(f);
+        sink->frame_no++;
+        break;
+    }
     }
 
     return 0;
 }
 
-const LR_CustomRenderer *lr_renderer_get_custom_renderer(LR_RendererBridge *rb)
+/* ── Internal: dispatch LR_RenderFrame to wrapper + sinks ──────────────── */
+
+static int lr_dispatch_frame(LR_RenderPipeline *pipe,
+                              const LR_RenderFrame *frame)
 {
-    if (!rb || !rb->custom_renderer_active) return NULL;
-    return &rb->custom_renderer;
-}
+    int ret = 0;
 
-int lr_renderer_init_egl(LR_RendererBridge *rb,
-                         int width, int height, int offscreen,
-                         void *native_display, void *native_window)
-{
-    if (!rb) return -1;
-
-    if (!lr_egl_is_available()) {
-        fprintf(stderr, "[LR_JS] EGL is not available (compile with -DLR_HAS_EGL and link -lEGL -lGLESv2)\n");
-        return -1;
-    }
-
-    LR_EGLRenderer *egl = lr_egl_renderer_create(width, height, offscreen,
-                                                  native_display, native_window);
-    if (!egl) {
-        fprintf(stderr, "[LR_JS] Failed to create EGL renderer\n");
-        return -1;
-    }
-
-    const LR_CustomRenderer *iface = lr_egl_renderer_get_interface(egl);
-    if (!iface) {
-        lr_egl_renderer_destroy(egl);
-        return -1;
-    }
-
-    if (lr_renderer_set_custom_renderer(rb, iface) != 0) {
-        lr_egl_renderer_destroy(egl);
-        return -1;
-    }
-
-    rb->fb_width = width;
-    rb->fb_height = height;
-
-    return 0;
-}
-
-/* ── Delegate drawing calls to custom renderer ─────────────────────────── */
-
-int lr_renderer_begin_frame(LR_RendererBridge *rb)
-{
-    if (!rb) return -1;
-    if (rb->custom_renderer_active && rb->custom_renderer.begin_frame) {
-        return rb->custom_renderer.begin_frame(rb->custom_renderer.user_data);
-    }
-    return 0;
-}
-
-int lr_renderer_end_frame(LR_RendererBridge *rb)
-{
-    if (!rb) return -1;
-    if (rb->custom_renderer_active && rb->custom_renderer.end_frame) {
-        return rb->custom_renderer.end_frame(rb->custom_renderer.user_data);
-    }
-    return 0;
-}
-
-int lr_renderer_present(LR_RendererBridge *rb)
-{
-    if (!rb) return -1;
-    if (rb->custom_renderer_active && rb->custom_renderer.present) {
-        return rb->custom_renderer.present(rb->custom_renderer.user_data);
-    }
-    return 0;
-}
-
-int lr_renderer_clear(LR_RendererBridge *rb, float r, float g, float b, float a)
-{
-    if (!rb) return -1;
-    if (rb->custom_renderer_active && rb->custom_renderer.clear) {
-        return rb->custom_renderer.clear(rb->custom_renderer.user_data, r, g, b, a);
-    }
-    /* Fallback: clear internal framebuffer */
-    if (rb->framebuffer) {
-        uint32_t color = ((uint32_t)(r * 255.0f) << 16)
-                       | ((uint32_t)(g * 255.0f) << 8)
-                       | ((uint32_t)(b * 255.0f))
-                       | ((uint32_t)(a * 255.0f) << 24);
-        size_t count = (size_t)rb->fb_width * (size_t)rb->fb_height;
-        for (size_t i = 0; i < count; i++) {
-            rb->framebuffer[i] = color;
-        }
-    }
-    return 0;
-}
-
-int lr_renderer_draw_rect(LR_RendererBridge *rb,
-                          float x, float y, float w, float h,
-                          float r, float g, float b, float a)
-{
-    if (!rb) return -1;
-    if (rb->custom_renderer_active && rb->custom_renderer.draw_rect) {
-        return rb->custom_renderer.draw_rect(rb->custom_renderer.user_data,
-                                              x, y, w, h, r, g, b, a);
-    }
-    /* Fallback: draw to internal framebuffer */
-    if (rb->framebuffer) {
-        uint32_t color = ((uint32_t)(r * 255.0f) << 16)
-                       | ((uint32_t)(g * 255.0f) << 8)
-                       | ((uint32_t)(b * 255.0f))
-                       | ((uint32_t)(a * 255.0f) << 24);
-        int ix = (int)x, iy = (int)y;
-        int iw = (int)w, ih = (int)h;
-        if (ix < 0) { iw += ix; ix = 0; }
-        if (iy < 0) { ih += iy; iy = 0; }
-        if (ix + iw > rb->fb_width)  iw = rb->fb_width - ix;
-        if (iy + ih > rb->fb_height) ih = rb->fb_height - iy;
-        if (iw <= 0 || ih <= 0) return 0;
-        for (int row = iy; row < iy + ih; row++) {
-            for (int col = ix; col < ix + iw; col++) {
-                rb->framebuffer[row * rb->fb_width + col] = color;
+    /* 1. Dispatch to the external renderer wrapper (primary output) */
+    if (pipe->wrapper && pipe->wrapper->submit_frame) {
+        /* Call init on first frame if available */
+        if (pipe->frame_counter == 1 && pipe->wrapper->init) {
+            if (pipe->wrapper->init(pipe->wrapper->user_data, frame) != 0) {
+                /* Init failed - still try to submit */
             }
         }
+        if (pipe->wrapper->submit_frame(pipe->wrapper->user_data, frame) != 0) {
+            ret = -1;
+        }
     }
-    return 0;
+
+    /* 2. Dispatch to side-output sinks (secondary output) */
+    for (int i = 0; i < pipe->sink_count; i++) {
+        if (pipe->sinks[i].active) {
+            pipe_sink_send_frame(&pipe->sinks[i], frame->pixels,
+                                 frame->width, frame->height);
+        }
+    }
+
+    return ret;
 }
 
-int lr_renderer_read_pixels(LR_RendererBridge *rb,
-                            uint32_t *out_buf, int x, int y, int w, int h)
+/* ── Submit frame (from Canvas 2D) ──────────────────────────────────────── */
+
+int lr_render_pipeline_submit(LR_RenderPipeline *pipe,
+                              const uint32_t *pixels,
+                              int w, int h,
+                              const char *source)
 {
-    if (!rb || !out_buf) return -1;
-    if (rb->custom_renderer_active && rb->custom_renderer.read_pixels) {
-        return rb->custom_renderer.read_pixels(rb->custom_renderer.user_data,
-                                                out_buf, x, y, w, h);
+    if (!pipe || !pixels) return -1;
+    if (w != pipe->width || h != pipe->height) return -1;
+
+    /* Copy to internal buffer */
+    size_t fb_size = (size_t)w * (size_t)h * sizeof(uint32_t);
+
+    /* Resize internal buffer if needed */
+    size_t cur_size = (size_t)pipe->width * (size_t)pipe->height * sizeof(uint32_t);
+    if (fb_size > cur_size) {
+        uint32_t *new_buf = realloc(pipe->frame_buffer, fb_size);
+        if (!new_buf) return -1;
+        pipe->frame_buffer = new_buf;
+        pipe->width = w;
+        pipe->height = h;
     }
-    /* Fallback: read from internal framebuffer */
-    if (rb->framebuffer) {
-        int fw = rb->fb_width, fh = rb->fb_height;
-        if (x < 0 || y < 0 || x + w > fw || y + h > fh) return -1;
-        for (int row = 0; row < h; row++) {
-            memcpy(out_buf + row * w,
-                   rb->framebuffer + (y + row) * fw + x,
-                   (size_t)w * sizeof(uint32_t));
-        }
-        return 0;
+
+    memcpy(pipe->frame_buffer, pixels, fb_size);
+    pipe->frame_ready = 1;
+
+    /* Build LR_RenderFrame and dispatch */
+    LR_RenderFrame frame;
+    lr_build_frame(&frame, pipe, pipe->frame_buffer, w, h, source);
+    return lr_dispatch_frame(pipe, &frame);
+}
+
+/* ── Submit GL frame (from WebGL) ───────────────────────────────────────── */
+
+int lr_render_pipeline_submit_gl(LR_RenderPipeline *pipe,
+                                 void *gl_ctx, int w, int h)
+{
+    if (!pipe || !gl_ctx) return -1;
+
+#if LR_EGL_AVAILABLE
+    /* Read back the GL framebuffer */
+    size_t fb_size = (size_t)w * (size_t)h * sizeof(uint32_t);
+
+    /* Ensure internal buffer is large enough */
+    size_t cur_size = (size_t)pipe->width * (size_t)pipe->height * sizeof(uint32_t);
+    if (fb_size > cur_size) {
+        uint32_t *new_buf = realloc(pipe->frame_buffer, fb_size);
+        if (!new_buf) return -1;
+        pipe->frame_buffer = new_buf;
     }
+    pipe->width = w;
+    pipe->height = h;
+
+    /* Read pixels from the current GL framebuffer */
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pipe->frame_buffer);
+    pipe->frame_ready = 1;
+
+    /* Build LR_RenderFrame and dispatch */
+    LR_RenderFrame frame;
+    lr_build_frame(&frame, pipe, pipe->frame_buffer, w, h, "webgl");
+    return lr_dispatch_frame(pipe, &frame);
+#else
+    (void)gl_ctx;
+    (void)w;
+    (void)h;
+    /* No GLES available - nothing to read back */
     return -1;
-}
-
-void *lr_renderer_get_native_gl(LR_RendererBridge *rb)
-{
-    if (!rb || !rb->custom_renderer_active) return NULL;
-    if (rb->custom_renderer.get_native_gl) {
-        return rb->custom_renderer.get_native_gl(rb->custom_renderer.user_data);
-    }
-    return NULL;
+#endif
 }

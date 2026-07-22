@@ -36,10 +36,12 @@ static void lr_free(LRRuntime *rt, void *ptr, size_t size)
 {
     if (ptr) {
         free(ptr);
-        rt->malloc_size -= size;
-        rt->malloc_count--;
-        rt->memory_used_count--;
-        rt->memory_used_size -= size;
+        if (rt) {
+            rt->malloc_size -= size;
+            rt->malloc_count--;
+            rt->memory_used_count--;
+            rt->memory_used_size -= size;
+        }
     }
 }
 
@@ -63,7 +65,7 @@ static void lr_string_free(LRRuntime *rt, LRString *s)
 {
     if (!s) return;
     /* Clear from small string cache if present, to prevent dangling pointer */
-    if (s->len > 0 && s->len <= 32) {
+    if (rt && s->len > 0 && s->len <= 32) {
         unsigned int hash = 5381;
         for (size_t i = 0; i < s->len; i++) {
             hash = ((hash << 5) + hash) + (unsigned char)s->str[i];
@@ -73,16 +75,24 @@ static void lr_string_free(LRRuntime *rt, LRString *s)
             rt->small_string_cache[idx] = NULL;
         }
     }
-    rt->str_count--;
-    rt->str_size -= (int64_t)(sizeof(LRString) + s->len + 1);
+    if (rt) {
+        rt->str_count--;
+        rt->str_size -= (int64_t)(sizeof(LRString) + s->len + 1);
+    }
     lr_free(rt, s, sizeof(LRString) + s->len + 1);
 }
 
 static void lr_string_release(LRRuntime *rt, LRString *s)
 {
     if (!s) return;
-    if (--s->ref_count <= 0)
-        lr_string_free(rt, s);
+    if (--s->ref_count <= 0) {
+        if (rt) {
+            lr_string_free(rt, s);
+        } else {
+            free(s->str);
+            free(s);
+        }
+    }
 }
 
 static LRString *lr_string_dup(LRString *s)
@@ -198,6 +208,7 @@ static LRObject *lr_object_alloc(LRRuntime *rt)
     obj->ref_count = 1;
     obj->type = LR_OBJ_PLAIN;
     obj->is_extensible = 1;
+    obj->opaque_free = NULL;
     /* Link into runtime object list for GC tracking */
     obj->gc_next = rt->obj_list;
     rt->obj_list = obj;
@@ -249,9 +260,13 @@ void lr_free_object(LRRuntime *rt, LRObject *obj)
             lr_free_value(free_ctx, prop->value);
             if (prop->setter.tag != LR_TYPE_UNDEFINED)
                 lr_free_value(free_ctx, prop->setter);
-            lr_free(rt, prop, sizeof(LRProperty));
-            rt->prop_count--;
-            rt->prop_size -= sizeof(LRProperty);
+            if (rt) {
+                lr_free(rt, prop, sizeof(LRProperty));
+                rt->prop_count--;
+                rt->prop_size -= sizeof(LRProperty);
+            } else {
+                free(prop);
+            }
             prop = next;
         }
         obj->prop_hash = NULL;
@@ -272,6 +287,11 @@ void lr_free_object(LRRuntime *rt, LRObject *obj)
             LRCFunction *cf = (LRCFunction *)obj->extra;
             if (cf) {
                 free((void *)cf->name);
+                if (cf->data_free) {
+                    cf->data_free(cf->data);
+                } else {
+                    /* Legacy: free data for functions that set it directly */
+                }
                 free(cf);
             }
             obj->extra = NULL;
@@ -299,12 +319,12 @@ void lr_free_object(LRRuntime *rt, LRObject *obj)
         }
     }
 
-    /* Free opaque data (typed arrays / data views) */
+    /* Free opaque data (typed arrays / data views / promises / generic) */
     if (obj->opaque) {
         if (obj->type == LR_OBJ_TYPED_ARRAY) {
             TypedArrayData *tad = (TypedArrayData *)obj->opaque;
             lr_free_value(free_ctx, tad->buffer);
-            free(tad->name);
+            free((void *)(tad->name));
             free(tad);
             obj->opaque = NULL;
         } else if (obj->type == LR_OBJ_DATA_VIEW) {
@@ -312,9 +332,38 @@ void lr_free_object(LRRuntime *rt, LRObject *obj)
             lr_free_value(free_ctx, dvd->buffer);
             free(dvd);
             obj->opaque = NULL;
+        } else if (obj->type == LR_OBJ_PROMISE) {
+            LRPromiseData *pd = (LRPromiseData *)obj->opaque;
+            if (pd) {
+                lr_free_value(free_ctx, pd->result);
+                for (int i = 0; i < pd->fulfill_count; i++) {
+                    lr_free_value(free_ctx, pd->fulfill_reactions[i].handler);
+                    lr_free_value(free_ctx, pd->fulfill_reactions[i].resolve);
+                    lr_free_value(free_ctx, pd->fulfill_reactions[i].reject);
+                    lr_free_value(free_ctx, pd->fulfill_reactions[i].promise);
+                }
+                for (int i = 0; i < pd->reject_count; i++) {
+                    lr_free_value(free_ctx, pd->reject_reactions[i].handler);
+                    lr_free_value(free_ctx, pd->reject_reactions[i].resolve);
+                    lr_free_value(free_ctx, pd->reject_reactions[i].reject);
+                    lr_free_value(free_ctx, pd->reject_reactions[i].promise);
+                }
+                free(pd->fulfill_reactions);
+                free(pd->reject_reactions);
+                free(pd);
+            }
+            obj->opaque = NULL;
+        } else {
+            /* Generic opaque data: use destructor if set, otherwise free() */
+            if (obj->opaque_free) {
+                obj->opaque_free(obj->opaque);
+            } else {
+                free(obj->opaque);
+            }
+            obj->opaque = NULL;
         }
     }
-    rt->obj_count--;
+    if (rt) rt->obj_count--;
     free(obj);
 }
 
@@ -509,6 +558,7 @@ LRValue lr_new_cfunction2(LRContext *ctx, LRCFunctionFunc func,
     cf->length = length;
     cf->magic = magic;
     cf->data = NULL;
+    cf->data_free = NULL;
     obj->extra = cf;
 
     v.tag = LR_TYPE_OBJECT;
@@ -564,7 +614,7 @@ void lr_free_value(LRContext *ctx, LRValue val)
             lr_object_release(ctx->rt, obj);
         } else {
             if (--obj->ref_count <= 0) {
-                free(obj);
+                lr_free_object(NULL, obj);
             }
         }
     }
@@ -2035,13 +2085,45 @@ void lr_free_context(LRContext *ctx)
         lr_set_property_str(ctx, ctx->global_obj, "globalThis", LR_VALUE_UNDEFINED);
     }
     lr_free_value(ctx, ctx->global_obj);
+
+    /* Break circular references (ctor↔proto) in remaining objects.
+     * Clear all property values that are objects to LR_VALUE_UNDEFINED,
+     * and clear obj->proto to break prototype chains.
+     * This allows the remaining objects to be freed safely. */
+    if (rt && rt->obj_list) {
+        LRObject *obj = rt->obj_list;
+        while (obj) {
+            LRProperty *prop = obj->prop_hash;
+            while (prop) {
+                if (prop->value.tag == LR_TYPE_OBJECT) {
+                    prop->value = LR_VALUE_UNDEFINED;
+                }
+                if (prop->setter.tag == LR_TYPE_OBJECT) {
+                    prop->setter = LR_VALUE_UNDEFINED;
+                }
+                prop = prop->next;
+            }
+            for (uint32_t i = 0; i < obj->prop_count; i++) {
+                if (obj->props[i].tag == LR_TYPE_OBJECT) {
+                    obj->props[i] = LR_VALUE_UNDEFINED;
+                }
+            }
+            if (obj->proto.tag == LR_TYPE_OBJECT) {
+                obj->proto = LR_VALUE_UNDEFINED;
+            }
+            obj = obj->gc_next;
+        }
+    }
     /* Free atom table */
     for (uint32_t i = 0; i < ctx->atom_count; i++) {
         lr_string_free(rt, ctx->atom_table[i]);
     }
     free(ctx->atom_table);
     free(ctx->error_message);
-    free(ctx);
+    /* Note: ctx itself is NOT freed here. The caller (lr_runtime_free)
+     * is responsible for freeing ctx AFTER the object cleanup loop,
+     * because objects still reference ctx via obj->ctx and need it
+     * for safe cleanup (e.g., data_free callbacks, opaque freeing). */
 }
 
 void lr_set_memory_limit(LRRuntime *rt, size_t limit)  { rt->malloc_limit = limit; }
@@ -2088,6 +2170,11 @@ LRValue lr_engine_eval(LRContext *ctx, const char *input, size_t input_len,
         const char *err_msg = parser_get_error(&parser, NULL, NULL);
         if (err_msg) {
             fprintf(stderr, "[LR_JS] Parse error: %s\n", err_msg);
+        }
+        /* Free AST if it was partially allocated (e.g. parse error after
+         * some nodes were created) */
+        if (ast) {
+            ast_free_ex(ast, &parser);
         }
         parser_free(&parser);
         return lr_throw_syntax_error(ctx, "%s: parse error",
@@ -3112,7 +3199,7 @@ uint8_t *lr_get_array_buffer(LRContext *ctx, size_t *psize, LRValue obj)
     return (uint8_t *)o->extra;
 }
 
-static void lr_array_buffer_free(void *opaque, void *ptr) { (void)opaque; free(ptr); }
+void lr_array_buffer_free(void *opaque, void *ptr) { (void)opaque; free(ptr); }
 
 LRValue lr_new_array_buffer_copy(LRContext *ctx, const uint8_t *buf, size_t len)
 {
@@ -3157,6 +3244,21 @@ LRValue lr_new_promise_capability(LRContext *ctx, LRValue *resolving_funcs)
         return promise;
     }
 
+    /* Set the prototype from Promise.prototype */
+    {
+        LRValue global = lr_get_global_object(ctx);
+        LRValue promise_ctor = lr_get_property_str(ctx, global, "Promise");
+        if (lr_is_object(promise_ctor)) {
+            LRValue proto = lr_get_property_str(ctx, promise_ctor, "prototype");
+            if (lr_is_object(proto)) {
+                lr_set_prototype(ctx, promise, proto);
+            }
+            lr_free_value(ctx, proto);
+        }
+        lr_free_value(ctx, promise_ctor);
+        lr_free_value(ctx, global);
+    }
+
     /* Create resolve and reject functions that act on this promise */
     LRValue resolve_func = lr_new_cfunction(ctx, promise_resolve_func, "resolve", 1);
     LRValue reject_func = lr_new_cfunction(ctx, promise_reject_func, "reject", 1);
@@ -3189,6 +3291,16 @@ void lr_set_opaque(LRValue obj, void *opaque)
     if (obj.tag != LR_TYPE_OBJECT || !obj.u.ptr) return;
     LRObject *o = (LRObject *)obj.u.ptr;
     o->opaque = opaque;
+    o->opaque_free = NULL; /* reset destructor to default */
+}
+
+void lr_set_opaque_with_free(LRValue obj, void *opaque,
+                              void (*free_func)(void *opaque))
+{
+    if (obj.tag != LR_TYPE_OBJECT || !obj.u.ptr) return;
+    LRObject *o = (LRObject *)obj.u.ptr;
+    o->opaque = opaque;
+    o->opaque_free = free_func;
 }
 
 void *lr_get_opaque(LRValue obj)

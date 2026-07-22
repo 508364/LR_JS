@@ -13,7 +13,8 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type \
            -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable \
-           -Wno-incompatible-pointer-types -Wno-discarded-qualifiers
+           -Wno-incompatible-pointer-types -Wno-discarded-qualifiers \
+           -fPIC
 
 # Architecture detection
 UNAME_M := $(shell uname -m 2>/dev/null || echo "x86_64")
@@ -38,11 +39,11 @@ endif
 # Platform detection
 ifeq ($(OS),Windows_NT)
     # Native Windows (MSYS2/MinGW)
-    LDFLAGS ?= -lm -lpthread -lws2_32
+    LDFLAGS = -lm -lpthread -lws2_32
     EXT     ?= .exe
 else
     # Linux / macOS
-    LDFLAGS ?= -lm -lpthread -ldl
+    LDFLAGS = -lm -lpthread -ldl
     EXT     ?=
 endif
 
@@ -74,6 +75,9 @@ LR_SRCS = \
 	$(SRC_DIR)/lr_crypto.c \
 	$(SRC_DIR)/lr_storage.c \
 	$(SRC_DIR)/lr_fetch.c \
+	$(SRC_DIR)/lr_fs.c \
+	$(SRC_DIR)/lr_terminal.c \
+	$(SRC_DIR)/lr_sysinfo.c \
 	$(SRC_DIR)/lr_thread_pool.c \
 	$(SRC_DIR)/lr_sandbox.c \
 	$(SRC_DIR)/lr_renderer.c \
@@ -105,6 +109,13 @@ INCLUDES = -I$(INC_DIR) -I$(SRC_DIR) -I$(ENGINE_DIR)
 
 # Target
 TARGET = $(BUILD_DIR)/lr_js$(EXT)
+
+# Library targets
+LIB_TARGET   = $(BUILD_DIR)/liblr_js.so
+LIB_A_TARGET = $(BUILD_DIR)/liblr_js.a
+
+# Library objects (all .o except CLI main)
+LIB_OBJS = $(ENGINE_OBJS) $(LR_OBJS)
 
 # Default config for engine
 ENGINE_CFLAGS = -D_GNU_SOURCE
@@ -148,6 +159,42 @@ $(TARGET): $(ENGINE_OBJS) $(LR_OBJS) $(CLI_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Build complete: $(TARGET)"
 	@echo "Run with: $(TARGET) [script.js]"
+
+# Shared library (liblr_js.so)
+$(LIB_TARGET): $(ENGINE_OBJS) $(LR_OBJS)
+	$(CC) $(CFLAGS) -shared -o $@ $^ $(LDFLAGS)
+	@echo "Library built: $(LIB_TARGET)"
+
+# Static library (liblr_js.a)
+$(LIB_A_TARGET): $(ENGINE_OBJS) $(LR_OBJS)
+	ar rcs $@ $^
+	@echo "Static library built: $(LIB_A_TARGET)"
+
+# Build both shared and static library
+lib: $(LIB_TARGET) $(LIB_A_TARGET)
+	@echo "Libraries built:"
+	@ls -lh $(LIB_TARGET) $(LIB_A_TARGET)
+
+# Build shared library only
+lib-so: $(LIB_TARGET)
+
+# Build static library only
+lib-a: $(LIB_A_TARGET)
+
+# Build example host program
+EXAMPLE_BIN = $(BUILD_DIR)/example_host
+EXAMPLE_SRC = examples/host_main.c
+EXAMPLE_OBJ = $(BUILD_DIR)/host_main.o
+
+$(EXAMPLE_OBJ): $(EXAMPLE_SRC) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(EXAMPLE_BIN): $(EXAMPLE_OBJ) $(LIB_A_TARGET)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Example built: $(EXAMPLE_BIN)"
+
+example: $(EXAMPLE_BIN)
+	@echo "Run with: $(EXAMPLE_BIN)"
 
 # Clean
 clean:

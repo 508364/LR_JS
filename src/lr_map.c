@@ -170,6 +170,21 @@ static void map_data_free(LRContext *ctx, LRMapData *md)
     free(md);
 }
 
+/* Wrapper for opaque_free callback - called during final cleanup */
+void lr_map_free_opaque(void *opaque)
+{
+    LRMapData *md = (LRMapData *)opaque;
+    if (!md) return;
+    for (int32_t i = 0; i < md->capacity; i++) {
+        if (md->entries[i].alive) {
+            lr_free_value(NULL, md->entries[i].key);
+            lr_free_value(NULL, md->entries[i].value);
+        }
+    }
+    free(md->entries);
+    free(md);
+}
+
 static int map_data_resize(LRContext *ctx, LRMapData *md, int32_t new_capacity)
 {
     LRMapEntry *old_entries = md->entries;
@@ -399,7 +414,7 @@ static LRValue js_map_constructor(JSContext *ctx, JSValueConst this_val,
         lr_free_value(ctx, map);
         return LR_VALUE_EXCEPTION;
     }
-    lr_set_opaque(map, md);
+    lr_set_opaque_with_free(map, md, lr_map_free_opaque);
 
     /* Set prototype */
     LRValue global = lr_get_global_object(ctx);

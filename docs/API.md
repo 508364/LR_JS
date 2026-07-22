@@ -12,9 +12,9 @@ L/R_JS 是一个用纯 C 语言实现的轻量级浏览器 JavaScript 运行器�
 
 | 平台 | 架构 | 编译器 | 最低版本 |
 |------|------|--------|----------|
-| **Linux** | x86_64, aarch64, armv7 | GCC 9+, Clang 12+ | kernel 3.10+ |
+| **Linux** | x86_64, x86, aarch64, armv7 | GCC 9+, Clang 12+ | kernel 3.10+ |
 | **macOS** | x86_64, arm64 (Apple Silicon) | Clang 14+ | macOS 11+ |
-| **Windows** | x86_64, aarch64 | MSVC 2022+, MinGW-w64 | Windows 10+ |
+| **Windows** | x86_64, x86, aarch64 | MSVC 2022+, MinGW-w64 | Windows 7+ |
 | **FreeBSD** | x86_64, aarch64 | Clang 14+ | FreeBSD 13+ |
 | **OpenBSD** | x86_64, aarch64 | Clang 14+ | OpenBSD 7.0+ |
 | **NetBSD** | x86_64, aarch64 | GCC 10+ | NetBSD 9.0+ |
@@ -482,6 +482,9 @@ localStorage.clear();
 
 ### 7.8 Fetch
 
+> **注意：** L/R_JS 不内置 HTTP 客户端。`fetch()` 通过 `LR_HttpWrapper` 接口将请求委托给宿主应用程序（浏览器、WebUI 等）。
+> 宿主必须调用 `lr_http_set_wrapper()` 注册包装器，否则 `fetch()` 返回 rejected Promise。
+
 ```js
 const resp = await fetch("https://api.example.com/data");
 const json = await resp.json();
@@ -564,7 +567,510 @@ LR_RendererConfig rcfg = {
 lr_renderer_init(&rt->renderer, &rcfg);
 ```
 
-### 8.5 线程池
+### 8.5 渲染管道（外部渲染器输出）
+
+渲染管道（`LR_RenderPipeline`）允许 Canvas 2D 和 WebGL 的渲染输出转发到外部渲染器。每个管道可以挂载多个输出接收器（Sink），支持 Socket、共享内存、回调和文件输出。
+
+#### C API
+
+```c
+// 创建管道
+LR_RenderPipeline *pipe = lr_render_pipeline_create(800, 600);
+
+// 添加输出接收器
+LR_PipeSink sock = lr_render_pipe_sink_socket("/tmp/renderer.sock");
+lr_render_pipeline_add_sink(pipe, &sock);
+
+LR_PipeSink cb = lr_render_pipe_sink_callback(my_callback, my_data);
+lr_render_pipeline_add_sink(pipe, &cb);
+
+// 提交帧（Canvas 2D 帧缓冲）
+lr_render_pipeline_submit(pipe, pixels, width, height);
+
+// 提交 GL 帧（从 GLES 帧缓冲读回）
+lr_render_pipeline_submit_gl(pipe, gl_ctx, width, height);
+
+// 集成到渲染器桥接
+lr_renderer_set_pipeline(rb, pipe);
+lr_renderer_pipeline_flush(rb);
+
+// 清理
+lr_render_pipeline_destroy(pipe);
+```
+
+#### JS API
+
+```javascript
+// 创建 Canvas
+const canvas = new Canvas(800, 600);
+
+// 方法 1: 通过 Canvas 设置管道（Socket）
+canvas.setPipeline('/tmp/renderer.sock');
+
+// 2D 上下文
+const ctx = canvas.getContext('2d');
+ctx.fillStyle = 'red';
+ctx.fillRect(0, 0, 100, 100);
+ctx.pipelineFlush();  // 提交帧到管道
+
+// 方法 2: 通过 WebGL 上下文设置管道
+const gl = canvas.getContext('webgl');
+gl.setPipeline('/tmp/renderer.sock');
+gl.clear(gl.COLOR_BUFFER_BIT);
+gl.pipelineFlush();  // 读回 GL 帧缓冲并提交
+
+// 方法 3: 使用 Canvas 的 GL 专用方法
+canvas.pipelineFlushGL();
+```
+
+#### Socket 协议
+
+每帧通过 Socket 发送的格式：
+
+```
+FRAME <width> <height> <data_size>\n
+<raw RGBA pixel data (data_size bytes)>
+```
+
+#### 管道类型
+
+| 类型 | 创建函数 | 说明 |
+|------|----------|------|
+| Socket | `lr_render_pipe_sink_socket(path)` | Unix 域套接字 |
+| Shared Memory | `lr_render_pipe_sink_shm(ptr, size)` | 共享内存 |
+| Callback | `lr_render_pipe_sink_callback(fn, user)` | 用户回调 |
+| File | `lr_render_pipe_sink_file(pattern)` | PPM 文件（调试） |
+
+### 8.6 HTTP 包装器（外部 HTTP 委派）
+
+> L/R_JS 本身不内置 HTTP 客户端。`fetch()` 通过 `LR_HttpWrapper` 接口将 HTTP 请求委托给宿主应用程序（浏览器、WebUI 等）。
+
+#### C API
+
+```c
+// 设置 HTTP 包装器（宿主拥有所有权，传 NULL 清除）
+void lr_http_set_wrapper(LR_Runtime *rt, LR_HttpWrapper *wrapper);
+
+// 获取当前 HTTP 包装器
+LR_HttpWrapper *lr_http_get_wrapper(LR_Runtime *rt);
+
+// 释放 LR_HttpResult 的分配字段
+void lr_http_result_free(LR_HttpResult *result);
+```
+
+#### 类型定义
+
+```c
+// HTTP 请求结果
+typedef struct LR_HttpResult {
+    int         status_code;    // HTTP 状态码（如 200），失败时为 0
+    char       *status_text;    // 状态文本（如 "OK"），strdup'd，由调用者 free
+    char       *headers;        // 原始响应头，strdup'd，由调用者 free
+    char       *body;           // 响应体，malloc'd，由调用者 free
+    size_t      body_len;       // 响应体长度（字节）
+    char       *error;          // 错误消息（strdup'd），成功时为 NULL
+} LR_HttpResult;
+
+// HTTP 包装器接口
+typedef struct LR_HttpWrapper {
+    void *user_data;  // 透传给回调的 opaque 数据
+
+    // 执行 HTTP 请求。填充 result 结构体。成功返回 0，失败返回 -1。
+    int (*fetch)(void *user_data, const char *method, const char *url,
+                 const char *headers, const void *body, size_t body_len,
+                 LR_HttpResult *result);
+} LR_HttpWrapper;
+```
+
+#### 使用示例
+
+```c
+// 宿主实现 fetch 回调
+static int my_fetch(void *user_data, const char *method, const char *url,
+                    const char *headers, const void *body, size_t body_len,
+                    LR_HttpResult *result)
+{
+    // 使用宿主自己的 HTTP 库（如 libcurl、WinHTTP、浏览器 fetch API 等）
+    // 填充 result->status_code, result->body, result->headers 等
+    result->status_code = 200;
+    result->status_text = strdup("OK");
+    result->body = strdup("{\"message\":\"Hello from host\"}");
+    result->body_len = strlen(result->body);
+    result->headers = strdup("Content-Type: application/json\r\n");
+    return 0;
+}
+
+// 注册包装器
+LR_HttpWrapper wrapper = { .user_data = NULL, .fetch = my_fetch };
+lr_http_set_wrapper(rt, &wrapper);
+
+// 之后 JS 中即可正常调用 fetch()
+// fetch("https://api.example.com/data").then(r => r.json()).then(console.log);
+```
+
+#### JS API
+
+```js
+// 当宿主注册了 LR_HttpWrapper 后，可正常使用 fetch()
+const resp = await fetch("https://api.example.com/data");
+const json = await resp.json();
+console.log(json);
+
+// 未注册包装器时，fetch() 返回 rejected Promise
+try {
+    await fetch("https://example.com");
+} catch (e) {
+    console.log(e.message);  // "fetch() is not available: no HTTP wrapper configured"
+}
+```
+
+### 8.7 文件系统 API（fs）
+
+> L/R_JS 提供基本的文件操作 API。对于需要系统权限的操作（如写入系统目录），通过 `LR_FileWrapper` 委托给宿主程序，
+> 宿主负责申请 OS 级权限（Windows UAC、Linux polkit 等）。每批次特权操作需要重新申请权限。
+
+#### JS API
+
+```js
+// 读取文件（返回字符串）
+const data = fs.readFile("/path/to/file.txt");
+console.log(data);
+
+// 写入文件（覆盖）
+fs.writeFile("/path/to/file.txt", "Hello, World!");
+
+// 追加写入
+fs.appendFile("/path/to/file.txt", "\nAppended line");
+
+// 读取目录（返回文件名数组）
+const entries = fs.readdir("/path/to/dir");
+console.log(entries[0], entries[1], /* ... */);
+
+// 创建目录
+fs.mkdir("/path/to/newdir");
+
+// 删除空目录
+fs.rmdir("/path/to/emptydir");
+
+// 删除文件
+fs.unlink("/path/to/file.txt");
+
+// 重命名/移动
+fs.rename("/path/to/old.txt", "/path/to/new.txt");
+
+// 获取文件信息
+const stat = fs.stat("/path/to/file.txt");
+console.log(stat.size, stat.isFile, stat.isDirectory, stat.mtime);
+
+// 检查文件是否存在
+if (fs.exists("/path/to/file.txt")) {
+    console.log("File exists!");
+}
+```
+
+#### 权限模型
+
+| 操作 | 普通文件 | 需要权限的文件 |
+|------|---------|--------------|
+| `readFile` | 直接读取 | 失败 → 调用 wrapper |
+| `writeFile` | 直接写入 | 失败 → 调用 wrapper |
+| `appendFile` | 直接追加 | 失败 → 调用 wrapper |
+| `readdir` | 直接列出 | 失败 → 调用 wrapper |
+| `mkdir` | 直接创建 | 失败 → 调用 wrapper |
+| `rmdir` | 直接删除 | 失败 → 调用 wrapper |
+| `unlink` | 直接删除 | 失败 → 调用 wrapper |
+| `rename` | 直接重命名 | 失败 → 调用 wrapper |
+| `stat` | 直接查询 | 失败 → 调用 wrapper |
+| `exists` | 直接查询 | 不支持特权 |
+
+#### C API（宿主集成）
+
+```c
+// 设置文件包装器（宿主拥有所有权，传 NULL 清除）
+void lr_file_set_wrapper(LR_Runtime *rt, LR_FileWrapper *wrapper);
+
+// 获取当前文件包装器
+LR_FileWrapper *lr_file_get_wrapper(LR_Runtime *rt);
+
+// 释放 LR_FileResult 的分配字段
+void lr_file_result_free(LR_FileResult *result);
+```
+
+#### 类型定义
+
+```c
+// 文件操作结果
+typedef struct LR_FileResult {
+    int         error_code;    // 0 成功，errno 失败
+    char       *error;         // 错误消息（strdup'd），成功时 NULL
+    char       *data;          // 读取操作的数据，malloc'd
+    size_t      data_len;      // 数据长度
+    int         is_dir;        // 是否为目录
+    int         is_file;       // 是否为普通文件
+    size_t      file_size;     // 文件大小
+    char      **entries;       // 目录条目（NULL 结尾）
+    int         entry_count;   // 条目数量
+} LR_FileResult;
+
+// 文件系统特权包装器
+typedef struct LR_FileWrapper {
+    void *user_data;  // 透传给回调的 opaque 数据
+
+    // 执行特权文件操作。每次调用都需要重新申请权限，不得缓存。
+    // operation: "read_file", "write_file", "delete_file", "rename",
+    //            "read_dir", "create_dir", "remove_dir", "stat"
+    // 成功返回 0，失败返回 -1（填充 error_code/error）。
+    int (*execute)(void *user_data, const char *path, const char *operation,
+                   const void *data, size_t data_len, const char *extra,
+                   LR_FileResult *result);
+} LR_FileWrapper;
+```
+
+#### 宿主集成示例
+
+```c
+static int my_file_execute(void *user_data, const char *path,
+                           const char *operation, const void *data,
+                           size_t data_len, const char *extra,
+                           LR_FileResult *result)
+{
+    // 1. 请求 OS 权限（UAC/polkit/…）
+    if (!request_admin_privilege(operation, path))
+        return -1;
+
+    // 2. 执行操作
+    if (strcmp(operation, "read_file") == 0) {
+        // 读取文件，填充 result->data/data_len
+    } else if (strcmp(operation, "write_file") == 0) {
+        // 写入文件
+    }
+    // ...
+
+    return 0;
+}
+
+// 注册包装器
+LR_FileWrapper wrapper = { .user_data = NULL, .execute = my_file_execute };
+lr_file_set_wrapper(rt, &wrapper);
+```
+
+### 8.8 终端 API（term）
+
+> L/R_JS 提供终端命令执行 API。对于需要系统权限的命令（如访问系统资源），通过 `LR_TerminalWrapper` 委托给宿主程序，
+> 宿主负责申请 OS 级权限（Windows UAC、Linux polkit 等）。每批次特权操作需要重新申请权限。
+
+#### JS API
+
+```js
+// 运行单条命令，返回 { exitCode, stdout, stderr }
+const result = term.run("echo Hello, World!");
+console.log(result.exitCode);  // 0
+console.log(result.stdout);    // "Hello, World!\n"
+console.log(result.stderr);    // ""
+
+// 运行命令并捕获错误输出
+const r = term.run("ls /nonexistent");
+console.log(r.exitCode);       // 2
+console.log(r.stderr);         // "ls: cannot access '/nonexistent': No such file or directory\n"
+
+// 批量运行多条命令（每批次重新授权）
+const results = term.runBatch([
+    "echo first",
+    "echo second",
+    "echo third"
+]);
+console.log(results.length);   // 3
+console.log(results[0].stdout); // "first\n"
+
+// 实时输出模式（逐行回调，支持 stdout/stderr 分离）
+// 回调参数可以是函数（简写为 onStdout）或 { onStdout, onStderr, onExit }
+term.spawn("ping 127.0.0.1", function(line) {
+    console.log("[stdout]", line.trim());
+});
+
+term.spawn("some-command", {
+    onStdout: function(line) { console.log("OUT:", line); },
+    onStderr: function(line) { console.error("ERR:", line); },
+    onExit: function(code)  { console.log("EXIT:", code); }
+});
+```
+
+#### 权限模型
+
+| 操作 | 普通命令 | 需要权限的命令 |
+|------|---------|--------------|
+| `run` | 直接执行 (`popen`) | 失败 → 调用 wrapper |
+| `runBatch` | 逐个直接执行 | 失败 → 调用 wrapper（每批次重新授权） |
+| `spawn` | 直接执行，逐行回调 | 失败 → 调用 wrapper（整批输出） |
+
+#### C API（宿主集成）
+
+```c
+// 设置终端包装器（宿主拥有所有权，传 NULL 清除）
+void lr_terminal_set_wrapper(LR_Runtime *rt, LR_TerminalWrapper *wrapper);
+
+// 获取当前终端包装器
+LR_TerminalWrapper *lr_terminal_get_wrapper(LR_Runtime *rt);
+
+// 释放 LR_TerminalResult 的分配字段
+void lr_terminal_result_free(LR_TerminalResult *result);
+```
+
+#### 类型定义
+
+```c
+// 命令执行结果
+typedef struct LR_TerminalResult {
+    int         error_code;    // 0 成功，errno 失败
+    char       *error;         // 错误消息（strdup'd），成功时 NULL
+    char       *stdout_data;   // 标准输出，malloc'd
+    size_t      stdout_len;    // stdout 长度
+    char       *stderr_data;   // 标准错误输出，malloc'd
+    size_t      stderr_len;    // stderr 长度
+    int         exit_code;     // 进程退出码（0 = 成功）
+} LR_TerminalResult;
+
+// 终端特权包装器
+typedef struct LR_TerminalWrapper {
+    void *user_data;  // 透传给回调的 opaque 数据
+
+    // 执行特权命令。每次调用都需要重新申请权限，不得缓存。
+    // operation: "run"
+    // 成功返回 0，失败返回 -1（填充 error_code/error）。
+    int (*execute)(void *user_data, const char *command, const char *operation,
+                   const void *stdin_data, size_t stdin_len,
+                   LR_TerminalResult *result);
+} LR_TerminalWrapper;
+```
+
+#### 宿主集成示例
+
+```c
+static int my_term_execute(void *user_data, const char *command,
+                            const char *operation, const void *stdin_data,
+                            size_t stdin_len, LR_TerminalResult *result)
+{
+    // 1. 请求 OS 权限（UAC/polkit/…）
+    if (!request_admin_privilege("execute", command))
+        return -1;
+
+    // 2. 使用 system() 或 CreateProcess() 执行命令
+    //    填充 result->stdout_data/stdout_len/stderr_data/stderr_len/exit_code
+    FILE *fp = popen(command, "r");
+    if (!fp) return -1;
+
+    // 读取输出...
+    result->exit_code = 0;
+    pclose(fp);
+    return 0;
+}
+
+// 注册包装器
+LR_TerminalWrapper wrapper = {
+    .user_data = NULL,
+    .execute = my_term_execute
+};
+lr_terminal_set_wrapper(rt, &wrapper);
+```
+
+### 8.9 系统信息 API（system）
+
+> L/R_JS 提供只读的系统信息 API，可在 JS 中获取操作系统名称、版本号、内核版本、CPU、GPU、RAM 等信息。
+> 所有数据通过标准 Linux `/proc` 和 `/sys` 文件系统读取，无需特权操作。
+
+#### JS API
+
+```js
+// 获取操作系统名称
+const name = system.name();
+console.log(name);  // "Ubuntu", "Debian", "Fedora" 等
+
+// 获取操作系统版本
+const version = system.version();
+console.log(version);  // "22.04 LTS", "11" 等
+
+// 获取内核版本
+const kernel = system.kernel();
+console.log(kernel);  // "6.2.0-35-generic"
+
+// 获取 CPU 架构
+const arch = system.arch();
+console.log(arch);  // "x86_64", "aarch64" 等
+
+// 获取 CPU 名称
+const cpu = system.cpu();
+console.log(cpu);  // "Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz"
+
+// 获取 CPU 核心数
+const cpuCount = system.cpuCount();
+console.log(cpuCount);  // 8
+
+// 获取 GPU 信息
+const gpu = system.gpu();
+console.log(gpu);  // "PCI 0x10de:0x1f95" 或 "Unknown"
+
+// 获取 RAM 信息（返回 { total, used, free } 字节）
+const ram = system.ram();
+console.log(ram.total);  // 17179869184 (16 GB)
+console.log(ram.used);   // 8589934592 (8 GB)
+console.log(ram.free);   // 8589934592 (8 GB)
+
+// 获取系统运行时间（秒）
+const uptime = system.uptime();
+console.log(uptime);  // 123456.78 (秒)
+
+// 获取主机名
+const hostname = system.hostname();
+console.log(hostname);  // "my-server"
+
+// 一次性获取所有系统信息
+const info = system.info();
+console.log(info);
+// {
+//   name: "Ubuntu",
+//   version: "22.04 LTS",
+//   kernel: "6.2.0-35-generic",
+//   arch: "x86_64",
+//   cpu: "Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz",
+//   cpuCount: 8,
+//   gpu: "PCI 0x10de:0x1f95",
+//   hostname: "my-server",
+//   uptime: 123456.78,
+//   ram: { total: 17179869184, used: 8589934592, free: 8589934592 }
+// }
+```
+
+#### 返回值说明
+
+| 函数 | 返回值类型 | 说明 |
+|------|-----------|------|
+| `system.name()` | `string` | 操作系统名称（如 "Ubuntu"） |
+| `system.version()` | `string` | 操作系统版本号 |
+| `system.kernel()` | `string` | Linux 内核版本 |
+| `system.arch()` | `string` | CPU 架构（如 "x86_64"） |
+| `system.cpu()` | `string` | CPU 型号名称 |
+| `system.cpuCount()` | `number` | 在线 CPU 核心数 |
+| `system.gpu()` | `string` | GPU 设备信息（PCI vendor:device） |
+| `system.ram()` | `{total, used, free}` | RAM 信息（字节为单位） |
+| `system.uptime()` | `number` | 系统运行时间（秒） |
+| `system.hostname()` | `string` | 主机名 |
+| `system.info()` | `object` | 一次性返回所有系统信息 |
+
+#### 数据来源
+
+| 信息 | 来源 |
+|------|------|
+| OS 名称/版本 | `/etc/os-release` |
+| 内核版本 | `uname()` |
+| CPU 信息 | `/proc/cpuinfo` |
+| GPU 信息 | `/sys/class/drm/card*/device/` |
+| RAM 信息 | `/proc/meminfo` |
+| 运行时间 | `/proc/uptime` |
+| 主机名 | `gethostname()` |
+
+---
+
+### 8.10 线程池
 
 ```c
 // 创建线程池
@@ -828,6 +1334,8 @@ promise
 ```
 
 ### 15.4 链式调用
+
+> **注意：** 以下示例中的 `fetch()` 需要宿主注册 `LR_HttpWrapper` 才能正常工作。
 
 ```javascript
 fetch("https://api.example.com/data")

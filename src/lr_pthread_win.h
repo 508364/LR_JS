@@ -254,11 +254,14 @@ static __inline int pthread_setspecific(pthread_key_t key, const void *value)
 
 /* ── Missing POSIX headers ─────────────────────────────────────────────── */
 
-/* sys/time.h struct timeval for MSVC */
+/* sys/time.h struct timeval for MSVC (guard against winsock2.h) */
+#ifndef _TIMEVAL_DEFINED
 struct timeval {
     long tv_sec;
     long tv_usec;
 };
+#define _TIMEVAL_DEFINED
+#endif
 
 /* gettimeofday for MSVC */
 static __inline int gettimeofday(struct timeval *tv, void *tz)

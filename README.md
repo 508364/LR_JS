@@ -5,7 +5,7 @@ Pure C, ES2022-compatible JavaScript engine with browser APIs.
 ## Features
 
 - **ES2022+ JavaScript**: Classes, arrow functions, Promises, Proxies, Reflect, modules, etc.
-- **Browser APIs**: `console`, `URL`, `TextEncoder`/`TextDecoder`, `fetch`, `crypto`, `performance`, `WebSocket`, Canvas, `setTimeout`/`setInterval`
+- **Browser APIs**: `console`, `URL`, `TextEncoder`/`TextDecoder`, `fetch` (wrapper-based, delegates to host), `fs` (file system, privilege-aware), `term` (terminal command execution, privilege-aware), `crypto`, `performance`, `WebSocket`, Canvas, `setTimeout`/`setInterval`
 - **Typed Arrays**: `ArrayBuffer`, `Int8Array`, `Uint8Array`, `Float64Array`, `DataView`
 - **Error Handling**: `Error`, `TypeError`, `SyntaxError`, `RangeError`, `ReferenceError` with stack traces and `cause` support
 - **ES6+ Collections**: `Map`, `Set`, `WeakMap`, `WeakSet`
@@ -177,7 +177,9 @@ LR_JS/
 │   ├── lr_performance.c # performance.now
 │   ├── lr_crypto.c     # crypto.randomUUID
 │   ├── lr_storage.c    # localStorage (in-memory)
-│   ├── lr_fetch.c      # HTTP fetch (via libcurl or WinHTTP)
+│   ├── lr_fetch.c      # HTTP fetch (wrapper-based, delegates to host)
+├── lr_fs.c         # File system API (privilege-aware wrapper)
+├── lr_terminal.c   # Terminal API (privilege-aware wrapper)
 │   ├── lr_thread_pool.c # Thread pool for workers
 │   ├── lr_sandbox.c    # Sandboxing
 │   ├── lr_worker.c     # Web Worker support

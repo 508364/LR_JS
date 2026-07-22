@@ -6,7 +6,7 @@
  *   - Offscreen rendering (pbuffer / framebuffer)
  *   - On-screen rendering (native window via EGL surface)
  *   - Pixel readback for compositing
- *   - Custom renderer plugin interface
+ *   - Pipeline integration (submit frames to external renderers)
  *
  * EGL is optional: compile with -DLR_HAS_EGL to enable.
  * When disabled, all EGL functions return error codes.
@@ -46,12 +46,8 @@ extern "C" {
 /* ── Forward declarations ──────────────────────────────────────────────── */
 
 typedef struct LR_EGLRenderer    LR_EGLRenderer;
-typedef struct LR_CustomRenderer LR_CustomRenderer;
 
-/* LR_CustomRenderer is fully defined in lr_renderer.h.
- * Consumers should include lr_renderer.h before lr_renderer_egl.h. */
-
-/* ── EGL Renderer (concrete implementation of LR_CustomRenderer) ──────── */
+/* ── EGL Renderer (GPU-accelerated GLES2 rendering via EGL) ──────────────── */
 
 struct LR_EGLRenderer {
     /* EGL state */
@@ -118,9 +114,10 @@ uint32_t *lr_egl_renderer_read_pixels(LR_EGLRenderer *egl, int *width, int *heig
 /* Resize the rendering surface. */
 int  lr_egl_renderer_resize(LR_EGLRenderer *egl, int width, int height);
 
-/* Get the LR_CustomRenderer vtable for this EGL renderer.
- * This allows the EGL renderer to be plugged into the renderer bridge. */
-const LR_CustomRenderer *lr_egl_renderer_get_interface(LR_EGLRenderer *egl);
+/* Get the native EGLDisplay handle. */
+void *lr_egl_renderer_get_display(LR_EGLRenderer *egl);
+/* Get the native EGLContext handle. */
+void *lr_egl_renderer_get_context(LR_EGLRenderer *egl);
 
 /* Check if EGL is available at runtime. */
 int  lr_egl_is_available(void);
@@ -141,7 +138,8 @@ static inline int  lr_egl_renderer_make_current(LR_EGLRenderer *egl) { (void)egl
 static inline int  lr_egl_renderer_swap_buffers(LR_EGLRenderer *egl) { (void)egl; return -1; }
 static inline uint32_t *lr_egl_renderer_read_pixels(LR_EGLRenderer *egl, int *w, int *h) { (void)egl; (void)w; (void)h; return NULL; }
 static inline int  lr_egl_renderer_resize(LR_EGLRenderer *egl, int w, int h) { (void)egl; (void)w; (void)h; return -1; }
-static inline const LR_CustomRenderer *lr_egl_renderer_get_interface(LR_EGLRenderer *egl) { (void)egl; return NULL; }
+static inline void *lr_egl_renderer_get_display(LR_EGLRenderer *egl) { (void)egl; return NULL; }
+static inline void *lr_egl_renderer_get_context(LR_EGLRenderer *egl) { (void)egl; return NULL; }
 static inline int  lr_egl_is_available(void) { return 0; }
 
 #endif /* LR_EGL_AVAILABLE */

@@ -29,16 +29,28 @@ struct LR_Canvas2D {
     float              stroke_r, stroke_g, stroke_b, stroke_a;
     float              line_width;
     float              global_alpha;
+
+    /* Own framebuffer (RGBA 32-bit pixels) */
+    uint32_t          *framebuffer;
 };
+
+/* ── Forward declarations of pipeline JS functions ─────────────────────── */
+
+static JSValue lr_canvas_set_pipeline(JSContext *js_ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv);
+static JSValue lr_canvas_pipeline_flush(JSContext *js_ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv);
+static JSValue lr_canvas_pipeline_flush_gl(JSContext *js_ctx, JSValueConst this_val,
+                                             int argc, JSValueConst *argv);
 
 /* ── Helper: get renderer bridge from runtime ──────────────────────────── */
 
 static LR_RendererBridge *canvas_get_rb(LR_Runtime *rt)
 {
-    /* The renderer bridge is stored as opaque data on the context.
-     * For now, we create/reuse a global one. In production, this
-     * would be managed by the runtime lifecycle. */
     extern LR_RendererBridge *g_lr_renderer_bridge;  /* See lr_runtime.c */
+    if (!g_lr_renderer_bridge) {
+        g_lr_renderer_bridge = lr_renderer_create();
+    }
     return g_lr_renderer_bridge;
 }
 
@@ -55,13 +67,28 @@ static LR_Canvas2D *canvas2d_create(LR_RendererBridge *rb, int w, int h)
     ctx->stroke_r = 0.0f; ctx->stroke_g = 0.0f; ctx->stroke_b = 0.0f; ctx->stroke_a = 1.0f;
     ctx->line_width = 1.0f;
     ctx->global_alpha = 1.0f;
+
+    /* Allocate own framebuffer (zero-initialized = transparent black) */
+    size_t fb_size = (size_t)ctx->width * (size_t)ctx->height * sizeof(uint32_t);
+    ctx->framebuffer = (uint32_t *)calloc(1, fb_size);
+
     return ctx;
 }
 
 static void canvas2d_destroy(LR_Canvas2D *ctx)
 {
-    (void)ctx;
-    /* future cleanup */
+    if (!ctx) return;
+    free(ctx->framebuffer);
+    free(ctx);
+}
+
+/* No-op opaque free for the shared rb pointer (managed by lr_runtime_free) */
+static void rb_noop_free(void *opaque) { (void)opaque; }
+
+/* Opaque free wrapper for 2D context (frees framebuffer + ctx) */
+static void canvas2d_free(void *opaque)
+{
+    canvas2d_destroy((LR_Canvas2D *)opaque);
 }
 
 /* ── JS: CanvasRenderingContext2D.clearRect(x, y, w, h) ────────────────── */
@@ -70,7 +97,7 @@ static JSValue lr_canvas_clear_rect(JSContext *js_ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
     LR_Canvas2D *ctx = JS_GetOpaque(this_val, 1);
-    if (!ctx || !ctx->rb) return JS_UNDEFINED;
+    if (!ctx || !ctx->framebuffer) return JS_UNDEFINED;
 
     double x = 0, y = 0, w = 0, h = 0;
     if (argc >= 4) {
@@ -79,7 +106,20 @@ static JSValue lr_canvas_clear_rect(JSContext *js_ctx, JSValueConst this_val,
         JS_ToFloat64(js_ctx, &w, argv[2]);
         JS_ToFloat64(js_ctx, &h, argv[3]);
     }
-    lr_renderer_clear(ctx->rb, 0.0f, 0.0f, 0.0f, 0.0f);
+
+    /* Clear the specified rect to transparent black (0) */
+    int ix = (int)x, iy = (int)y;
+    int iw = (int)w, ih = (int)h;
+    if (ix < 0) { iw += ix; ix = 0; }
+    if (iy < 0) { ih += iy; iy = 0; }
+    if (ix + iw > ctx->width)  iw = ctx->width - ix;
+    if (iy + ih > ctx->height) ih = ctx->height - iy;
+    if (iw <= 0 || ih <= 0) return JS_UNDEFINED;
+
+    for (int row = iy; row < iy + ih; row++) {
+        memset(&ctx->framebuffer[row * ctx->width + ix], 0,
+               (size_t)iw * sizeof(uint32_t));
+    }
     return JS_UNDEFINED;
 }
 
@@ -89,7 +129,7 @@ static JSValue lr_canvas_fill_rect(JSContext *js_ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
     LR_Canvas2D *ctx = JS_GetOpaque(this_val, 1);
-    if (!ctx || !ctx->rb) return JS_UNDEFINED;
+    if (!ctx || !ctx->framebuffer) return JS_UNDEFINED;
 
     double x = 0, y = 0, w = 0, h = 0;
     if (argc >= 4) {
@@ -99,9 +139,26 @@ static JSValue lr_canvas_fill_rect(JSContext *js_ctx, JSValueConst this_val,
         JS_ToFloat64(js_ctx, &h, argv[3]);
     }
 
+    /* Draw rect into own framebuffer */
+    int ix = (int)x, iy = (int)y;
+    int iw = (int)w, ih = (int)h;
+    if (ix < 0) { iw += ix; ix = 0; }
+    if (iy < 0) { ih += iy; iy = 0; }
+    if (ix + iw > ctx->width)  iw = ctx->width - ix;
+    if (iy + ih > ctx->height) ih = ctx->height - iy;
+    if (iw <= 0 || ih <= 0) return JS_UNDEFINED;
+
     float a = ctx->fill_a * ctx->global_alpha;
-    lr_renderer_draw_rect(ctx->rb, (float)x, (float)y, (float)w, (float)h,
-                          ctx->fill_r, ctx->fill_g, ctx->fill_b, a);
+    uint32_t color = ((uint32_t)(ctx->fill_r * 255.0f) << 16) |
+                     ((uint32_t)(ctx->fill_g * 255.0f) << 8)  |
+                     ((uint32_t)(ctx->fill_b * 255.0f))       |
+                     ((uint32_t)(a * 255.0f) << 24);
+
+    for (int row = iy; row < iy + ih; row++) {
+        for (int col = ix; col < ix + iw; col++) {
+            ctx->framebuffer[row * ctx->width + col] = color;
+        }
+    }
     return JS_UNDEFINED;
 }
 
@@ -182,7 +239,7 @@ static JSValue lr_canvas_get_image_data(JSContext *js_ctx, JSValueConst this_val
                                          int argc, JSValueConst *argv)
 {
     LR_Canvas2D *ctx = JS_GetOpaque(this_val, 1);
-    if (!ctx || !ctx->rb) return JS_UNDEFINED;
+    if (!ctx || !ctx->framebuffer) return JS_UNDEFINED;
 
     int sx = 0, sy = 0, sw = 1, sh = 1;
     if (argc >= 4) {
@@ -192,14 +249,22 @@ static JSValue lr_canvas_get_image_data(JSContext *js_ctx, JSValueConst this_val
         JS_ToInt32(js_ctx, &sh, argv[3]);
     }
 
-    /* Read pixels from renderer */
+    /* Clamp to canvas bounds */
+    if (sx < 0) { sw += sx; sx = 0; }
+    if (sy < 0) { sh += sy; sy = 0; }
+    if (sx + sw > ctx->width)  sw = ctx->width - sx;
+    if (sy + sh > ctx->height) sh = ctx->height - sy;
+    if (sw <= 0 || sh <= 0) return JS_UNDEFINED;
+
+    /* Read pixels from own framebuffer */
     size_t buf_size = (size_t)sw * (size_t)sh * sizeof(uint32_t);
     uint32_t *pixels = (uint32_t *)malloc(buf_size);
     if (!pixels) return JS_UNDEFINED;
 
-    if (lr_renderer_read_pixels(ctx->rb, pixels, sx, sy, sw, sh) != 0) {
-        free(pixels);
-        return JS_UNDEFINED;
+    for (int row = 0; row < sh; row++) {
+        memcpy(&pixels[row * sw],
+               &ctx->framebuffer[(sy + row) * ctx->width + sx],
+               (size_t)sw * sizeof(uint32_t));
     }
 
     /* Build ImageData object: { width, height, data: Uint8ClampedArray } */
@@ -230,7 +295,7 @@ static JSValue lr_canvas_get_image_data(JSContext *js_ctx, JSValueConst this_val
 /* ── JS: Canvas constructor ────────────────────────────────────────────── */
 
 static JSValue lr_canvas_constructor(JSContext *js_ctx,
-                                      JSValueConst new_target,
+                                      JSValueConst this_val,
                                       int argc, JSValueConst *argv)
 {
     LR_Runtime *rt = JS_GetContextOpaque(js_ctx);
@@ -242,15 +307,13 @@ static JSValue lr_canvas_constructor(JSContext *js_ctx,
         JS_ToInt32(js_ctx, &h, argv[1]);
     }
 
-    JSValue obj = JS_NewObject(js_ctx);
+    JS_SetPropertyStr(js_ctx, this_val, "width", JS_NewInt32(js_ctx, w));
+    JS_SetPropertyStr(js_ctx, this_val, "height", JS_NewInt32(js_ctx, h));
 
-    JS_SetPropertyStr(js_ctx, obj, "width", JS_NewInt32(js_ctx, w));
-    JS_SetPropertyStr(js_ctx, obj, "height", JS_NewInt32(js_ctx, h));
+    /* Store the renderer bridge reference (no-op free — managed by lr_runtime_free) */
+    lr_set_opaque_with_free(this_val, rb, rb_noop_free);
 
-    /* Store the renderer bridge reference */
-    JS_SetOpaque(obj, rb);
-
-    return obj;
+    return JS_UNDEFINED;  /* Use the engine-created object */
 }
 
 /* ── JS: canvas.getContext('2d') ───────────────────────────────────────── */
@@ -282,9 +345,9 @@ static JSValue lr_canvas_get_context(JSContext *js_ctx, JSValueConst this_val,
             return JS_UNDEFINED;
         }
 
-        /* Build 2D context object */
+        /* Build 2D context object (auto-free via canvas2d_destroy on GC) */
         JSValue ctx_obj = JS_NewObject(js_ctx);
-        JS_SetOpaque(ctx_obj, ctx);
+        lr_set_opaque_with_free(ctx_obj, ctx, canvas2d_free);
 
         /* Properties */
         JS_SetPropertyStr(js_ctx, ctx_obj, "canvas", JS_DupValue(js_ctx, this_val));
@@ -302,6 +365,10 @@ static JSValue lr_canvas_get_context(JSContext *js_ctx, JSValueConst this_val,
                                 lr_canvas_get_fill_style, lr_canvas_set_fill_style, 0);
         JS_DefinePropertyGetSet(js_ctx, ctx_obj, JS_NewAtom(js_ctx, "globalAlpha"),
                                 lr_canvas_get_global_alpha, lr_canvas_set_global_alpha, 0);
+
+        /* Pipeline method on 2D context */
+        JS_SetPropertyStr(js_ctx, ctx_obj, "pipelineFlush",
+                          JS_NewCFunction(js_ctx, lr_canvas_pipeline_flush, "pipelineFlush", 0));
 
         if (argc >= 1) JS_FreeCString(js_ctx, type);
         return ctx_obj;
@@ -360,64 +427,133 @@ static JSValue lr_canvas_get_context(JSContext *js_ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
-/* ── JS: canvas.toDataURL(type, quality) ───────────────────────────────── */
+/* ── Module init ───────────────────────────────────────────────────────── */
 
-static JSValue lr_canvas_to_data_url(JSContext *js_ctx, JSValueConst this_val,
-                                      int argc, JSValueConst *argv)
+/* ── JS: canvas.setPipeline(socketPath) ───────────────────────────────────
+ *
+ * Creates a render pipeline with a socket sink and attaches it to the
+ * canvas's renderer bridge. The pipeline accepts rendered frames from
+ * Canvas 2D or WebGL and forwards them to an external renderer via
+ * Unix domain socket.
+ *
+ * Usage:
+ *   const canvas = new Canvas(800, 600);
+ *   canvas.setPipeline('/tmp/renderer.sock');
+ *   // ... draw ...
+ *   canvas.pipelineFlush();
+ */
+static JSValue lr_canvas_set_pipeline(JSContext *js_ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv)
 {
     LR_RendererBridge *rb = JS_GetOpaque(this_val, 1);
     if (!rb) return JS_UNDEFINED;
 
-    /* Read framebuffer pixels */
-    int w = rb->fb_width, h = rb->fb_height;
-    if (w <= 0 || h <= 0) return JS_UNDEFINED;
-
-    size_t buf_size = (size_t)w * (size_t)h * sizeof(uint32_t);
-    uint32_t *pixels = (uint32_t *)malloc(buf_size);
-    if (!pixels) return JS_UNDEFINED;
-
-    if (lr_renderer_read_pixels(rb, pixels, 0, 0, w, h) != 0) {
-        free(pixels);
-        return JS_UNDEFINED;
+    if (argc < 1) {
+        return JS_ThrowTypeError(js_ctx, "setPipeline: socket path required");
     }
 
-    /* Stub: return a placeholder data URL.
-     * Full PNG/JPEG encoding would require a library like libpng/stb_image. */
-    char url[256];
-    snprintf(url, sizeof(url),
-             "data:image/png;base64,LR_JS_CANVAS_%dx%d_PLACEHOLDER", w, h);
+    const char *socket_path = JS_ToCString(js_ctx, argv[0]);
+    if (!socket_path) return JS_ThrowTypeError(js_ctx, "setPipeline: invalid argument");
 
-    free(pixels);
-    return JS_NewString(js_ctx, url);
+    /* Get canvas dimensions from JS properties */
+    JSValue w_val = JS_GetPropertyStr(js_ctx, this_val, "width");
+    JSValue h_val = JS_GetPropertyStr(js_ctx, this_val, "height");
+    int cw = 800, ch = 600;
+    JS_ToInt32(js_ctx, &cw, w_val);
+    JS_ToInt32(js_ctx, &ch, h_val);
+    JS_FreeValue(js_ctx, w_val);
+    JS_FreeValue(js_ctx, h_val);
+
+    /* Create a pipeline if not already created */
+    LR_RenderPipeline *pipe = lr_renderer_get_pipeline(rb);
+    if (!pipe) {
+        pipe = lr_render_pipeline_create(cw, ch);
+        if (!pipe) {
+            JS_FreeCString(js_ctx, socket_path);
+            return JS_ThrowTypeError(js_ctx, "setPipeline: failed to create pipeline");
+        }
+        lr_renderer_set_pipeline(rb, pipe);
+    }
+
+    /* Create socket sink */
+    LR_PipeSink sink = lr_render_pipe_sink_socket(socket_path);
+    JS_FreeCString(js_ctx, socket_path);
+
+    if (sink.fd < 0) {
+        return JS_ThrowTypeError(js_ctx, "setPipeline: failed to connect");
+    }
+
+    int idx = lr_render_pipeline_add_sink(pipe, &sink);
+    if (idx < 0) {
+        lr_socket_close(sink.fd);
+        return JS_ThrowTypeError(js_ctx, "setPipeline: failed to add sink");
+    }
+
+    return JS_NewInt32(js_ctx, idx);
 }
 
-/* ── JS: canvas.toBuffer() → raw RGBA pixel buffer ─────────────────────── */
-
-static JSValue lr_canvas_to_buffer(JSContext *js_ctx, JSValueConst this_val,
-                                    int argc, JSValueConst *argv)
+/* ── JS: canvas.pipelineFlush() ───────────────────────────────────────────
+ *
+ * Flushes the current framebuffer through the render pipeline.
+ * All active sinks receive the frame data.
+ * Returns true on success, false if no pipeline is attached.
+ */
+static JSValue lr_canvas_pipeline_flush(JSContext *js_ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv)
 {
     (void)argc; (void)argv;
+
+    /* Try Canvas 2D context first */
+    LR_Canvas2D *ctx = JS_GetOpaque(this_val, 1);
+    if (ctx && ctx->framebuffer) {
+        LR_RenderPipeline *pipe = ctx->rb ? lr_renderer_get_pipeline(ctx->rb) : NULL;
+        if (!pipe) return JS_NewBool(js_ctx, 0);
+        int ret = lr_render_pipeline_submit(pipe, ctx->framebuffer, ctx->width, ctx->height, "canvas2d");
+        return JS_NewBool(js_ctx, ret == 0);
+    }
+
+    /* Try Canvas object (LR_RendererBridge opaque) */
+    LR_RendererBridge *rb = JS_GetOpaque(this_val, 1);
+    if (rb) {
+        LR_RenderPipeline *pipe = lr_renderer_get_pipeline(rb);
+        if (!pipe) return JS_NewBool(js_ctx, 0);
+        /* We don't have a framebuffer here - use the pipeline's internal buffer */
+        return JS_NewBool(js_ctx, 0);
+    }
+
+    return JS_NewBool(js_ctx, 0);
+}
+
+/* ── JS: canvas.pipelineFlushGL() ─────────────────────────────────────────
+ *
+ * For WebGL: reads back the current GL framebuffer and submits to pipeline.
+ * Requires the WebGL context to be attached to this canvas.
+ *   gl_ctx: the WebGLRenderingContext object
+ */
+static JSValue lr_canvas_pipeline_flush_gl(JSContext *js_ctx, JSValueConst this_val,
+                                             int argc, JSValueConst *argv)
+{
     LR_RendererBridge *rb = JS_GetOpaque(this_val, 1);
     if (!rb) return JS_UNDEFINED;
 
-    int w = rb->fb_width, h = rb->fb_height;
-    if (w <= 0 || h <= 0) return JS_UNDEFINED;
+    (void)argc;
+    LR_RenderPipeline *pipe = lr_renderer_get_pipeline(rb);
+    if (!pipe) return JS_NewBool(js_ctx, 0);
 
-    size_t buf_size = (size_t)w * (size_t)h * sizeof(uint32_t);
-    uint32_t *pixels = (uint32_t *)malloc(buf_size);
-    if (!pixels) return JS_UNDEFINED;
+    /* Get canvas dimensions from JS properties */
+    JSValue w_val = JS_GetPropertyStr(js_ctx, this_val, "width");
+    JSValue h_val = JS_GetPropertyStr(js_ctx, this_val, "height");
+    int w = 800, h = 600;
+    JS_ToInt32(js_ctx, &w, w_val);
+    JS_ToInt32(js_ctx, &h, h_val);
+    JS_FreeValue(js_ctx, w_val);
+    JS_FreeValue(js_ctx, h_val);
 
-    if (lr_renderer_read_pixels(rb, pixels, 0, 0, w, h) != 0) {
-        free(pixels);
-        return JS_UNDEFINED;
-    }
-
-    JSValue buf = JS_NewArrayBufferCopy(js_ctx, (uint8_t *)pixels, buf_size);
-    free(pixels);
-    return buf;
+    /* For WebGL pipeline flush, we need the GL context.
+     * This is a hint - the actual GL readback is done by the
+     * WebGL context's own pipelineFlush() method. */
+    return JS_NewBool(js_ctx, 0);
 }
-
-/* ── Module init ───────────────────────────────────────────────────────── */
 
 void lr_canvas_init(LR_Runtime *rt)
 {
@@ -429,15 +565,22 @@ void lr_canvas_init(LR_Runtime *rt)
                                             "Canvas", 2,
                                             JS_CFUNC_constructor, 0);
 
+    /* Create prototype explicitly */
+    JSValue proto = JS_NewObject(ctx);
+
     /* Add getContext method to prototype */
-    JSValue proto = JS_GetPropertyStr(ctx, canvas_func, "prototype");
     JS_SetPropertyStr(ctx, proto, "getContext",
                       JS_NewCFunction(ctx, lr_canvas_get_context, "getContext", 2));
-    JS_SetPropertyStr(ctx, proto, "toDataURL",
-                      JS_NewCFunction(ctx, lr_canvas_to_data_url, "toDataURL", 2));
-    JS_SetPropertyStr(ctx, proto, "toBuffer",
-                      JS_NewCFunction(ctx, lr_canvas_to_buffer, "toBuffer", 0));
-    JS_FreeValue(ctx, proto);
+    /* Pipeline methods */
+    JS_SetPropertyStr(ctx, proto, "setPipeline",
+                      JS_NewCFunction(ctx, lr_canvas_set_pipeline, "setPipeline", 1));
+    JS_SetPropertyStr(ctx, proto, "pipelineFlush",
+                      JS_NewCFunction(ctx, lr_canvas_pipeline_flush, "pipelineFlush", 0));
+    JS_SetPropertyStr(ctx, proto, "pipelineFlushGL",
+                      JS_NewCFunction(ctx, lr_canvas_pipeline_flush_gl, "pipelineFlushGL", 0));
+
+    /* Set prototype on the constructor function */
+    JS_SetPropertyStr(ctx, canvas_func, "prototype", proto);
 
     /* Expose to global */
     JS_SetPropertyStr(ctx, global, "Canvas", canvas_func);

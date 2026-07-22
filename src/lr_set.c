@@ -166,6 +166,20 @@ static void set_data_free(LRContext *ctx, LRSetData *sd)
     free(sd);
 }
 
+/* Wrapper for opaque_free callback - called during final cleanup */
+void lr_set_free_opaque(void *opaque)
+{
+    LRSetData *sd = (LRSetData *)opaque;
+    if (!sd) return;
+    for (int32_t i = 0; i < sd->capacity; i++) {
+        if (sd->entries[i].alive) {
+            lr_free_value(NULL, sd->entries[i].value);
+        }
+    }
+    free(sd->entries);
+    free(sd);
+}
+
 static int set_data_resize(LRContext *ctx, LRSetData *sd, int32_t new_capacity)
 {
     LRSetEntry *old_entries = sd->entries;
@@ -370,7 +384,7 @@ static LRValue js_set_constructor(JSContext *ctx, JSValueConst this_val,
         lr_free_value(ctx, set);
         return LR_VALUE_EXCEPTION;
     }
-    lr_set_opaque(set, sd);
+    lr_set_opaque_with_free(set, sd, lr_set_free_opaque);
 
     /* Set prototype */
     LRValue global = lr_get_global_object(ctx);

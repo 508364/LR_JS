@@ -2014,7 +2014,7 @@ static void typed_array_data_free(LRContext *ctx, TypedArrayData *tad)
 {
     if (!tad) return;
     JS_FreeValue(ctx, tad->buffer);
-    free(tad->name);
+    free((void *)(tad->name));
     free(tad);
 }
 
@@ -2199,7 +2199,7 @@ static LRValue js_typed_array_constructor(LRContext *ctx, LRValue this_val, int 
         size_t byte_len = (size_t)length * elem_size;
         uint8_t *buf_data = (uint8_t *)calloc(1, byte_len);
         if (!buf_data && byte_len > 0) return JS_ThrowTypeError(ctx, "%s: out of memory", name);
-        LRValue buf = lr_new_array_buffer(ctx, buf_data, byte_len, free, NULL, 0);
+        LRValue buf = lr_new_array_buffer(ctx, buf_data, byte_len, lr_array_buffer_free, NULL, 0);
         if (JS_IsException(buf)) { free(buf_data); return buf; }
         TypedArrayData *tad = typed_array_data_new(ctx, buf, 0, byte_len, elem_size, magic, name);
         JS_FreeValue(ctx, buf);
@@ -2238,7 +2238,7 @@ static LRValue js_typed_array_constructor(LRContext *ctx, LRValue this_val, int 
                 case TA_MAGIC_BIGINT64:  { int64_t v = (int64_t)d; memcpy(buf_data + offset, &v, 8); break; }
                 }
             }
-            LRValue buf = lr_new_array_buffer(ctx, buf_data, byte_len, free, NULL, 0);
+            LRValue buf = lr_new_array_buffer(ctx, buf_data, byte_len, lr_array_buffer_free, NULL, 0);
             if (JS_IsException(buf)) { free(buf_data); return buf; }
             TypedArrayData *tad = typed_array_data_new(ctx, buf, 0, byte_len, elem_size, magic, name);
             JS_FreeValue(ctx, buf);
@@ -2280,7 +2280,7 @@ static LRValue js_typed_array_constructor(LRContext *ctx, LRValue this_val, int 
                     case TA_MAGIC_BIGINT64:  { int64_t v = (int64_t)d; memcpy(buf_data + offset, &v, 8); break; }
                     }
                 }
-                LRValue buf = lr_new_array_buffer(ctx, buf_data, byte_len, free, NULL, 0);
+                LRValue buf = lr_new_array_buffer(ctx, buf_data, byte_len, lr_array_buffer_free, NULL, 0);
                 if (JS_IsException(buf)) { free(buf_data); return buf; }
                 TypedArrayData *tad = typed_array_data_new(ctx, buf, 0, byte_len, elem_size, magic, name);
                 JS_FreeValue(ctx, buf);
@@ -2856,7 +2856,7 @@ static LRValue js_typed_array_slice(LRContext *ctx, LRValue this_val, int argc, 
     uint8_t *base = lr_get_array_buffer(ctx, NULL, tad->buffer);
     if (!base) { free(buf_data); return JS_ThrowTypeError(ctx, "TypedArray: buffer is detached"); }
     memcpy(buf_data, base + tad->byte_offset + (size_t)start * tad->element_size, byte_len);
-    LRValue buf = lr_new_array_buffer(ctx, buf_data, byte_len, free, NULL, 0);
+    LRValue buf = lr_new_array_buffer(ctx, buf_data, byte_len, lr_array_buffer_free, NULL, 0);
     if (JS_IsException(buf)) { free(buf_data); return buf; }
     TypedArrayData *new_tad = typed_array_data_new(ctx, buf, 0, byte_len, tad->element_size, tad->magic, tad->name);
     JS_FreeValue(ctx, buf);
@@ -3185,7 +3185,7 @@ static LRValue js_array_buffer_constructor(LRContext *ctx, LRValue this_val,
         return JS_ThrowTypeError(ctx, "ArrayBuffer: allocation failed");
     }
     /* Create ArrayBuffer object */
-    JSValue result = lr_new_array_buffer(ctx, buf, (size_t)byte_len, free, NULL, 0);
+    JSValue result = lr_new_array_buffer(ctx, buf, (size_t)byte_len, lr_array_buffer_free, NULL, 0);
     if (JS_IsException(result)) {
         free(buf);
     }

@@ -3571,6 +3571,101 @@ static JSValue lr_webgl_vertex_attrib_i_pointer(JSContext *js_ctx, JSValueConst 
     return JS_UNDEFINED;
 }
 /* ══════════════════════════════════════════════════════════════════════════
+   Render Pipeline (external renderer output for WebGL)
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── JS: gl.pipelineFlush() ───────────────────────────────────────────────
+ *
+ * Reads back the current GL framebuffer and submits it to the render
+ * pipeline, which forwards it to all registered external renderer sinks.
+ * Requires a pipeline to be attached via setPipeline() first.
+ * Returns true on success, false if no pipeline is attached.
+ */
+static JSValue lr_webgl_pipeline_flush(JSContext *js_ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    LR_WebGLContext *ctx = JS_GetOpaque(this_val, 1);
+    if (!ctx || !ctx->rb) return JS_UNDEFINED;
+
+    LR_RenderPipeline *pipe = lr_renderer_get_pipeline(ctx->rb);
+    if (!pipe) return JS_NewBool(js_ctx, 0);
+
+#if LR_EGL_AVAILABLE
+    /* Read back GL framebuffer directly */
+    int w = ctx->vp_w, h = ctx->vp_h;
+    if (w <= 0 || h <= 0) return JS_NewBool(js_ctx, 0);
+
+    size_t fb_size = (size_t)w * (size_t)h * sizeof(uint32_t);
+    uint32_t *pixels = (uint32_t *)malloc(fb_size);
+    if (!pixels) return JS_NewBool(js_ctx, 0);
+
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    int ret = lr_render_pipeline_submit(pipe, pixels, w, h, "webgl");
+    free(pixels);
+    return JS_NewBool(js_ctx, ret == 0);
+#else
+    (void)ctx;
+    return JS_NewBool(js_ctx, 0);
+#endif
+}
+
+/* ── JS: gl.setPipeline(socketPath) ───────────────────────────────────────
+ *
+ * Creates a render pipeline with a socket sink and attaches it to the
+ * underlying renderer bridge. Subsequent pipelineFlush() calls will
+ * send the GL framebuffer to the external renderer at the socket path.
+ *
+ * Usage:
+ *   const gl = canvas.getContext('webgl');
+ *   gl.setPipeline('/tmp/renderer.sock');
+ *   // ... render ...
+ *   gl.pipelineFlush();
+ */
+static JSValue lr_webgl_set_pipeline(JSContext *js_ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    LR_WebGLContext *ctx = JS_GetOpaque(this_val, 1);
+    if (!ctx || !ctx->rb) return JS_UNDEFINED;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(js_ctx, "setPipeline: socket path required");
+    }
+
+    const char *socket_path = JS_ToCString(js_ctx, argv[0]);
+    if (!socket_path) return JS_ThrowTypeError(js_ctx, "setPipeline: invalid argument");
+
+    /* Create a pipeline if not already created */
+    LR_RenderPipeline *pipe = lr_renderer_get_pipeline(ctx->rb);
+    if (!pipe) {
+        pipe = lr_render_pipeline_create(
+            ctx->vp_w > 0 ? ctx->vp_w : 800,
+            ctx->vp_h > 0 ? ctx->vp_h : 600);
+        if (!pipe) {
+            JS_FreeCString(js_ctx, socket_path);
+            return JS_ThrowTypeError(js_ctx, "setPipeline: failed to create pipeline");
+        }
+        lr_renderer_set_pipeline(ctx->rb, pipe);
+    }
+
+    /* Create socket sink */
+    LR_PipeSink sink = lr_render_pipe_sink_socket(socket_path);
+    JS_FreeCString(js_ctx, socket_path);
+
+    if (sink.fd < 0) {
+        return JS_ThrowTypeError(js_ctx, "setPipeline: failed to connect");
+    }
+
+    int idx = lr_render_pipeline_add_sink(pipe, &sink);
+    if (idx < 0) {
+        lr_socket_close(sink.fd);
+        return JS_ThrowTypeError(js_ctx, "setPipeline: failed to add sink");
+    }
+
+    return JS_NewInt32(js_ctx, idx);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
    Context Creation
    ══════════════════════════════════════════════════════════════════════════ */
 
@@ -3642,9 +3737,7 @@ JSValue lr_webgl_create_context(JSContext *js_ctx, LR_RendererBridge *rb,
 
     /* Check if native GL is available */
 #if LR_EGL_AVAILABLE
-    if (rb && rb->get_proc_address) {
-        ctx->has_native_gl = 1;
-    }
+    ctx->has_native_gl = 1;
 #endif
 
     JSValue obj = JS_NewObject(js_ctx);
@@ -4332,6 +4425,16 @@ JSValue lr_webgl_create_context(JSContext *js_ctx, LR_RendererBridge *rb,
     /* Add the drawingBufferWidth/Height properties */
     JS_SetPropertyStr(js_ctx, obj, "drawingBufferWidth", JS_NewInt32(js_ctx, width));
     JS_SetPropertyStr(js_ctx, obj, "drawingBufferHeight", JS_NewInt32(js_ctx, height));
+
+    /* ── Pipeline methods (not in standard WebGL, for external renderer output) ── */
+
+    /* pipelineFlush(): read back the current GL framebuffer and submit to pipeline */
+    JS_SetPropertyStr(js_ctx, obj, "pipelineFlush",
+        JS_NewCFunction(js_ctx, lr_webgl_pipeline_flush, "pipelineFlush", 0));
+
+    /* setPipeline(socketPath): attach a render pipeline to the underlying bridge */
+    JS_SetPropertyStr(js_ctx, obj, "setPipeline",
+        JS_NewCFunction(js_ctx, lr_webgl_set_pipeline, "setPipeline", 1));
 
     /* Extension constants are not needed here - they are returned by getExtension() */
 

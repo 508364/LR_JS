@@ -97,6 +97,9 @@ LRValue lr_new_promise(LRContext *ctx)
         v.u.ptr = NULL;
         return v;
     }
+    /* Link into runtime object list for GC tracking */
+    obj->gc_next = ctx->rt->obj_list;
+    ctx->rt->obj_list = obj;
     ctx->rt->obj_count++;
     v.tag = LR_TYPE_OBJECT;
     v.u.ptr = obj;
@@ -134,6 +137,15 @@ static void resolve_data_free(LRContext *ctx, PromiseResolveData *rd)
 {
     if (!rd) return;
     lr_free_value(ctx, rd->promise);
+    free(rd);
+}
+
+/* Wrapper for data_free callback - called during final cleanup */
+static void resolve_data_free_wrapper(void *data)
+{
+    PromiseResolveData *rd = (PromiseResolveData *)data;
+    if (!rd) return;
+    lr_free_value(NULL, rd->promise);
     free(rd);
 }
 
@@ -280,6 +292,10 @@ static LRValue job_fulfill_reaction(JSContext *ctx, JSValueConst this_val,
         lr_call(ctx, jd->resolve, LR_VALUE_UNDEFINED, 1, &result);
         lr_free_value(ctx, result);
     }
+
+    /* Free the job data — no longer needed */
+    cf->data = NULL;
+    job_data_free(ctx, jd);
     return LR_VALUE_UNDEFINED;
 }
 
@@ -308,6 +324,9 @@ static LRValue job_reject_reaction(JSContext *ctx, JSValueConst this_val,
         lr_free_value(ctx, result);
     }
 
+    /* Free the job data — no longer needed */
+    cf->data = NULL;
+    job_data_free(ctx, jd);
     return LR_VALUE_UNDEFINED;
 }
 
@@ -401,6 +420,7 @@ void lr_promise_resolve_internal(LRContext *ctx, LRValue promise, LRValue value)
                 if (robj && robj->extra) {
                     LRCFunction *rcf = (LRCFunction *)robj->extra;
                     rcf->data = rd;
+                    rcf->data_free = resolve_data_free_wrapper;
                 }
             }
             /* We need a separate data for reject, but we share the same struct */
@@ -511,6 +531,7 @@ static LRValue js_promise_constructor(JSContext *ctx, JSValueConst this_val,
         if (robj && robj->extra) {
             LRCFunction *rcf = (LRCFunction *)robj->extra;
             rcf->data = rd;
+            rcf->data_free = resolve_data_free_wrapper;
         }
     }
 
@@ -520,6 +541,7 @@ static LRValue js_promise_constructor(JSContext *ctx, JSValueConst this_val,
         if (rejobj && rejobj->extra) {
             LRCFunction *rcf = (LRCFunction *)rejobj->extra;
             rcf->data = rd;
+            /* data_free only on resolve to avoid double-free (both share same rd) */
         }
     }
 
@@ -592,6 +614,7 @@ static LRValue js_promise_then(JSContext *ctx, JSValueConst this_val,
         if (robj && robj->extra) {
             LRCFunction *rcf = (LRCFunction *)robj->extra;
             rcf->data = rd;
+            rcf->data_free = resolve_data_free_wrapper;
         }
     }
 
@@ -874,6 +897,15 @@ static LRValue js_promise_reject(JSContext *ctx, JSValueConst this_val,
 
     LRValue promise = lr_new_promise(ctx);
     if (lr_is_exception(promise)) return promise;
+
+    /* Set prototype from the constructor's prototype property */
+    if (lr_is_object(this_val)) {
+        LRValue proto = lr_get_property_str(ctx, this_val, "prototype");
+        if (lr_is_object(proto)) {
+            lr_set_prototype(ctx, promise, proto);
+        }
+        lr_free_value(ctx, proto);
+    }
 
     LRPromiseData *pd = (LRPromiseData *)lr_get_opaque(promise);
     if (pd) {

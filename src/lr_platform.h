@@ -60,6 +60,39 @@
 #pragma warning(disable: 4267)  /* conversion from size_t */
 #pragma warning(disable: 4100)  /* unreferenced formal parameter */
 #pragma warning(disable: 4127)  /* conditional expression is constant */
+
+/* ── MSVC POSIX compatibility macros ─────────────────────────────────── */
+
+/* __attribute__ not supported */
+#define __attribute__(x)
+
+/* POSIX strdup → _strdup */
+#define strdup _strdup
+
+/* POSIX strtok_r → strtok_s (same signature) */
+#define strtok_r(str, delim, saveptr)  strtok_s(str, delim, saveptr)
+
+/* POSIX strcasecmp/strncasecmp → _stricmp/_strnicmp */
+#define strcasecmp  _stricmp
+#define strncasecmp _strnicmp
+
+/* POSIX snprintf emulation for MSVC < 2015 (VC14 / _MSC_VER 1900) */
+#if _MSC_VER < 1900
+#define snprintf _snprintf
+#endif
+
+/* POSIX localtime_r/gmtime_r wrappers */
+static __inline struct tm *localtime_r(const time_t *t, struct tm *result)
+{
+    if (localtime_s(result, t) != 0) return NULL;
+    return result;
+}
+static __inline struct tm *gmtime_r(const time_t *t, struct tm *result)
+{
+    if (gmtime_s(result, t) != 0) return NULL;
+    return result;
+}
+
 #else
 #define LR_COMPILER_MSVC 0
 #endif
@@ -94,6 +127,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <wincrypt.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <io.h>
@@ -199,11 +233,14 @@ typedef int clockid_t;
 #define CLOCK_REALTIME  1
 #define CLOCK_MONOTONIC_RAW 0
 
-/* High-resolution time spec for MSVC */
+/* High-resolution time spec for MSVC (guard against UCRT time.h) */
+#ifndef _TIMESPEC_DEFINED
+#define _TIMESPEC_DEFINED
 struct timespec {
     time_t tv_sec;
     long   tv_nsec;
 };
+#endif
 
 /* Implementation of clock_gettime for Windows */
 LR_INLINE int clock_gettime(clockid_t clk_id, struct timespec *ts)

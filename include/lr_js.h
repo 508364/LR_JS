@@ -200,6 +200,84 @@ LR_API void lr_dump_memory_usage(LR_Runtime *rt, FILE *fp);
 LR_API const char *lr_get_last_error(LR_Runtime *rt);
 LR_API void        lr_clear_last_error(LR_Runtime *rt);
 
+/* ══════════════════════════════════════════════════════════════════════════
+ *  Host Wrapper Interfaces
+ *
+ *  L/R_JS delegates privileged operations (HTTP, file system, terminal)
+ *  to the host application through these wrapper interfaces.
+ *  See docs/API.md for detailed usage.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── HTTP Wrapper ─────────────────────────────────────────────────────── */
+
+typedef struct LR_HttpResult {
+    int         status_code;
+    char       *status_text;
+    char       *headers;
+    char       *body;
+    size_t      body_len;
+    char       *error;
+} LR_HttpResult;
+
+typedef struct LR_HttpWrapper {
+    void *user_data;
+    int (*fetch)(void *user_data, const char *method, const char *url,
+                 const char *headers, const void *body, size_t body_len,
+                 LR_HttpResult *result);
+} LR_HttpWrapper;
+
+LR_API void lr_http_set_wrapper(LR_Runtime *rt, LR_HttpWrapper *wrapper);
+LR_API LR_HttpWrapper *lr_http_get_wrapper(LR_Runtime *rt);
+LR_API void lr_http_result_free(LR_HttpResult *result);
+
+/* ── File System Wrapper ──────────────────────────────────────────────── */
+
+typedef struct LR_FileResult {
+    int         error_code;
+    char       *error;
+    char       *data;
+    size_t      data_len;
+    int         is_dir;
+    int         is_file;
+    size_t      file_size;
+    char      **entries;
+    int         entry_count;
+} LR_FileResult;
+
+typedef struct LR_FileWrapper {
+    void *user_data;
+    int (*execute)(void *user_data, const char *path, const char *operation,
+                   const void *data, size_t data_len, const char *extra,
+                   LR_FileResult *result);
+} LR_FileWrapper;
+
+LR_API void lr_file_set_wrapper(LR_Runtime *rt, LR_FileWrapper *wrapper);
+LR_API LR_FileWrapper *lr_file_get_wrapper(LR_Runtime *rt);
+LR_API void lr_file_result_free(LR_FileResult *result);
+
+/* ── Terminal Wrapper ─────────────────────────────────────────────────── */
+
+typedef struct LR_TerminalResult {
+    int         error_code;
+    char       *error;
+    char       *stdout_data;
+    size_t      stdout_len;
+    char       *stderr_data;
+    size_t      stderr_len;
+    int         exit_code;
+} LR_TerminalResult;
+
+typedef struct LR_TerminalWrapper {
+    void *user_data;
+    int (*execute)(void *user_data, const char *command, const char *operation,
+                   const void *stdin_data, size_t stdin_len,
+                   LR_TerminalResult *result);
+} LR_TerminalWrapper;
+
+LR_API void lr_terminal_set_wrapper(LR_Runtime *rt, LR_TerminalWrapper *wrapper);
+LR_API LR_TerminalWrapper *lr_terminal_get_wrapper(LR_Runtime *rt);
+LR_API void lr_terminal_result_free(LR_TerminalResult *result);
+
 /* ── Version ──────────────────────────────────────────────────────────── */
 
 #define LR_JS_VERSION_MAJOR 1
