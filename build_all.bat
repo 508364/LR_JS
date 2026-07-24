@@ -1,8 +1,6 @@
 @echo off
 chcp 65001 >nul 2>&1
-REM NetLeaf Multi-Architecture Build Script
-REM This script builds NetLeaf for Windows x86, x64, and ARM64
-
+REM L/R_JS Multi-Architecture Build Script (Windows x86, x64, ARM64)
 set VERSION=0.1.0
 
 echo ========================================
@@ -10,94 +8,94 @@ echo   L/R_JS v%VERSION% Build Script
 echo ========================================
 echo.
 
-REM Create output directories
 if not exist "build" mkdir build
 if not exist "releases" mkdir releases
 
-REM Check if VS environment is available
 where cl >nul 2>nul
 if %errorlevel% neq 0 (
-    echo [错误] 未找到Visual Studio构建工具
-    echo 请在Visual Studio Developer Command Prompt中运行此脚本
-    echo.
+    echo [ERROR] Visual Studio build tools not found.
+    echo Please run this script from a Visual Studio Developer Command Prompt.
     exit /b 1
 )
 
-REM Build for x64
+REM ---------- x64 ----------
 echo [1/3] Building for Windows x64...
 if exist "build\x64" rmdir /s /q "build\x64"
 mkdir "build\x64"
 cd "build\x64"
-cmake -G "Visual Studio 17 2022" -A x64 -DBUILD_EXAMPLES=ON ..\..
+cmake -G "Visual Studio 17 2022" -A x64 ..\.. > "..\..\build\x64_cfg.log" 2>&1
 if %errorlevel% neq 0 (
-    echo CMake configuration failed for x64!
-    cd ..\..
+    echo [FAIL] x64 CMake configure failed. See build\x64_cfg.log
+    cd "..\.."
     exit /b 1
 )
-cmake --build . --config Release
+cmake --build . --config Release >> "..\..\build\x64_cfg.log" 2>&1
 if %errorlevel% neq 0 (
-    echo Build failed for x64!
-    cd ..\..
+    echo [FAIL] x64 build failed. See build\x64_cfg.log
+    cd "..\.."
     exit /b 1
 )
-cd ..\..
+cd "..\.."
 echo x64 build completed!
-
-REM Create x64 package with example
-echo Creating x64 package...
-powershell.exe -Command "Compress-Archive -Path 'build\x64\lib\Release\netleaf.lib','build\x64\bin\Release\netleaf.dll','build\x64\bin\Release\eaturese\netleaf.h','examples\exampl_xa.c-%RSoi_fs
+powershell.exe -NoProfile -Command "Compress-Archive -Path 'build\x64\lib\Release\lr_js_static.lib','build\x64\bin\Release\lr_js.dll','build\x64\bin\Release\lr_js.exe','include\lr_js.h' -DestinationPath 'releases\LR_JS-%VERSION%-windows-x64.zip' -Force"
+if %errorlevel% neq 0 (
+    echo [FAIL] x64 packaging failed.
+    exit /b 1
+)
 echo x64 package created!
 echo.
 
-REM Build for x86 (Win32)
+REM ---------- x86 ----------
 echo [2/3] Building for Windows x86 (Win32)...
 if exist "build\x86" rmdir /s /q "build\x86"
 mkdir "build\x86"
 cd "build\x86"
-cmake -G "Visual Studio 17 2022" -A Win32 -DBUILD_EXAMPLES=ON ..\..
+cmake -G "Visual Studio 17 2022" -A Win32 ..\.. > "..\..\build\x86_cfg.log" 2>&1
 if %errorlevel% neq 0 (
-    echo CMake configuration failed for x86!
-    cd ..\..
+    echo [FAIL] x86 CMake configure failed. See build\x86_cfg.log
+    cd "..\.."
     exit /b 1
 )
-cmake --build . --config Release
+cmake --build . --config Release >> "..\..\build\x86_cfg.log" 2>&1
 if %errorlevel% neq 0 (
-    echo Build failed for x86!
-    cd ..\..
+    echo [FAIL] x86 build failed. See build\x86_cfg.log
+    cd "..\.."
     exit /b 1
 )
-cd ..\..
+cd "..\.."
 echo x86 build completed!
-
-REM Create x86 package with example
-echo Creating x86 package...
-powershell.exe -Command "Compress-Archive -Path 'build\x86\lib\Release\netleaf.lib','build\x86\bin\Release\netleaf.dll','build\x86\bin\Release\example_all_features.exe','build\x86\lib\Release\netleaf_autocomplete.lib','build\x86\bin\Release\netleaf_autocomplete.dll','build\x86\lib\Release\netleaf_autoroute.lib','build\x86\bin\Release\netleaf_autoroute.dll','build\x86\lib\Release\netleaf_errorpage.lib','build\x86\bin\Release\netleaf_errorpage.dll','include\netleaf.h','examples\example_all_features.c' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x86.zip' -Force"
+powershell.exe -NoProfile -Command "Compress-Archive -Path 'build\x86\lib\Release\lr_js_static.lib','build\x86\bin\Release\lr_js.dll','build\x86\bin\Release\lr_js.exe','include\lr_js.h' -DestinationPath 'releases\LR_JS-%VERSION%-windows-x86.zip' -Force"
+if %errorlevel% neq 0 (
+    echo [FAIL] x86 packaging failed.
+    exit /b 1
+)
 echo x86 package created!
 echo.
 
-REM Build for ARM64
+REM ---------- ARM64 ----------
 echo [3/3] Building for Windows ARM64...
 if exist "build\arm64" rmdir /s /q "build\arm64"
 mkdir "build\arm64"
 cd "build\arm64"
-cmake -G "Visual Studio 17 2022" -A ARM64 -DBUILD_EXAMPLES=ON ..\..
+cmake -G "Visual Studio 17 2022" -A ARM64 ..\.. > "..\..\build\arm64_cfg.log" 2>&1
 if %errorlevel% neq 0 (
-    echo CMake configuration failed for ARM64!
-    cd ..\..
+    echo [FAIL] ARM64 CMake configure failed. See build\arm64_cfg.log
+    cd "..\.."
     exit /b 1
 )
-cmake --build . --config Release
+cmake --build . --config Release >> "..\..\build\arm64_cfg.log" 2>&1
 if %errorlevel% neq 0 (
-    echo Build failed for ARM64!
-    cd ..\..
+    echo [FAIL] ARM64 build failed. See build\arm64_cfg.log
+    cd "..\.."
     exit /b 1
 )
-cd ..\..
+cd "..\.."
 echo ARM64 build completed!
-
-REM Create ARM64 package with example
-echo Creating ARM64 package...
-powershell.exe -Command "Compress-Archive -Path 'build\arm64\lib\Release\netleaf.lib','build\arm64\bin\Release\netleaf.dll','build\arm64\bin\Release\example_all_features.exe','build\arm64\lib\Release\netleaf_autocomplete.lib','build\arm64\bin\Release\netleaf_autocomplete.dll','build\arm64\lib\Release\netleaf_autoroute.lib','build\arm64\bin\Release\netleaf_autoroute.dll','build\arm64\lib\Release\netleaf_errorpage.lib','build\arm64\bin\Release\netleaf_errorpage.dll','include\netleaf.h','examples\example_all_features.c' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-arm64.zip' -Force"
+powershell.exe -NoProfile -Command "Compress-Archive -Path 'build\arm64\lib\Release\lr_js_static.lib','build\arm64\bin\Release\lr_js.dll','build\arm64\bin\Release\lr_js.exe','include\lr_js.h' -DestinationPath 'releases\LR_JS-%VERSION%-windows-arm64.zip' -Force"
+if %errorlevel% neq 0 (
+    echo [FAIL] ARM64 packaging failed.
+    exit /b 1
+)
 echo ARM64 package created!
 echo.
 
@@ -105,8 +103,9 @@ echo ========================================
 echo   All builds completed successfully!
 echo ========================================
 echo.
-echo Packages location: releases\
-echo   - NetLeaf-%VERSION%-windows-x64.zip
-echo   - NetLeaf-%VERSION%-windows-x86.zip
-echo   - NetLeaf-%VERSION%-windows-arm64.zip
+echo Packages:
+echo   - releases\LR_JS-%VERSION%-windows-x64.zip
+echo   - releases\LR_JS-%VERSION%-windows-x86.zip
+echo   - releases\LR_JS-%VERSION%-windows-arm64.zip
 echo.
+exit /b 0

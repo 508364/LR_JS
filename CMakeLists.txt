@@ -14,7 +14,7 @@
 #   build/bin/  → lr_js.exe / lr_js
 
 cmake_minimum_required(VERSION 3.14)
-project(lr_js VERSION 1.0.0 LANGUAGES C)
+project(lr_js VERSION 0.1.0 LANGUAGES C)
 
 # ── C Standard ────────────────────────────────────────────────────────────
 
@@ -30,7 +30,7 @@ if(MSVC)
     # MSVC C11 mode
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /std:c11")
     # Disable noisy warnings
-    add_compile_options(/wd4996 /wd4244 /wd4267 /wd4100 /wd4127)
+    add_compile_options(/wd4996 /wd4244 /wd4267 /wd4100 /wd4127 /wd4013 /wd4101 /wd4113 /wd4133)
     # Set source and execution character sets to UTF-8 (fixes C4819)
     add_compile_options(/utf-8)
     # Define NOMINMAX to avoid Windows.h min/max macros
@@ -103,6 +103,24 @@ set(LR_RUNTIME_SRCS
     src/lr_builtins_extra.c
 )
 
+# MSVC lacks <regex.h>; provide the built-in POSIX-compatible regex engine.
+# On other platforms the system <regex.h> is used, so we must not compile
+# this translation unit there (it would duplicate the libc symbols).
+if(MSVC)
+    # MSVC lacks <regex.h>; provide the built-in POSIX-compatible regex engine.
+    # On other platforms the system <regex.h> is used, so we must not compile
+    # this translation unit there (it would duplicate the libc symbols).
+    list(APPEND LR_RUNTIME_SRCS src/lr_regex.c)
+    # Unix-only runtime modules use dirent/utsname/sysinfo/popen etc. The
+    # Windows POSIX relay (lr_posix_win.c) provides what they need so the
+    # whole project (including the lr_js CLI executable) links under MSVC.
+    list(APPEND LR_RUNTIME_SRCS
+        src/lr_posix_win.c
+        src/lr_fs.c
+        src/lr_terminal.c
+        src/lr_sysinfo.c)
+endif()
+
 # ── CLI Sources ───────────────────────────────────────────────────────────
 
 set(LR_CLI_SRCS
@@ -132,7 +150,7 @@ target_include_directories(lr_js_static PUBLIC ${LR_INCLUDE_DIRS})
 target_compile_definitions(lr_js_static PUBLIC LR_JS_BUILD_STATIC)
 # On MSVC, link ws2_32 for sockets
 if(LR_PLATFORM_WINDOWS)
-    target_link_libraries(lr_js_static PUBLIC ws2_32)
+    target_link_libraries(lr_js_static PUBLIC ws2_32 ntdll)
 endif()
 
 # ── Public shared/DLL library: lr_js_shared ───────────────────────────────
@@ -145,7 +163,7 @@ target_include_directories(lr_js_shared PUBLIC ${LR_INCLUDE_DIRS})
 target_compile_definitions(lr_js_shared PRIVATE LR_JS_BUILD_DLL)
 target_compile_definitions(lr_js_shared PUBLIC LR_JS_USE_DLL)
 if(LR_PLATFORM_WINDOWS)
-    target_link_libraries(lr_js_shared PUBLIC ws2_32)
+    target_link_libraries(lr_js_shared PUBLIC ws2_32 ntdll)
 endif()
 
 # Set output name
@@ -161,7 +179,7 @@ add_executable(lr_js ${LR_CLI_SRCS})
 target_include_directories(lr_js PRIVATE ${LR_INCLUDE_DIRS})
 target_link_libraries(lr_js PRIVATE lr_js_static)
 if(LR_PLATFORM_WINDOWS)
-    target_link_libraries(lr_js PRIVATE ws2_32)
+    target_link_libraries(lr_js PRIVATE ws2_32 ntdll)
 endif()
 
 # On MSVC, set the executable output name

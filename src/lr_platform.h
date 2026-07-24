@@ -76,9 +76,10 @@
 #define strcasecmp  _stricmp
 #define strncasecmp _strnicmp
 
-/* POSIX snprintf emulation for MSVC < 2015 (VC14 / _MSC_VER 1900) */
+/* POSIX snprintf/vsnprintf emulation for MSVC < 2015 (VC14 / _MSC_VER 1900) */
 #if _MSC_VER < 1900
-#define snprintf _snprintf
+#define snprintf  _snprintf
+#define vsnprintf _vsnprintf
 #endif
 
 /* POSIX localtime_r/gmtime_r wrappers */
@@ -133,6 +134,7 @@ static __inline struct tm *gmtime_r(const time_t *t, struct tm *result)
 #include <io.h>
 #include <process.h>
 #include <sys/stat.h>
+#include <sys/timeb.h>
 #include <intrin.h>
 
 /* Link Windows socket library */
@@ -229,11 +231,14 @@ static __inline struct tm *gmtime_r(const time_t *t, struct tm *result)
 /* clockid_t for MSVC */
 typedef int clockid_t;
 
-#define CLOCK_MONOTONIC 0
-#define CLOCK_REALTIME  1
-#define CLOCK_MONOTONIC_RAW 0
+#define CLOCK_REALTIME       0   /* wall-clock time (epoch) */
+#define CLOCK_MONOTONIC      1   /* high-resolution monotonic (since boot) */
+#define CLOCK_MONOTONIC_RAW  1
 
-/* High-resolution time spec for MSVC (guard against UCRT time.h) */
+/* struct timespec is provided natively by UCRT <time.h> on MSVC (guarded
+   internally by _CRT_NO_TIME_T, NOT _TIMESPEC_DEFINED), so we must not
+   redefine it there. Only MinGW needs our own definition. */
+#if !LR_COMPILER_MSVC
 #ifndef _TIMESPEC_DEFINED
 #define _TIMESPEC_DEFINED
 struct timespec {
@@ -241,10 +246,23 @@ struct timespec {
     long   tv_nsec;
 };
 #endif
+#endif
 
 /* Implementation of clock_gettime for Windows */
 LR_INLINE int clock_gettime(clockid_t clk_id, struct timespec *ts)
 {
+    if (clk_id == CLOCK_REALTIME) {
+        /* Wall-clock time. Must be consistent with pthread_cond_timedwait(),
+           which derives "now" from _ftime_s() - otherwise timed waits would
+           compute a negative timeout and return immediately (busy loop). */
+        struct _timeb tb;
+        _ftime_s(&tb);
+        ts->tv_sec  = (time_t)tb.time;
+        ts->tv_nsec = (long)tb.millitm * 1000000L;
+        return 0;
+    }
+
+    /* CLOCK_MONOTONIC / CLOCK_MONOTONIC_RAW: high-resolution monotonic clock */
     static LARGE_INTEGER freq = {0};
     static int initialized = 0;
     LARGE_INTEGER now;
@@ -262,7 +280,6 @@ LR_INLINE int clock_gettime(clockid_t clk_id, struct timespec *ts)
         ts->tv_sec = 0;
         ts->tv_nsec = 0;
     }
-    (void)clk_id;
     return 0;
 }
 

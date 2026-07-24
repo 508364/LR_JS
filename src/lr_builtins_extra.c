@@ -4,12 +4,96 @@
  */
 #include <math.h>
 #include <time.h>
+#if defined(_MSC_VER)
+#include "lr_regex.h"   /* MSVC has no <regex.h>; use the built-in engine */
+#else
 #include <regex.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <float.h>
 #include <errno.h>
+
+/* ── MSVC POSIX shims ────────────────────────────────────────────────────
+ * MSVC does not provide these POSIX functions used by the Date module.
+ * They are only needed on Windows; other platforms use the system libc. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+
+/* __builtin_clz: count leading zeros of a 32-bit unsigned int. */
+static __inline int lr_builtin_clz(unsigned int x)
+{
+    unsigned long idx;
+    if (x == 0) return 32;
+    _BitScanReverse(&idx, (unsigned long)x);
+    return 31 - (int)idx;
+}
+#define __builtin_clz lr_builtin_clz
+
+/* timegm: like mktime but interprets the broken-down time as UTC. */
+#define timegm _mkgmtime
+
+/* Minimal strptime supporting only the formats used by this file:
+ *   "%Y-%m-%dT%H:%M:%S"  and  "%Y-%m-%d" */
+static __inline int lr_strptime_isdig(const char *p)
+{
+    return p[0] >= '0' && p[0] <= '9' && p[1] >= '0' && p[1] <= '9';
+}
+static const char *lr_strptime(const char *s, const char *fmt, struct tm *tm)
+{
+    memset(tm, 0, sizeof(*tm));
+    tm->tm_mday = 1;
+    const char *p = s;
+    for (; *fmt; fmt++) {
+        if (*fmt != '%') {
+            if (*p != *fmt) return NULL;
+            p++;
+            continue;
+        }
+        fmt++;
+        switch (*fmt) {
+        case 'Y':
+            if (!(p[0] >= '0' && p[0] <= '9' && p[1] >= '0' && p[1] <= '9' &&
+                  p[2] >= '0' && p[2] <= '9' && p[3] >= '0' && p[3] <= '9'))
+                return NULL;
+            tm->tm_year = (p[0] - '0') * 1000 + (p[1] - '0') * 100 +
+                          (p[2] - '0') * 10 + (p[3] - '0') - 1900;
+            p += 4;
+            break;
+        case 'm':
+            if (!lr_strptime_isdig(p)) return NULL;
+            tm->tm_mon = (p[0] - '0') * 10 + (p[1] - '0') - 1;
+            p += 2;
+            break;
+        case 'd':
+            if (!lr_strptime_isdig(p)) return NULL;
+            tm->tm_mday = (p[0] - '0') * 10 + (p[1] - '0');
+            p += 2;
+            break;
+        case 'H':
+            if (!lr_strptime_isdig(p)) return NULL;
+            tm->tm_hour = (p[0] - '0') * 10 + (p[1] - '0');
+            p += 2;
+            break;
+        case 'M':
+            if (!lr_strptime_isdig(p)) return NULL;
+            tm->tm_min = (p[0] - '0') * 10 + (p[1] - '0');
+            p += 2;
+            break;
+        case 'S':
+            if (!lr_strptime_isdig(p)) return NULL;
+            tm->tm_sec = (p[0] - '0') * 10 + (p[1] - '0');
+            p += 2;
+            break;
+        default:
+            return NULL;
+        }
+    }
+    return p;
+}
+#define strptime lr_strptime
+#endif
 
 #include "lr_runtime.h"
 #include "lr_builtins.h"

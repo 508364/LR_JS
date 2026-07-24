@@ -10,10 +10,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include "lr_runtime.h"
+#ifdef _WIN32
+#include "lr_posix_win.h"
+#else
 #include <unistd.h>
 #include <sys/utsname.h>
 #include <sys/sysinfo.h>
-#include "lr_runtime.h"
+#endif
 
 /* ── Helper: read first line from a file, strip newline ───────────────── */
 

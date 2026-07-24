@@ -384,11 +384,6 @@ static JSValue lr_canvas_get_context(JSContext *js_ctx, JSValueConst this_val,
         JS_FreeValue(js_ctx, w_val);
         JS_FreeValue(js_ctx, h_val);
 
-        if (argc >= 2) {
-            /* Check WebGL context attributes */
-            JSValue attrs = argv[1];
-        }
-
         JSValue gl_obj = lr_webgl_create_context(js_ctx, rb, w, h, 0);
         if (JS_IsNull(gl_obj) || JS_IsUndefined(gl_obj)) {
             if (argc >= 1) JS_FreeCString(js_ctx, type);

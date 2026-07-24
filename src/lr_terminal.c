@@ -14,9 +14,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include "lr_runtime.h"
+#ifdef _WIN32
+#include "lr_posix_win.h"
+#else
 #include <unistd.h>
 #include <sys/wait.h>
-#include "lr_runtime.h"
+#endif
 
 /* ── Terminal wrapper API ──────────────────────────────────────────────── */
 
@@ -95,8 +99,15 @@ static int run_popen(const char *command, LR_TerminalResult *result)
      * with pipes. Let's use mkstemp for temp files.
      */
 
+#ifdef _WIN32
+    char stdout_template[1024];
+    char stderr_template[1024];
+    lr_mkstemp_template(stdout_template, sizeof(stdout_template), "lr_term_stdout");
+    lr_mkstemp_template(stderr_template, sizeof(stderr_template), "lr_term_stderr");
+#else
     char stdout_template[] = "/tmp/lr_term_stdout_XXXXXX";
     char stderr_template[] = "/tmp/lr_term_stderr_XXXXXX";
+#endif
     int stdout_fd = mkstemp(stdout_template);
     int stderr_fd = mkstemp(stderr_template);
 
@@ -110,9 +121,16 @@ static int run_popen(const char *command, LR_TerminalResult *result)
 
     /* Build the shell command: run command, capture stdout/stderr to temp files */
     char shell_cmd[16384];
-    int n = snprintf(shell_cmd, sizeof(shell_cmd),
-                     "(%s) >'%s' 2>'%s'; echo __LR_EXIT__=$?",
-                     command, stdout_template, stderr_template);
+    int n;
+#ifdef _WIN32
+    n = snprintf(shell_cmd, sizeof(shell_cmd),
+                 "(%s) >\"%s\" 2>\"%s\"",
+                 command, stdout_template, stderr_template);
+#else
+    n = snprintf(shell_cmd, sizeof(shell_cmd),
+                 "(%s) >'%s' 2>'%s'; echo __LR_EXIT__=$?",
+                 command, stdout_template, stderr_template);
+#endif
     if (n < 0 || (size_t)n >= sizeof(shell_cmd)) {
         unlink(stdout_template);
         unlink(stderr_template);
@@ -133,6 +151,12 @@ static int run_popen(const char *command, LR_TerminalResult *result)
     /* Read popen output (just the exit code line) */
     char buf[256];
     int exit_code = -1;
+#ifdef _WIN32
+    (void)buf;
+    int status = pclose(fp);
+    exit_code = status & 0xFF;
+    if (exit_code < 0) exit_code = -1;
+#else
     while (fgets(buf, sizeof(buf), fp)) {
         int scanned;
         if (sscanf(buf, "__LR_EXIT__=%d", &scanned) == 1) {
@@ -142,6 +166,7 @@ static int run_popen(const char *command, LR_TerminalResult *result)
     }
     if (exit_code < 0) exit_code = -1;
     pclose(fp);
+#endif
 
     /* Read stdout from temp file */
     FILE *out_fp = fopen(stdout_template, "rb");
@@ -352,7 +377,12 @@ static JSValue term_spawn(JSContext *ctx, JSValueConst this_val,
     }
 
     /* ── Create temp file for stderr ────────────────────────────────── */
+#ifdef _WIN32
+    char stderr_template[1024];
+    lr_mkstemp_template(stderr_template, sizeof(stderr_template), "lr_term_spawn_stderr");
+#else
     char stderr_template[] = "/tmp/lr_term_spawn_stderr_XXXXXX";
+#endif
     int stderr_fd = mkstemp(stderr_template);
     if (stderr_fd < 0) {
         JSValue err = make_js_error(ctx, "term.spawn failed to create temp file", command, errno);
@@ -364,9 +394,16 @@ static JSValue term_spawn(JSContext *ctx, JSValueConst this_val,
 
     /* ── Build shell command ────────────────────────────────────────── */
     char shell_cmd[16384];
-    int n = snprintf(shell_cmd, sizeof(shell_cmd),
-                     "(%s) 2>'%s'; echo __LR_SPAWN_EXIT__=$?",
-                     command, stderr_template);
+    int n;
+#ifdef _WIN32
+    n = snprintf(shell_cmd, sizeof(shell_cmd),
+                 "(%s) 2>\"%s\"",
+                 command, stderr_template);
+#else
+    n = snprintf(shell_cmd, sizeof(shell_cmd),
+                 "(%s) 2>'%s'; echo __LR_SPAWN_EXIT__=$?",
+                 command, stderr_template);
+#endif
     if (n < 0 || (size_t)n >= sizeof(shell_cmd)) {
         unlink(stderr_template);
         JSValue err = make_js_error(ctx, "term.spawn command too long", command, E2BIG);
@@ -423,12 +460,16 @@ static JSValue term_spawn(JSContext *ctx, JSValueConst this_val,
     int exit_code = -1;
 
     while (fgets(line_buf, sizeof(line_buf), fp)) {
+#ifdef _WIN32
+        /* No exit marker under cmd.exe; stream stdout lines directly. */
+#else
         /* Check for exit code marker */
         int scanned;
         if (sscanf(line_buf, "__LR_SPAWN_EXIT__=%d", &scanned) == 1) {
             exit_code = scanned;
             break;
         }
+#endif
         /* Call onStdout callback */
         if (JS_IsFunction(ctx, on_stdout)) {
             JSValue line = JS_NewString(ctx, line_buf);
@@ -437,7 +478,12 @@ static JSValue term_spawn(JSContext *ctx, JSValueConst this_val,
         }
     }
     if (exit_code < 0) exit_code = -1;
+#ifdef _WIN32
+    int spawn_status = pclose(fp);
+    exit_code = spawn_status & 0xFF;
+#else
     pclose(fp);
+#endif
 
     /* ── Read stderr from temp file ─────────────────────────────────── */
     FILE *err_fp = fopen(stderr_template, "rb");

@@ -66,6 +66,8 @@ typedef struct {
     int                initialized;
 } pthread_cond_t;
 
+#define PTHREAD_COND_INITIALIZER { CONDITION_VARIABLE_INIT, 0 }
+
 typedef struct {
     int dummy;
 } pthread_condattr_t;
@@ -124,20 +126,31 @@ typedef HANDLE pthread_t;
 
 typedef struct {
     size_t stack_size;
+    int    detachstate;   /* PTHREAD_CREATE_JOINABLE or PTHREAD_CREATE_DETACHED */
 } pthread_attr_t;
 
-/* Thread routine signature */
-typedef unsigned int (__stdcall *pthread_start_routine_t)(void *);
+/* Thread routine signature (matches POSIX: returns void*, takes void*) */
+typedef void *(*pthread_start_routine_t)(void *);
+
+#define PTHREAD_CREATE_JOINABLE  0
+#define PTHREAD_CREATE_DETACHED  1
 
 static __inline int pthread_attr_init(pthread_attr_t *attr)
 {
     attr->stack_size = 0;
+    attr->detachstate = PTHREAD_CREATE_JOINABLE;
     return 0;
 }
 
 static __inline int pthread_attr_setstacksize(pthread_attr_t *attr, size_t size)
 {
     attr->stack_size = size;
+    return 0;
+}
+
+static __inline int pthread_attr_setdetachstate(pthread_attr_t *attr, int state)
+{
+    attr->detachstate = state;
     return 0;
 }
 
@@ -159,15 +172,16 @@ static unsigned int __stdcall pthread_start_wrapper(void *arg)
     pthread_start_routine_t func = info->func;
     void *user_arg = info->arg;
     free(info);
-    return func(user_arg);
+    func(user_arg);
+    return 0;
 }
 
 static __inline int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
-                                    pthread_start_routine_t func, void *arg)
+                                    void *(*start_routine)(void *), void *arg)
 {
     pthread_start_info_t *info = (pthread_start_info_t *)malloc(sizeof(*info));
     if (!info) return -1;
-    info->func = func;
+    info->func = start_routine;
     info->arg = arg;
 
     size_t stack = (attr && attr->stack_size) ? attr->stack_size : 0;
@@ -178,6 +192,13 @@ static __inline int pthread_create(pthread_t *thread, const pthread_attr_t *attr
         return -1;
     }
     *thread = h;
+
+    /* Detached threads cannot be joined; release the handle immediately so the
+       OS reclaims the thread resources once it exits. */
+    if (attr && attr->detachstate == PTHREAD_CREATE_DETACHED) {
+        CloseHandle(h);
+        *thread = NULL;
+    }
     return 0;
 }
 
@@ -254,14 +275,9 @@ static __inline int pthread_setspecific(pthread_key_t key, const void *value)
 
 /* ── Missing POSIX headers ─────────────────────────────────────────────── */
 
-/* sys/time.h struct timeval for MSVC (guard against winsock2.h) */
-#ifndef _TIMEVAL_DEFINED
-struct timeval {
-    long tv_sec;
-    long tv_usec;
-};
-#define _TIMEVAL_DEFINED
-#endif
+/* NOTE: struct timeval is provided natively by <winsock2.h> on MSVC/Windows
+   SDK (it is NOT guarded by _TIMEVAL_DEFINED), so we must NOT redefine it.
+   gettimeofday/usleep below simply use the SDK-provided struct timeval. */
 
 /* gettimeofday for MSVC */
 static __inline int gettimeofday(struct timeval *tv, void *tz)
@@ -281,10 +297,16 @@ static __inline int usleep(unsigned int usec)
     return 0;
 }
 
-/* unistd.h stubs */
+/* unistd.h stubs (guarded: lr_platform.h also defines R_OK/W_OK on Windows) */
+#ifndef R_OK
 #define R_OK 4
+#endif
+#ifndef W_OK
 #define W_OK 2
+#endif
+#ifndef F_OK
 #define F_OK 0
+#endif
 
 /* ssize_t */
 #ifndef _SSIZE_T_DEFINED

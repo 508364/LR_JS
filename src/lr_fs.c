@@ -13,11 +13,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
+#include "lr_runtime.h"
+#ifdef _WIN32
+#include "lr_posix_win.h"
+#else
 #include <sys/stat.h>
 #include <dirent.h>
-#include <errno.h>
 #include <unistd.h>
-#include "lr_runtime.h"
+#endif
 
 /* ── File wrapper API ──────────────────────────────────────────────────── */
 
@@ -242,6 +246,10 @@ static JSValue fs_readdir(JSContext *ctx, JSValueConst this_val,
     while ((entry = readdir(dir)) != NULL) {
         JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, entry->d_name));
     }
+    /* The L/R_JS engine does not auto-update array length via
+     * JS_SetPropertyUint32, so set it explicitly (otherwise the returned
+     * array has elements but an undefined .length). */
+    JS_SetPropertyStr(ctx, arr, "length", JS_NewInt32(ctx, idx));
     closedir(dir);
 
     JS_FreeCString(ctx, path);
