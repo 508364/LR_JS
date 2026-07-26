@@ -319,7 +319,7 @@ static Token lex_number(Lexer *lex)
         /* TODO: BigInt support - store as string for now */
     }
 
-done:
+done: {
     /* Parse the number value */
     size_t len = lex->pos - start;
     char *buf = (char *)malloc(len + 1);
@@ -346,6 +346,7 @@ done:
     }
     free(buf);
     return t;
+    }
 }
 
 /* ── String Parsing ───────────────────────────────────────────────────── */

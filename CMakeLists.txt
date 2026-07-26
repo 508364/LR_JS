@@ -107,19 +107,21 @@ set(LR_RUNTIME_SRCS
 # On other platforms the system <regex.h> is used, so we must not compile
 # this translation unit there (it would duplicate the libc symbols).
 if(MSVC)
-    # MSVC lacks <regex.h>; provide the built-in POSIX-compatible regex engine.
-    # On other platforms the system <regex.h> is used, so we must not compile
-    # this translation unit there (it would duplicate the libc symbols).
     list(APPEND LR_RUNTIME_SRCS src/lr_regex.c)
-    # Unix-only runtime modules use dirent/utsname/sysinfo/popen etc. The
-    # Windows POSIX relay (lr_posix_win.c) provides what they need so the
-    # whole project (including the lr_js CLI executable) links under MSVC.
-    list(APPEND LR_RUNTIME_SRCS
-        src/lr_posix_win.c
-        src/lr_fs.c
-        src/lr_terminal.c
-        src/lr_sysinfo.c)
+    # Windows POSIX relay: provides dirent/utsname/sysinfo/popen wrappers so
+    # the Unix-oriented modules below link under MSVC.
+    list(APPEND LR_RUNTIME_SRCS src/lr_posix_win.c)
 endif()
+
+# Filesystem / terminal / sysinfo modules use POSIX APIs (dirent, utsname,
+# sysinfo, popen). On MSVC they rely on the lr_posix_win.c relay above; on
+# Unix they use the system libc directly. They MUST be compiled on every
+# platform, otherwise lr_fs_init / lr_terminal_init / lr_sysinfo_init (called
+# unconditionally from lr_runtime.c) are left undefined at link time.
+list(APPEND LR_RUNTIME_SRCS
+    src/lr_fs.c
+    src/lr_terminal.c
+    src/lr_sysinfo.c)
 
 # ── CLI Sources ───────────────────────────────────────────────────────────
 

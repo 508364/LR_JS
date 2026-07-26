@@ -1,0 +1,21 @@
+-- The C compiler identification is GNU 10.2.1
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/aarch64-linux-gnu-gcc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Looking for pthread.h
+-- Looking for pthread.h - found
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Failed
+-- Looking for pthread_create in pthreads
+-- Looking for pthread_create in pthreads - not found
+-- Looking for pthread_create in pthread
+-- Looking for pthread_create in pthread - found
+-- Found Threads: TRUE  
+-- EGL/GLES2 GPU renderer: disabled (use -DLR_ENABLE_EGL=ON)
+-- LR_JS building for Unix (Linux/macOS)
+--   Output: build/lib/liblr_js.a + build/lib/liblr_js.so + build/bin/lr_js
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /mnt/f/GitHub/LR_JS/build_linux/aarch64
