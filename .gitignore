@@ -56,3 +56,8 @@ dkms.conf
 build/
 build_cmake/
 Project-Record/
+/build_linux
+*.log
+/build_linux
+*.log
+/build_linux
