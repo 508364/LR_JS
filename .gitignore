@@ -53,11 +53,13 @@ dkms.conf
 
 .gitignore
 
-build/
+build/*
 build_cmake/
 Project-Record/
 /build_linux
 *.log
-/build_linux
-*.log
-/build_linux
+/build_macos/*
+/build_linux/*
+/releases
+/build
+/build_macos

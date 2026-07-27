@@ -369,11 +369,33 @@ LR_INLINE long lr_get_page_size(void)
     return sz > 0 ? sz : 4096;
 }
 
+#if LR_PLATFORM_MACOS
+
+/* macOS has no _SC_AVPHYS_PAGES; query free pages via the Mach VM API. */
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+
+LR_INLINE long lr_get_avail_mem_pages(void)
+{
+    vm_statistics_data_t vmstat;
+    mach_msg_type_number_t count = HOST_VM_INFO_COUNT;
+    if (host_statistics(mach_host_self(), HOST_VM_INFO,
+                        (host_info_t)&vmstat, &count) == KERN_SUCCESS) {
+        long pages = (long)vmstat.free_count;
+        return pages > 0 ? pages : (1024 * 256);  /* fallback: 256MB */
+    }
+    return (1024 * 256);  /* fallback: 256MB */
+}
+
+#else
+
 LR_INLINE long lr_get_avail_mem_pages(void)
 {
     long pages = sysconf(_SC_AVPHYS_PAGES);
     return pages > 0 ? pages : (1024 * 256);  /* fallback: 256MB */
 }
+
+#endif  /* LR_PLATFORM_MACOS */
 
 #endif
 

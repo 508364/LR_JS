@@ -82,10 +82,133 @@ for arch in "${TARGETS[@]}"; do
     mkdir -p "$bdir"
 
     tc="$bdir/toolchain.cmake"
+    # CMake cannot auto-detect the Darwin archiver when cross-compiling, so we
+    # must point CMAKE_AR / CMAKE_RANLIB at the osxcross wrappers explicitly.
+    # The wrapper name varies between installs: o64-ar / oa64-ar, or the
+    # versioned x86_64-apple-darwin*-ar / aarch64-apple-darwin*-ar, or llvm-ar.
+    # Search the compiler's own bin directory for a match.
+    cc_path="$(command -v "$cc")"
+    cc_bin="$(dirname "$cc_path")"
+    ar_tool=""
+    for cand in "$cc_bin/${cc%-clang}-ar" \
+                "$cc_bin"/x86_64-apple-darwin*-ar \
+                "$cc_bin"/aarch64-apple-darwin*-ar \
+                "$cc_bin"/llvm-ar; do
+        if [ -x "$cand" ]; then ar_tool="$cand"; break; fi
+    done
+    if [ -z "$ar_tool" ]; then
+        echo "  [WARN] no Darwin archiver found; using system 'ar' (link will likely fail)"
+        ar_tool="ar"
+    fi
+    ranlib_tool=""
+    for cand in "$cc_bin/${cc%-clang}-ranlib" \
+                "$cc_bin"/x86_64-apple-darwin*-ranlib \
+                "$cc_bin"/aarch64-apple-darwin*-ranlib \
+                "$cc_bin"/llvm-ranlib; do
+        if [ -x "$cand" ]; then ranlib_tool="$cand"; break; fi
+    done
+    [ -z "$ranlib_tool" ] && ranlib_tool="ranlib"
+
+    # ── SDK + compiler resolution (auto-detected unless overridden) ──────
+    # The osxcross *-clang launcher hardcodes SDKROOT=15.5 and appends its
+    # own -isysroot AFTER the user's flags, so CMAKE_OSX_SYSROOT / the
+    # SDKROOT env var cannot override it. We therefore bypass the launcher
+    # and invoke the real target-specific clang directly, with explicit
+    # -target / -isysroot / -mmacosx-version-min. The binary's filename
+    # encodes the exact triple, which we reuse for -target so the matching
+    # <triple>-ld linker (e.g. x86_64-apple-darwin21.4-ld) is found.
+    #
+    # SDK selection: use LR_OSX_SDK / SDKROOT if set, otherwise auto-detect.
+    # Newer SDKs (>=15) expose the '_Float16' type which the older osxcross
+    # clang builds cannot compile, so auto-detection prefers the SDK whose
+    # macOS major version matches the clang's baked darwin version and, as a
+    # final fallback, the oldest available SDK.
+    cc_path="${cc_path:-$(command -v "$cc")}"
+    cc_bin="${cc_bin:-$(dirname "$cc_path")}"
+    cmake_cc="$cc"
+
+    # Locate the real target-specific clang (bypass the o64/oa64 launcher).
+    real_clang=""
+    case "$arch" in
+        arm64|aarch64)
+            for pat in arm64-apple-darwin*-clang aarch64-apple-darwin*-clang clang-* clang; do
+                for cand in "$cc_bin"/$pat; do
+                    if [ -x "$cand" ]; then real_clang="$cand"; break 2; fi
+                done
+            done ;;
+        *)
+            for pat in x86_64-apple-darwin*-clang clang-* clang; do
+                for cand in "$cc_bin"/$pat; do
+                    if [ -x "$cand" ]; then real_clang="$cand"; break 2; fi
+                done
+            done ;;
+    esac
+    if [ -z "$real_clang" ]; then
+        echo "  [ERROR] cannot locate the real clang binary in $cc_bin" >&2
+        exit 1
+    fi
+    # triple = clang filename minus the trailing '-clang'
+    # (x86_64-apple-darwin21.4-clang -> x86_64-apple-darwin21.4)
+    triple="$(basename "$real_clang")"
+    triple="${triple%-clang}"
+    # macOS major version implied by the clang's darwin version (darwin21 -> 12)
+    darwin_num="$(printf '%s' "$triple" | sed -n 's/.*apple-darwin\([0-9][0-9]*\).*/\1/p')"
+    macos_major=$(( ${darwin_num:-21} - 9 ))
+    [ "$macos_major" -lt 10 ] && macos_major=10
+
+    # SDK: honor override, else auto-detect.
+    sdk="${LR_OSX_SDK:-${SDKROOT:-}}"
+    if [ -n "$sdk" ]; then
+        if [ ! -d "$sdk" ]; then
+            echo "  [ERROR] LR_OSX_SDK '$sdk' does not exist." >&2
+            echo "          Provide a valid macOS SDK directory (one that does" >&2
+            echo "          NOT use the '_Float16' type, e.g. MacOSX13.sdk)." >&2
+            exit 1
+        fi
+        echo "  Using SDK override: $sdk"
+    else
+        # Candidate SDK root directories.
+        sdk_roots="$cc_bin/../SDK ${OSXCROSS_TARGET_DIR:+$OSXCROSS_TARGET_DIR/SDK} $HOME/osxcross/target/SDK /opt/osxcross/SDK"
+        best=""; best_ver=""
+        for root in $sdk_roots; do
+            [ -d "$root" ] || continue
+            for d in "$root"/MacOSX*.sdk; do
+                [ -d "$d" ] || continue
+                v="$(printf '%s' "$d" | sed -n 's/.*MacOSX\([0-9][0-9]*\).*/\1/p')"
+                if [ "$v" = "$macos_major" ]; then best="$d"; break 2; fi
+                if [ -z "$best_ver" ] || { [ -n "$v" ] && [ "$v" -lt "$best_ver" ]; }; then
+                    best="$d"; best_ver="${v:-0}"
+                fi
+            done
+        done
+        if [ -z "$best" ]; then
+            echo "  [ERROR] no macOS SDK found under SDK roots." >&2
+            echo "          Set LR_OSX_SDK=/path/to/MacOSXx.y.sdk" >&2
+            exit 1
+        fi
+        sdk="$best"
+        echo "  Auto-detected SDK: $sdk"
+    fi
+
+    sdk_block="set(CMAKE_OSX_SYSROOT \"$sdk\" CACHE PATH \"SDK\" FORCE)"
+    min_ver="${macos_major}.0"
+    echo "  Real clang: $real_clang (triple: $triple, min-ver: $min_ver)"
+    cc_wrapper="$bdir/cc_wrapper.sh"
+    cat > "$cc_wrapper" <<WRAP
+#!/bin/sh
+exec "$real_clang" -target $triple -isysroot "$sdk" -mmacosx-version-min=$min_ver -B"$(dirname "$real_clang")" "\$@"
+WRAP
+    chmod +x "$cc_wrapper"
+    # CMake requires an absolute path for CMAKE_C_COMPILER.
+    cmake_cc="$ROOT/$cc_wrapper"
+
     cat > "$tc" <<EOF
 set(CMAKE_SYSTEM_NAME Darwin)
-set(CMAKE_C_COMPILER $cc)
+set(CMAKE_C_COMPILER $cmake_cc)
+set(CMAKE_AR "$ar_tool" CACHE FILEPATH "osxcross archiver" FORCE)
+set(CMAKE_RANLIB "$ranlib_tool" CACHE FILEPATH "osxcross ranlib" FORCE)
 set(CMAKE_OSX_ARCHITECTURES $arch CACHE STRING "" FORCE)
+$sdk_block
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 EOF
 

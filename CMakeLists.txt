@@ -42,7 +42,26 @@ else()
     set(LR_PLATFORM_WINDOWS OFF)
     set(LR_COMPILER_MSVC OFF)
     # GCC/Clang flags
-    add_compile_options(-Wall -Wextra -D_GNU_SOURCE)
+    # The following noisy categories are suppressed to keep the build log clean.
+    # This mirrors the lenient policy already applied on MSVC (which disables a
+    # long list of warnings). None of them indicate real defects in this engine:
+    #   -Wno-unused-parameter   : callback APIs (ctx, this_val, argc, argv) leave
+    #                             some params unused by design.
+    #   -Wno-unused-function     : many internal helpers (*_data_free finalizers,
+    #                             URL accessors) are compiled but only referenced
+    #                             in certain build configurations.
+    #   -Wno-cast-function-type  : the engine's property accessor macro
+    #                             (JS_CGETSET_DEF) deliberately casts 2/3-arg getter
+    #                             and setter signatures to the 4-arg LRCFunctionFunc.
+    #   -Wno-unused-variable /
+    #   -Wno-unused-but-set-variable : a handful of leftover locals.
+    add_compile_options(-Wall -Wextra
+        -Wno-unused-parameter
+        -Wno-unused-function
+        -Wno-cast-function-type
+        -Wno-unused-variable
+        -Wno-unused-but-set-variable
+        -D_GNU_SOURCE)
 endif()
 
 # ── Output directories ────────────────────────────────────────────────────

@@ -78,6 +78,35 @@ cmake --build . --config Release
 #   build_cmake/lib/lr_js.dll      - 共享库（Windows）
 ```
 
+## macOS 交叉编译（osxcross）
+
+可以从 Linux 使用 [osxcross](https://github.com/tpoechtrager/osxcross) 构建 macOS 的 `x86_64` 与 `arm64` 二进制：
+
+```bash
+# 1. 编译并安装 osxcross，至少准备一个 macOS SDK（如 MacOSX12.sdk）。
+#    注意：若你的 osxcross clang 版本低于 LLVM 15，请勿使用 15.x 的 SDK
+#    （它会用到 '_Float16' 类型，旧版 clang 无法编译）。
+#
+# 2. 运行交叉编译脚本。脚本会自动检测已安装的 osxcross 工具链
+#    （o64-clang / oa64-clang）与 SDK，并构建两种架构：
+./build_macos.sh
+
+# 若自动检测选错了 SDK，可显式指定：
+LR_OSX_SDK=/path/to/MacOSX12.3.sdk ./build_macos.sh
+```
+
+每种架构的产物（位于 `releases/` 下）：
+
+- `LR_JS-0.1.0-macos-x86_64.tar.gz`
+- `LR_JS-0.1.0-macos-arm64.tar.gz`
+
+每个压缩包内含 `lib/liblr_js.a`、`lib/liblr_js.dylib`、`bin/lr_js` 以及 `lr_js.h`。
+
+工作原理：
+
+- 脚本绕过 `o64-clang`/`oa64-clang` 启动器（它们硬编码了 SDK，并在用户参数之后追加 `-isysroot`，导致无法覆盖）。改为直接调用真实的、带目标架构的 clang，并从其文件名提取精确的 `-target` triple，从而使用与之匹配的 `<triple>-ld` 链接器（如 `x86_64-apple-darwin21.4-ld`），而非宿主的 `/usr/bin/ld`。
+- SDK 自动检测优先选择与 clang 内嵌 darwin 版本对应的 macOS 主版本，否则回退到最旧的可用 SDK，以规避 `_Float16` 不兼容问题。`LR_OSX_SDK` / `SDKROOT` 可手动覆盖。
+
 ## Windows 支持
 
 ### 兼容性

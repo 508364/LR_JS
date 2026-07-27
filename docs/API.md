@@ -1162,6 +1162,26 @@ make clean && make -j$(sysctl -n hw.logicalcpu)
 # 输出: build/lr_js, build/liblr_js.a
 ```
 
+### 10.2.1 交叉编译（Linux → macOS，osxcross）
+
+若没有 macOS 本机环境，可从 Linux 使用 [osxcross](https://github.com/tpoechtrager/osxcross) 交叉编译 macOS `x86_64` / `arm64` 二进制：
+
+```bash
+# 1. 编译安装 osxcross，并准备至少一个 macOS SDK（如 MacOSX12.sdk）。
+#    若 osxcross clang 版本低于 LLVM 15，避免使用 15.x 的 SDK
+#   （其 math.h 使用了 '_Float16' 类型，旧版 clang 无法编译）。
+#
+# 2. 运行脚本，自动检测工具链与 SDK 并构建两种架构：
+./build_macos.sh
+
+# 也可显式指定 SDK：
+LR_OSX_SDK=/path/to/MacOSX12.3.sdk ./build_macos.sh
+```
+
+产物为 `releases/LR_JS-0.1.0-macos-{x86_64,arm64}.tar.gz`，内含 `lib/liblr_js.a`、`lib/liblr_js.dylib`、`bin/lr_js` 与 `lr_js.h`。
+
+实现要点：脚本绕过 `o64-clang`/`oa64-clang` 启动器，直接调用真实的、带目标架构的 clang，并从其文件名提取精确 `-target` triple（如 `x86_64-apple-darwin21.4`），以匹配 `x86_64-apple-darwin21.4-ld` 链接器；SDK 自动检测优先匹配 clang 内嵌的 darwin 版本，否则回退到最旧的可用 SDK。
+
 ### 10.3 Windows
 
 ```powershell

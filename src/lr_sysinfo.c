@@ -11,11 +11,16 @@
 #include <string.h>
 #include <stdio.h>
 #include "lr_runtime.h"
+#include "lr_platform.h"
 #ifdef _WIN32
 #include "lr_posix_win.h"
 #else
 #include <unistd.h>
 #include <sys/utsname.h>
+#endif
+
+/* Linux provides sysinfo() via <sys/sysinfo.h>; macOS/BSD do not. */
+#if LR_PLATFORM_LINUX
 #include <sys/sysinfo.h>
 #endif
 
@@ -252,7 +257,7 @@ static void get_ram_info(long long *total, long long *used, long long *free)
 
 static double get_uptime(void)
 {
-    /* Try /proc/uptime first */
+    /* Try /proc/uptime first (Linux) */
     char *line = read_first_line("/proc/uptime");
     if (line) {
         double uptime;
@@ -262,10 +267,12 @@ static double get_uptime(void)
         }
         free(line);
     }
+#if LR_PLATFORM_LINUX
     /* Fallback to sysinfo */
     struct sysinfo si;
     if (sysinfo(&si) == 0)
         return (double)si.uptime;
+#endif
     return 0.0;
 }
 

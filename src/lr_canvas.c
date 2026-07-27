@@ -362,9 +362,11 @@ static JSValue lr_canvas_get_context(JSContext *js_ctx, JSValueConst this_val,
 
         /* fillStyle getter/setter */
         JS_DefinePropertyGetSet(js_ctx, ctx_obj, JS_NewAtom(js_ctx, "fillStyle"),
-                                lr_canvas_get_fill_style, lr_canvas_set_fill_style, 0);
+                                (LRCFunctionFunc)lr_canvas_get_fill_style,
+                                (LRCFunctionFunc)lr_canvas_set_fill_style, 0);
         JS_DefinePropertyGetSet(js_ctx, ctx_obj, JS_NewAtom(js_ctx, "globalAlpha"),
-                                lr_canvas_get_global_alpha, lr_canvas_set_global_alpha, 0);
+                                (LRCFunctionFunc)lr_canvas_get_global_alpha,
+                                (LRCFunctionFunc)lr_canvas_set_global_alpha, 0);
 
         /* Pipeline method on 2D context */
         JS_SetPropertyStr(js_ctx, ctx_obj, "pipelineFlush",

@@ -78,6 +78,44 @@ cmake --build . --config Release
 #   build_cmake/lib/lr_js.dll      - Shared library (Windows)
 ```
 
+## macOS Cross-Compile (osxcross)
+
+You can build macOS `x86_64` and `arm64` binaries from Linux using
+[osxcross](https://github.com/tpoechtrager/osxcross):
+
+```bash
+# 1. Build & install osxcross with at least one macOS SDK (e.g. MacOSX12.sdk).
+#    NOTE: if your osxcross clang is older than LLVM 15, avoid the 15.x SDK
+#    (it uses the '_Float16' type, which those clang versions cannot compile).
+#
+# 2. Run the cross-build script. It auto-detects the installed osxcross
+#    toolchains (o64-clang / oa64-clang) and SDKs and builds both archs:
+./build_macos.sh
+
+# Override the SDK explicitly if auto-detection picks the wrong one:
+LR_OSX_SDK=/path/to/MacOSX12.3.sdk ./build_macos.sh
+```
+
+Per-architecture output (created under `releases/`):
+
+- `LR_JS-0.1.0-macos-x86_64.tar.gz`
+- `LR_JS-0.1.0-macos-arm64.tar.gz`
+
+Each archive contains `lib/liblr_js.a`, `lib/liblr_js.dylib`,
+`bin/lr_js` and `lr_js.h`.
+
+How it works:
+
+- The script bypasses the `o64-clang`/`oa64-clang` launchers (which hardcode an
+  SDK and append `-isysroot` after the user's flags, preventing override). It
+  instead invokes the real target-specific clang directly and derives the exact
+  `-target` triple from that binary's filename, so the matching `<triple>-ld`
+  linker (e.g. `x86_64-apple-darwin21.4-ld`) is used instead of the host
+  `/usr/bin/ld`.
+- SDK auto-detection prefers the SDK whose macOS major version matches the
+  clang's baked darwin version, and falls back to the oldest available SDK to
+  avoid the `_Float16` incompatibility. `LR_OSX_SDK` / `SDKROOT` can override it.
+
 ## Windows Support
 
 ### Compatibility

@@ -2090,8 +2090,6 @@ static const struct {
     { TA_MAGIC_BIGINT64,  "BigInt64Array",  TA_ELEM_BIGINT64 },
 };
 
-static int ta_type_count = sizeof(ta_type_info) / sizeof(ta_type_info[0]);
-
 /* ── TypedArray data free helper ───────────────────────────────────────── */
 
 static void typed_array_data_free(LRContext *ctx, TypedArrayData *tad)
