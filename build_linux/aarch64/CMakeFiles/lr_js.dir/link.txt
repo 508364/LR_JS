@@ -1,1 +1,0 @@
-/usr/bin/aarch64-linux-gnu-gcc -O3 -DNDEBUG CMakeFiles/lr_js.dir/cli/main.c.o -o bin/lr_js  lib/liblr_js_static.a -lm -ldl -lpthread 
