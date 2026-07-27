@@ -5,7 +5,7 @@ Pure C, ES2022-compatible JavaScript engine with browser APIs.
 ## Features
 
 - **ES2022+ JavaScript**: Classes, arrow functions, Promises, Proxies, Reflect, modules, etc.
-- **Browser APIs**: `console`, `URL`, `TextEncoder`/`TextDecoder`, `fetch` (wrapper-based, delegates to host), `fs` (file system, privilege-aware), `term` (terminal command execution, privilege-aware), `crypto`, `performance`, `WebSocket`, Canvas, `setTimeout`/`setInterval`
+- **Browser APIs**: `console`, `URL`, `TextEncoder`/`TextDecoder`, `fetch` (network requests are delegated to the host via `LR_HttpWrapper` — the engine has **no built-in networking**), `fs` (file system, privilege-aware), `term` (terminal command execution, privilege-aware), `crypto`, `performance`, Canvas, `setTimeout`/`setInterval`. Note: `WebSocket` is not implemented yet.
 - **Typed Arrays**: `ArrayBuffer`, `Int8Array`, `Uint8Array`, `Float64Array`, `DataView`
 - **Error Handling**: `Error`, `TypeError`, `SyntaxError`, `RangeError`, `ReferenceError` with stack traces and `cause` support
 - **ES6+ Collections**: `Map`, `Set`, `WeakMap`, `WeakSet`

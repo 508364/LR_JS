@@ -5,7 +5,7 @@
 ## 特性
 
 - **ES2022+ JavaScript**：类、箭头函数、Promise、Proxy、Reflect、模块等
-- **浏览器 API**：`console`、`URL`、`TextEncoder`/`TextDecoder`、`fetch`（包装器模式，委托给宿主）、`fs`（文件系统，权限感知）、`term`（终端命令执行，权限感知）、`crypto`、`performance`、`WebSocket`、Canvas、`setTimeout`/`setInterval`
+- **浏览器 API**：`console`、`URL`、`TextEncoder`/`TextDecoder`、`fetch`（网络请求通过宿主 `LR_HttpWrapper` 委派，引擎**无内置网络功能**）、`fs`（文件系统，权限感知）、`term`（终端命令执行，权限感知）、`crypto`、`performance`、Canvas、`setTimeout`/`setInterval`。注：`WebSocket` 尚未实现。
 - **类型数组**：`ArrayBuffer`、`Int8Array`、`Uint8Array`、`Float64Array`、`DataView`
 - **错误处理**：`Error`、`TypeError`、`SyntaxError`、`RangeError`、`ReferenceError`，支持堆栈跟踪和 `cause`
 - **ES6+ 集合**：`Map`、`Set`、`WeakMap`、`WeakSet`

@@ -482,8 +482,9 @@ localStorage.clear();
 
 ### 7.8 Fetch
 
-> **注意：** L/R_JS 不内置 HTTP 客户端。`fetch()` 通过 `LR_HttpWrapper` 接口将请求委托给宿主应用程序（浏览器、WebUI 等）。
+> **注意：** L/R_JS **不内置任何网络功能**。引擎本身不发任何网络包；`fetch()` 通过 `LR_HttpWrapper` 接口将请求委托给宿主应用程序（浏览器、WebUI 等）。
 > 宿主必须调用 `lr_http_set_wrapper()` 注册包装器，否则 `fetch()` 返回 rejected Promise。
+> 目前网络相关能力仅有 `fetch`（宿主委派）；`WebSocket` 尚未实现（规划中以同样的宿主委派方式提供）。
 
 ```js
 const resp = await fetch("https://api.example.com/data");
