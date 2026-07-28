@@ -5,7 +5,7 @@ Pure C, ES2022-compatible JavaScript engine with browser APIs.
 ## Features
 
 - **ES2022+ JavaScript**: Classes, arrow functions, Promises, Proxies, Reflect, modules, etc.
-- **Browser APIs**: `console`, `URL`, `TextEncoder`/`TextDecoder`, `fetch` (network requests are delegated to the host via `LR_HttpWrapper` — the engine has **no built-in networking**), `fs` (file system, privilege-aware), `term` (terminal command execution, privilege-aware), `crypto`, `performance`, Canvas, `setTimeout`/`setInterval`. Note: `WebSocket` is not implemented yet.
+- **Browser APIs**: `console`, `URL`, `TextEncoder`/`TextDecoder`, `fetch` (network requests delegated to the host via `LR_HttpWrapper`), `WebSocket` (host-delegated via `LR_WsWrapper`), `fs` (file system, privilege-aware), `term` (terminal command execution, privilege-aware), `crypto`, `performance`, Canvas, `setTimeout`/`setInterval`. Note: the engine has **no built-in networking** — both `fetch` and `WebSocket` are delegated to the host.
 - **Typed Arrays**: `ArrayBuffer`, `Int8Array`, `Uint8Array`, `Float64Array`, `DataView`
 - **Error Handling**: `Error`, `TypeError`, `SyntaxError`, `RangeError`, `ReferenceError` with stack traces and `cause` support
 - **ES6+ Collections**: `Map`, `Set`, `WeakMap`, `WeakSet`
@@ -216,6 +216,7 @@ LR_JS/
 │   ├── lr_crypto.c     # crypto.randomUUID
 │   ├── lr_storage.c    # localStorage (in-memory)
 │   ├── lr_fetch.c      # HTTP fetch (wrapper-based, delegates to host)
+│   ├── lr_ws.c         # WebSocket (host-delegated wrapper, LR_WsWrapper)
 ├── lr_fs.c         # File system API (privilege-aware wrapper)
 ├── lr_terminal.c   # Terminal API (privilege-aware wrapper)
 │   ├── lr_thread_pool.c # Thread pool for workers
@@ -249,6 +250,11 @@ int main() {
     return 0;
 }
 ```
+
+## Special Thanks
+
+- **QuickJS** — This project is built upon the [QuickJS](https://bellard.org/quickjs/) JavaScript engine by Fabrice Bellard. Its compact, embeddable C implementation provides the core JavaScript runtime foundation.
+- **V8** — Many architectural and behavioral decisions (object model, Promise/job queues, bytecode design, etc.) are informed by and reference the design of Google's [V8](https://v8.dev/) engine.
 
 ## License
 

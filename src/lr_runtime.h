@@ -54,6 +54,12 @@ struct LR_Runtime {
 
     /* Terminal wrapper (privileged command execution) */
     struct LR_TerminalWrapper *terminal_wrapper;
+
+    /* WebSocket wrapper (delegates to host application) */
+    struct LR_WsWrapper *ws_wrapper;
+
+    /* WebSocket connection registry (conn_handle -> JS object), opaque */
+    void         *ws_registry;
 };
 
 /* ── Internal helpers ─────────────────────────────────────────────────── */
@@ -78,6 +84,15 @@ void lr_register_builtins(LR_Runtime *rt);
 void lr_console_init(LR_Runtime *rt);
 void lr_timers_init(LR_Runtime *rt);
 void lr_fetch_init(LR_Runtime *rt);
+void lr_ws_init(LR_Runtime *rt);
+
+/* Reusable EventTarget methods (defined in lr_event.c) for class prototypes */
+JSValue lr_event_target_addEventListener(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv);
+JSValue lr_event_target_removeEventListener(JSContext *ctx, JSValueConst this_val,
+                                            int argc, JSValueConst *argv);
+JSValue lr_event_target_dispatchEvent(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv);
 void lr_fs_init(LR_Runtime *rt);
 void lr_terminal_init(LR_Runtime *rt);
 void lr_sysinfo_init(LR_Runtime *rt);

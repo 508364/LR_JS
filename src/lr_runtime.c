@@ -938,6 +938,7 @@ void lr_register_builtins(LR_Runtime *rt)
     lr_crypto_init(rt);
     lr_storage_init(rt);
     lr_fetch_init(rt);
+    lr_ws_init(rt);
     lr_fs_init(rt);
     lr_terminal_init(rt);
     lr_sysinfo_init(rt);

@@ -152,7 +152,31 @@ struct LRObject {
     /* GC fields */
     int           gc_mark;        /* mark bit for mark-and-sweep GC */
     struct LRObject *gc_next;     /* linked list for object tracking */
+    /* Finalization / weak reference support */
+    int           finalization_pending; /* deferred-free in progress */
+    int           weak_ref_count;       /* number of WeakRefs targeting this object */
+    struct LRObject *finalize_next;     /* pending-finalization list link */
 };
+
+/* ── FinalizationRegistry support ─────────────────────────────────────── */
+
+/* One registration: target -> (heldValue, callback, registry, token).
+ * `target` is stored as a raw (non-owning) pointer. */
+typedef struct LRFinalizationEntry {
+    struct LRObject *target;   /* raw pointer to the registered target (weak) */
+    LRValue          heldValue; /* strong reference to the held value */
+    LRValue          callback;  /* the cleanup callback (strong) */
+    LRValue          registry;  /* owning FinalizationRegistry (strong) */
+    LRValue          token;     /* unregister token (or JS_UNDEFINED) */
+    struct LRFinalizationEntry *next;
+} LRFinalizationEntry;
+
+/* Closure data for a scheduled finalization cleanup job. */
+typedef struct LRFinalizationJobData {
+    LRContext *ctx;
+    LRValue    callback;
+    LRValue    heldValue;
+} LRFinalizationJobData;
 
 /* ── C Function ───────────────────────────────────────────────────────── */
 
@@ -404,6 +428,10 @@ struct LRRuntime {
     /* Shape cache for property access */
     LRShapeCacheEntry shape_cache[LR_SHAPE_CACHE_SIZE];
     int                shape_cache_index;  /* round-robin replacement index */
+
+    /* Finalization / weak reference support */
+    struct LRObject   *pending_finalize_list; /* objects awaiting finalization */
+    struct LRFinalizationEntry *finalization_entries; /* registry registrations */
 };
 
 /* ── Job Entry ─────────────────────────────────────────────────────────── */
@@ -470,6 +498,26 @@ LRValue lr_new_cfunction2(LRContext *ctx, LRCFunctionFunc func,
 LRValue    lr_dup_value(LRContext *ctx, LRValue val);
 void       lr_free_value(LRContext *ctx, LRValue val);
 void       lr_free_object(LRRuntime *rt, struct LRObject *obj);
+
+/* ── Weak Reference support ────────────────────────────────────────────── */
+
+/* Record that a WeakRef now references `target` (does not keep it alive). */
+void lr_weak_ref_retain(LRRuntime *rt, struct LRObject *target);
+/* Drop one WeakRef reference to `target`; frees it if fully unreferenced. */
+void lr_weak_ref_release(LRRuntime *rt, struct LRObject *target);
+/* Return a strong reference to `target`, or JS_UNDEFINED if it was collected. */
+LRValue lr_weak_ref_deref(LRContext *ctx, struct LRObject *target);
+
+/* ── FinalizationRegistry support ─────────────────────────────────────── */
+
+/* Register a target for finalization. `callback`/`heldValue`/`registry` are
+ * taken (their references belong to the entry). `token` may be JS_UNDEFINED. */
+void lr_register_finalization(LRRuntime *rt, struct LRObject *target,
+                              LRValue callback, LRValue heldValue,
+                              LRValue registry, LRValue token);
+/* Remove all registrations whose unregister token is === `token`.
+ * Returns the number of registrations removed. */
+int lr_unregister_finalization(LRRuntime *rt, LRValue token);
 const char *lr_to_cstring(LRContext *ctx, LRValue val);
 void       lr_free_cstring(LRContext *ctx, const char *str);
 
@@ -511,6 +559,12 @@ LRValue lr_get_property_uint32(LRContext *ctx, LRValue obj, uint32_t idx);
 int     lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val);
 int     lr_set_property_str(LRContext *ctx, LRValue obj, const char *name, LRValue val);
 int     lr_set_property_uint32(LRContext *ctx, LRValue obj, uint32_t idx, LRValue val);
+/* Define an accessor (getter/setter) property. getter/setter are function
+ * values (or LR_VALUE_UNDEFINED when absent). */
+int     lr_set_accessor_property(LRContext *ctx, LRValue obj, LRString *atom,
+                                 LRValue getter, LRValue setter);
+int     lr_set_accessor_property_str(LRContext *ctx, LRValue obj, const char *name,
+                                     LRValue getter, LRValue setter);
 
 int     lr_delete_property(LRContext *ctx, LRValue obj, LRString *atom, int flags);
 

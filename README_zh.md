@@ -5,7 +5,7 @@
 ## 特性
 
 - **ES2022+ JavaScript**：类、箭头函数、Promise、Proxy、Reflect、模块等
-- **浏览器 API**：`console`、`URL`、`TextEncoder`/`TextDecoder`、`fetch`（网络请求通过宿主 `LR_HttpWrapper` 委派，引擎**无内置网络功能**）、`fs`（文件系统，权限感知）、`term`（终端命令执行，权限感知）、`crypto`、`performance`、Canvas、`setTimeout`/`setInterval`。注：`WebSocket` 尚未实现。
+- **浏览器 API**：`console`、`URL`、`TextEncoder`/`TextDecoder`、`fetch`（网络请求通过宿主 `LR_HttpWrapper` 委派）、`WebSocket`（通过 `LR_WsWrapper` 宿主委派）、`fs`（文件系统，权限感知）、`term`（终端命令执行，权限感知）、`crypto`、`performance`、Canvas、`setTimeout`/`setInterval`。注：引擎**无内置网络功能**，`fetch` 与 `WebSocket` 均由宿主委派。
 - **类型数组**：`ArrayBuffer`、`Int8Array`、`Uint8Array`、`Float64Array`、`DataView`
 - **错误处理**：`Error`、`TypeError`、`SyntaxError`、`RangeError`、`ReferenceError`，支持堆栈跟踪和 `cause`
 - **ES6+ 集合**：`Map`、`Set`、`WeakMap`、`WeakSet`
@@ -207,6 +207,7 @@ LR_JS/
 │   ├── lr_crypto.c     # crypto.randomUUID
 │   ├── lr_storage.c    # localStorage（内存存储）
 │   ├── lr_fetch.c      # HTTP 请求（包装器模式，委托给宿主）
+│   ├── lr_ws.c         # WebSocket（宿主委派包装器，LR_WsWrapper）
 ├── lr_fs.c         # 文件系统 API（权限感知包装器）
 ├── lr_terminal.c   # 终端 API（权限感知包装器）
 │   ├── lr_thread_pool.c # 线程池
@@ -333,6 +334,11 @@ lr_renderer_pipeline_flush(rb);  // 自动提交当前帧缓冲
 // 清理
 lr_render_pipeline_destroy(pipe);
 ```
+
+## 特别感谢
+
+- **QuickJS** —— 本项目基于 Fabrice Bellard 的 [QuickJS](https://bellard.org/quickjs/) JavaScript 引擎构建，其精简、可嵌入的 C 语言实现为本项目提供了核心 JavaScript 运行时基础。
+- **V8** —— 本项目在对象模型、Promise/任务队列、字节码设计等架构与行为决策上，参考并借鉴了 Google [V8](https://v8.dev/) 引擎的设计思路。
 
 ## 许可证
 

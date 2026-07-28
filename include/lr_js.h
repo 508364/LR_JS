@@ -230,6 +230,47 @@ LR_API void lr_http_set_wrapper(LR_Runtime *rt, LR_HttpWrapper *wrapper);
 LR_API LR_HttpWrapper *lr_http_get_wrapper(LR_Runtime *rt);
 LR_API void lr_http_result_free(LR_HttpResult *result);
 
+/* ── WebSocket Wrapper ────────────────────────────────────────────────── */
+/*
+ * Like the HTTP wrapper, L/R_JS implements NO WebSocket protocol internally.
+ * It delegates the connection to the host application through LR_WsWrapper.
+ *
+ * The host's connect() callback opens the connection and returns a connection
+ * handle; the actual "open" event is reported later via lr_ws_on_open().
+ * The host delivers inbound data and lifecycle events by calling the engine
+ * side lr_ws_on_*() functions, which must be invoked from the engine thread
+ * (e.g. from the host's I/O pump integrated with lr_event_loop_run()).
+ */
+typedef struct LR_WsWrapper {
+    void *user_data;  /* opaque data passed to every callback */
+
+    /* Initiate a connection. On success store the host connection handle in
+       *out_handle and return 0; the open event arrives later via
+       lr_ws_on_open(). Return -1 for immediate failure. */
+    int (*connect)(void *user_data, const char *url, const char *protocols,
+                   void **out_handle);
+
+    /* Send a text frame. Return 0 on success, -1 on error. */
+    int (*send)(void *user_data, void *conn_handle,
+                const void *data, size_t len);
+
+    /* Close the connection. code/reason may be 0/NULL. Return 0 on success. */
+    int (*close)(void *user_data, void *conn_handle, int code, const char *reason);
+} LR_WsWrapper;
+
+LR_API void lr_ws_set_wrapper(LR_Runtime *rt, LR_WsWrapper *wrapper);
+LR_API LR_WsWrapper *lr_ws_get_wrapper(LR_Runtime *rt);
+
+/* Engine-side callbacks the HOST invokes to push WebSocket events into JS.
+   Must be called from the engine thread. */
+LR_API void lr_ws_on_open(LR_Runtime *rt, void *conn_handle);
+LR_API void lr_ws_on_message(LR_Runtime *rt, void *conn_handle,
+                              const void *data, size_t len);
+LR_API void lr_ws_on_close(LR_Runtime *rt, void *conn_handle,
+                            int code, const char *reason);
+LR_API void lr_ws_on_error(LR_Runtime *rt, void *conn_handle,
+                            const char *message);
+
 /* ── File System Wrapper ──────────────────────────────────────────────── */
 
 typedef struct LR_FileResult {

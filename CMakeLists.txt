@@ -100,6 +100,7 @@ set(LR_RUNTIME_SRCS
     src/lr_crypto.c
     src/lr_storage.c
     src/lr_fetch.c
+    src/lr_ws.c
     src/lr_thread_pool.c
     src/lr_sandbox.c
     src/lr_renderer.c

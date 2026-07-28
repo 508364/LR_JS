@@ -216,10 +216,12 @@ static LRObject *lr_object_alloc(LRRuntime *rt)
     return obj;
 }
 
-/* Metadata for ArrayBuffer: stores the free_func and its opaque argument */
+/* Metadata for ArrayBuffer / SharedArrayBuffer: stores the free_func and
+ * its opaque argument. */
 typedef struct ArrayBufferMeta {
     void (*free_func)(void *opaque, void *ptr);
     void *opaque;
+    int is_shared;
 } ArrayBufferMeta;
 
 void lr_free_object(LRRuntime *rt, LRObject *obj)
@@ -367,11 +369,215 @@ void lr_free_object(LRRuntime *rt, LRObject *obj)
     free(obj);
 }
 
+/* ── Weak references & finalization support ────────────────────────────── */
+
+static void lr_free_pending_object(LRRuntime *rt, LRObject *obj)
+{
+    /* Remove from the pending-finalization list */
+    LRObject **pp = &rt->pending_finalize_list;
+    while (*pp) {
+        if (*pp == obj) { *pp = obj->finalize_next; break; }
+        pp = &(*pp)->finalize_next;
+    }
+    obj->finalization_pending = 0;
+    lr_free_object(rt, obj);
+}
+
+static int lr_has_finalization_registrations(LRRuntime *rt, LRObject *obj)
+{
+    LRFinalizationEntry *e = rt->finalization_entries;
+    while (e) {
+        if (e->target == obj) return 1;
+        e = e->next;
+    }
+    return 0;
+}
+
+static void lr_finalization_job_data_free(void *p)
+{
+    LRFinalizationJobData *jd = (LRFinalizationJobData *)p;
+    if (!jd) return;
+    lr_free_value(jd->ctx, jd->callback);
+    lr_free_value(jd->ctx, jd->heldValue);
+    free(jd);
+}
+
+static LRValue js_finalization_job_func(LRContext *ctx, LRValue this_val,
+                                        int argc, LRValue *argv)
+{
+    (void)this_val; (void)argc; (void)argv;
+    LRObject *fobj = (LRObject *)ctx->current_func.u.ptr;
+    if (!fobj || fobj->type != LR_OBJ_CFUNCTION) return LR_VALUE_UNDEFINED;
+    LRCFunction *cf = (LRCFunction *)fobj->extra;
+    LRFinalizationJobData *jd = (LRFinalizationJobData *)cf->data;
+    if (!jd) return LR_VALUE_UNDEFINED;
+    LRValue arg = lr_dup_value(ctx, jd->heldValue);
+    LRValue result = lr_call(ctx, jd->callback, LR_VALUE_UNDEFINED, 1, &arg);
+    lr_free_value(ctx, arg);
+    lr_free_value(ctx, result);
+    return LR_VALUE_UNDEFINED;
+}
+
+static void lr_enqueue_finalization_job(LRContext *ctx, LRValue callback, LRValue heldValue)
+{
+    LRValue fn = lr_new_cfunction(ctx, js_finalization_job_func, "finalizationJob", 0);
+    if (fn.tag != LR_TYPE_OBJECT) { lr_free_value(ctx, fn); return; }
+    LRObject *fobj = (LRObject *)fn.u.ptr;
+    LRCFunction *cf = (LRCFunction *)fobj->extra;
+    LRFinalizationJobData *jd = (LRFinalizationJobData *)malloc(sizeof(LRFinalizationJobData));
+    if (!jd) { lr_free_value(ctx, fn); return; }
+    jd->ctx = ctx;
+    jd->callback = lr_dup_value(ctx, callback);
+    jd->heldValue = lr_dup_value(ctx, heldValue);
+    cf->data = jd;
+    cf->data_free = lr_finalization_job_data_free;
+    lr_enqueue_job(ctx->rt, ctx, fn);
+    lr_free_value(ctx, fn);
+}
+
+/* Fire any FinalizationRegistry callbacks registered for `obj` as microtasks. */
+static void lr_process_finalization_registrations(LRRuntime *rt, LRObject *obj)
+{
+    LRContext *ctx = rt->ctx_list;
+    LRFinalizationEntry **pp = &rt->finalization_entries;
+    while (*pp) {
+        LRFinalizationEntry *e = *pp;
+        if (e->target != obj) { pp = &e->next; continue; }
+        if (ctx && !JS_IsUndefined(e->callback)) {
+            lr_enqueue_finalization_job(ctx, e->callback, e->heldValue);
+        }
+        *pp = e->next;
+        lr_free_value(ctx, e->heldValue);
+        lr_free_value(ctx, e->callback);
+        lr_free_value(ctx, e->registry);
+        lr_free_value(ctx, e->token);
+        free(e);
+    }
+}
+
+static int lr_token_matches(LRValue a, LRValue b)
+{
+    if (JS_IsUndefined(a) || JS_IsUndefined(b)) return 0;
+    if (a.tag != b.tag) return 0;
+    switch (a.tag) {
+    case LR_TYPE_INT32:   return a.u.int32 == b.u.int32;
+    case LR_TYPE_FLOAT64: return a.u.float64 == b.u.float64;
+    case LR_TYPE_BOOL:    return a.u.bool_val == b.u.bool_val;
+    case LR_TYPE_STRING:  return strcmp(((LRString *)a.u.ptr)->str,
+                                        ((LRString *)b.u.ptr)->str) == 0;
+    case LR_TYPE_OBJECT:  return a.u.ptr == b.u.ptr;
+    default:              return 0;
+    }
+}
+
 static void lr_object_release(LRRuntime *rt, LRObject *obj)
 {
     if (!obj) return;
-    if (--obj->ref_count <= 0)
-        lr_free_object(rt, obj);
+    if (!rt && obj->ctx) rt = obj->ctx->rt;
+    if (--obj->ref_count > 0) return;
+    /* Already deferred by a prior release (still kept alive by WeakRefs or
+     * pending finalization). A deref() may have temporarily revived it; just
+     * leave it pending — it will be freed once its last WeakRef is gone. */
+    if (obj->finalization_pending) return;
+    /* The object is now unreachable via strong references. */
+    if (obj->weak_ref_count > 0 || lr_has_finalization_registrations(rt, obj)) {
+        /* Defer finalization: keep the object alive (ref_count stays 0) until
+         * its last WeakRef and any pending finalization work is gone. */
+        obj->ref_count = 0;
+        obj->finalization_pending = 1;
+        obj->finalize_next = rt->pending_finalize_list;
+        rt->pending_finalize_list = obj;
+        lr_process_finalization_registrations(rt, obj);
+        if (obj->weak_ref_count == 0) {
+            lr_free_pending_object(rt, obj);
+        }
+        return;
+    }
+    lr_free_object(rt, obj);
+}
+
+/* ── Public WeakRef / FinalizationRegistry API ─────────────────────────── */
+
+void lr_weak_ref_retain(LRRuntime *rt, LRObject *target)
+{
+    (void)rt;
+    if (target) target->weak_ref_count++;
+}
+
+void lr_weak_ref_release(LRRuntime *rt, LRObject *target)
+{
+    if (!target) return;
+    if (!rt && target->ctx) rt = target->ctx->rt;
+    if (target->weak_ref_count > 0) target->weak_ref_count--;
+    if (target->weak_ref_count == 0 && target->finalization_pending) {
+        lr_free_pending_object(rt, target);
+    }
+}
+
+LRValue lr_weak_ref_deref(LRContext *ctx, LRObject *target)
+{
+    if (!target) return LR_VALUE_UNDEFINED;
+    /* The target is still physically alive as long as it is kept around by a
+     * strong reference or by at least one WeakRef (which implies this WeakRef
+     * is still live, so the pointer remains valid). Once both drop to zero the
+     * object has been freed and we must report it as collected. */
+    if (target->ref_count > 0 || target->weak_ref_count > 0) {
+        LRValue v;
+        v.tag = LR_TYPE_OBJECT;
+        v.u.ptr = target;
+        return lr_dup_value(ctx, v);
+    }
+    return LR_VALUE_UNDEFINED;
+}
+
+void lr_register_finalization(LRRuntime *rt, LRObject *target,
+                              LRValue callback, LRValue heldValue,
+                              LRValue registry, LRValue token)
+{
+    if (!rt || !target) {
+        lr_free_value(NULL, callback);
+        lr_free_value(NULL, heldValue);
+        lr_free_value(NULL, registry);
+        lr_free_value(NULL, token);
+        return;
+    }
+    LRFinalizationEntry *e = (LRFinalizationEntry *)malloc(sizeof(LRFinalizationEntry));
+    if (!e) {
+        lr_free_value(NULL, callback);
+        lr_free_value(NULL, heldValue);
+        lr_free_value(NULL, registry);
+        lr_free_value(NULL, token);
+        return;
+    }
+    e->target = target;
+    e->callback = callback;     /* takes ownership */
+    e->heldValue = heldValue;   /* takes ownership */
+    e->registry = registry;     /* takes ownership */
+    e->token = token;           /* takes ownership */
+    e->next = rt->finalization_entries;
+    rt->finalization_entries = e;
+}
+
+int lr_unregister_finalization(LRRuntime *rt, LRValue token)
+{
+    int removed = 0;
+    if (!rt) return 0;
+    LRFinalizationEntry **pp = &rt->finalization_entries;
+    while (*pp) {
+        LRFinalizationEntry *e = *pp;
+        if (lr_token_matches(e->token, token)) {
+            *pp = e->next;
+            lr_free_value(NULL, e->heldValue);
+            lr_free_value(NULL, e->callback);
+            lr_free_value(NULL, e->registry);
+            lr_free_value(NULL, e->token);
+            free(e);
+            removed++;
+        } else {
+            pp = &e->next;
+        }
+    }
+    return removed;
 }
 
 static LRObject *lr_object_dup(LRObject *obj)
@@ -883,7 +1089,7 @@ static void shape_cache_update(LRContext *ctx, LRObject *obj, LRString *atom, in
 /* ── Property Access ──────────────────────────────────────────────────── */
 
 /* Get property from object's own properties (not prototype chain) */
-static LRValue *lr_object_find_own_prop(LRObject *obj, LRString *key)
+static LRProperty *lr_object_find_own_prop(LRObject *obj, LRString *key)
 {
     if (!obj->prop_hash) return NULL;
     /* Simple linear search through hash chain */
@@ -892,11 +1098,100 @@ static LRValue *lr_object_find_own_prop(LRObject *obj, LRString *key)
         if (prop->key == key || (prop->key && key &&
             prop->key->len == key->len &&
             memcmp(prop->key->str, key->str, key->len) == 0)) {
-            return &prop->value;
+            return prop;
         }
         prop = prop->next;
     }
     return NULL;
+}
+
+/* Invoke a property's getter/setter semantics.
+ * For an accessor property, call the getter (if any) with `receiver` as this.
+ * For a normal property, return the stored value. */
+static LRValue lr_property_get(LRContext *ctx, LRValue receiver, LRProperty *prop)
+{
+    if (prop->flags & LR_PROP_GETTER) {
+        if (prop->value.tag == LR_TYPE_OBJECT) {
+            LRValue result = lr_call_direct(ctx, prop->value, receiver, 0, NULL);
+            return result;
+        }
+        return LR_VALUE_UNDEFINED;
+    }
+    return lr_dup_value(ctx, prop->value);
+}
+
+/* Set an accessor (getter/setter) property on an object.
+ * getter/setter are function values (or LR_VALUE_UNDEFINED). */
+static int lr_set_accessor_property(LRContext *ctx, LRValue obj, LRString *atom,
+                                    LRValue getter, LRValue setter)
+{
+    if (obj.tag != LR_TYPE_OBJECT) {
+        lr_free_value(ctx, getter);
+        lr_free_value(ctx, setter);
+        return -1;
+    }
+    LRObject *o = (LRObject *)obj.u.ptr;
+
+    uint8_t flags = LR_PROP_ENUMERABLE | LR_PROP_CONFIGURABLE;
+    if (getter.tag == LR_TYPE_OBJECT) flags |= LR_PROP_GETTER;
+    if (setter.tag == LR_TYPE_OBJECT) flags |= LR_PROP_SETTER;
+
+    LRProperty *prop = o->prop_hash;
+    while (prop) {
+        if (prop->key == atom || (prop->key && atom &&
+            prop->key->len == atom->len &&
+            memcmp(prop->key->str, atom->str, atom->len) == 0)) {
+            lr_free_value(ctx, prop->value);
+            lr_free_value(ctx, prop->setter);
+            prop->value = getter;
+            prop->setter = setter;
+            prop->flags = flags;
+            lr_string_dup(atom);
+            shape_cache_update(ctx, o, atom, 1);
+            return 0;
+        }
+        prop = prop->next;
+    }
+
+    LRProperty *new_prop = (LRProperty *)calloc(1, sizeof(LRProperty));
+    new_prop->key = lr_string_dup(atom);
+    new_prop->value = getter;
+    new_prop->setter = setter;
+    new_prop->flags = flags;
+    new_prop->next = o->prop_hash;
+    o->prop_hash = new_prop;
+    shape_cache_update(ctx, o, atom, 1);
+    ctx->rt->prop_count++;
+    ctx->rt->prop_size += sizeof(LRProperty);
+    return 0;
+}
+
+static int lr_set_accessor_property_str(LRContext *ctx, LRValue obj,
+                                        const char *name, LRValue getter, LRValue setter)
+{
+    LRString *atom = lr_new_atom(ctx, name);
+    return lr_set_accessor_property(ctx, obj, atom, getter, setter);
+}
+
+/* Helper: invoke a property's setter if it is an accessor.
+ * Returns 1 if handled (setter invoked or no-op for read-only accessor),
+ * 0 if the property is a normal data property (caller should store value). */
+static int lr_property_try_set_accessor(LRContext *ctx, LRValue receiver,
+                                        LRProperty *prop, LRValue val)
+{
+    if (!(prop->flags & (LR_PROP_GETTER | LR_PROP_SETTER)))
+        return 0;
+    if (prop->flags & LR_PROP_SETTER) {
+        if (prop->setter.tag == LR_TYPE_OBJECT) {
+            LRValue arg = lr_dup_value(ctx, val);
+            LRValue args[1] = { arg };
+            LRValue result = lr_call_direct(ctx, prop->setter, receiver, 1, args);
+            lr_free_value(ctx, result);
+            lr_free_value(ctx, arg);
+        }
+    }
+    lr_free_value(ctx, val);
+    return 1;
 }
 
 LRValue lr_get_property(LRContext *ctx, LRValue obj, LRString *atom)
@@ -952,11 +1247,11 @@ LRValue lr_get_property(LRContext *ctx, LRValue obj, LRString *atom)
     }
 
     /* Check own properties */
-    LRValue *found = lr_object_find_own_prop(o, atom);
+    LRProperty *found = lr_object_find_own_prop(o, atom);
     if (found) {
         /* Update shape cache */
         shape_cache_update(ctx, o, atom, 1);
-        return lr_dup_value(ctx, *found);
+        return lr_property_get(ctx, obj, found);
     }
 
     /* Walk prototype chain */
@@ -969,7 +1264,7 @@ LRValue lr_get_property(LRContext *ctx, LRValue obj, LRString *atom)
         }
         found = lr_object_find_own_prop(po, atom);
         if (found) {
-            return lr_dup_value(ctx, *found);
+            return lr_property_get(ctx, obj, found);
         }
         proto = po->proto;
     }
@@ -986,9 +1281,9 @@ LRValue lr_get_property_direct(LRContext *ctx, LRValue obj, LRString *atom)
     LRObject *o = (LRObject *)obj.u.ptr;
 
     /* Check own properties */
-    LRValue *found = lr_object_find_own_prop(o, atom);
+    LRProperty *found = lr_object_find_own_prop(o, atom);
     if (found) {
-        return lr_dup_value(ctx, *found);
+        return lr_property_get(ctx, obj, found);
     }
 
     /* Walk prototype chain */
@@ -997,7 +1292,7 @@ LRValue lr_get_property_direct(LRContext *ctx, LRValue obj, LRString *atom)
         LRObject *po = (LRObject *)proto.u.ptr;
         found = lr_object_find_own_prop(po, atom);
         if (found) {
-            return lr_dup_value(ctx, *found);
+            return lr_property_get(ctx, obj, found);
         }
         proto = po->proto;
     }
@@ -1085,6 +1380,8 @@ int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
             LRProperty *prop = o->prop_hash;
             while (prop) {
                 if (prop->key == atom) {
+                    if (lr_property_try_set_accessor(ctx, obj, prop, val))
+                        return 0;
                     lr_free_value(ctx, prop->value);
                     prop->value = val;
                     lr_string_dup(atom);
@@ -1101,6 +1398,9 @@ int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
         if (prop->key == atom || (prop->key && atom &&
             prop->key->len == atom->len &&
             memcmp(prop->key->str, atom->str, atom->len) == 0)) {
+            /* Accessor property: invoke setter */
+            if (lr_property_try_set_accessor(ctx, obj, prop, val))
+                return 0;
             /* Property exists - update value */
             lr_free_value(ctx, prop->value);
             prop->value = val; /* Takes ownership of val */
@@ -1128,7 +1428,8 @@ int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
     return 0;
 }
 
-/* Direct property set - bypasses Proxy traps */
+/* Direct property set - bypasses Proxy traps, but still honours
+ * accessor (getter/setter) semantics. */
 int lr_set_property_direct(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
 {
     if (obj.tag != LR_TYPE_OBJECT) return -1;
@@ -1140,6 +1441,9 @@ int lr_set_property_direct(LRContext *ctx, LRValue obj, LRString *atom, LRValue 
         if (prop->key == atom || (prop->key && atom &&
             prop->key->len == atom->len &&
             memcmp(prop->key->str, atom->str, atom->len) == 0)) {
+            /* Accessor property: invoke setter */
+            if (lr_property_try_set_accessor(ctx, obj, prop, val))
+                return 0;
             /* Property exists - update value */
             lr_free_value(ctx, prop->value);
             prop->value = val; /* Takes ownership of val */
@@ -1671,19 +1975,29 @@ void lr_set_property_function_list(LRContext *ctx, LRValue obj,
 {
     for (int i = 0; i < count; i++) {
         if (!tab[i].name) continue;
-        LRValue fn;
         if (tab[i].def_type == 0) {
             /* function */
-            fn = lr_new_cfunction2(ctx, tab[i].u.func.generic, tab[i].name,
+            LRValue fn = lr_new_cfunction2(ctx, tab[i].u.func.generic, tab[i].name,
                 tab[i].u.func.length, tab[i].u.func.cproto, tab[i].magic);
+            lr_set_property_str(ctx, obj, tab[i].name, fn);
         } else if (tab[i].def_type == 1) {
-            /* getset - skip for now */
-            continue;
+            /* getset - create accessor property */
+            LRValue getter = LR_VALUE_UNDEFINED;
+            LRValue setter = LR_VALUE_UNDEFINED;
+            if (tab[i].u.getset.get) {
+                getter = lr_new_cfunction2(ctx, tab[i].u.getset.get, tab[i].name,
+                    0, 0, tab[i].magic);
+            }
+            if (tab[i].u.getset.set) {
+                setter = lr_new_cfunction2(ctx, tab[i].u.getset.set, tab[i].name,
+                    1, 0, tab[i].magic);
+            }
+            lr_set_accessor_property_str(ctx, obj, tab[i].name, getter, setter);
         } else {
             /* value */
-            fn = lr_new_int32(ctx, tab[i].u.val.value);
+            LRValue fn = lr_new_int32(ctx, tab[i].u.val.value);
+            lr_set_property_str(ctx, obj, tab[i].name, fn);
         }
-        lr_set_property_str(ctx, obj, tab[i].name, fn);
     }
 }
 
@@ -2952,13 +3266,11 @@ void lr_gc_run(LRRuntime *rt)
         while (*pprev) {
             LRObject *obj = *pprev;
             if (obj->gc_mark == 0) {
-                if (obj->ref_count > 0) {
-                    /* Object is referenced but not GC-marked.
-                     * This might be a reference leak OR referenced by
-                     * non-GC-tracked code (e.g., timer callback).
-                     * To be safe, keep it alive. The ref-counting
-                     * mechanism will free it when the last reference
-                     * is released. */
+                if (obj->ref_count > 0 || obj->finalization_pending) {
+                    /* Object is referenced but not GC-marked, OR it is
+                     * awaiting deferred finalization (ref_count 0 but kept
+                     * alive for WeakRefs / FinalizationRegistry). Keep it
+                     * in the object list; it will be freed explicitly. */
                     pprev = &(*pprev)->gc_next;
                     continue;
                 }
@@ -3171,6 +3483,7 @@ LRValue lr_new_array_buffer(LRContext *ctx, uint8_t *buf, size_t len,
         if (meta) {
             meta->free_func = free_func;
             meta->opaque = opaque;
+            meta->is_shared = is_shared;
         }
         obj->opaque = meta;
     } else {

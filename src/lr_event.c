@@ -8,7 +8,7 @@
 
 /* ── EventTarget API ──────────────────────────────────────────────────── */
 
-static JSValue lr_event_target_addEventListener(JSContext *ctx,
+JSValue lr_event_target_addEventListener(JSContext *ctx,
                                                   JSValueConst this_val,
                                                   int argc, JSValueConst *argv)
 {
@@ -48,7 +48,7 @@ static JSValue lr_event_target_addEventListener(JSContext *ctx,
     return JS_UNDEFINED;
 }
 
-static JSValue lr_event_target_removeEventListener(JSContext *ctx,
+JSValue lr_event_target_removeEventListener(JSContext *ctx,
                                                      JSValueConst this_val,
                                                      int argc, JSValueConst *argv)
 {
@@ -99,7 +99,7 @@ static JSValue lr_event_target_removeEventListener(JSContext *ctx,
     return JS_UNDEFINED;
 }
 
-static JSValue lr_event_target_dispatchEvent(JSContext *ctx,
+JSValue lr_event_target_dispatchEvent(JSContext *ctx,
                                                JSValueConst this_val,
                                                int argc, JSValueConst *argv)
 {
@@ -148,12 +148,11 @@ static JSValue lr_event_target_dispatchEvent(JSContext *ctx,
 
 /* ── Event constructor ────────────────────────────────────────────────── */
 
-static JSValue lr_event_constructor(JSContext *ctx, JSValueConst new_target,
+static JSValue lr_event_constructor(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
-    JSValue proto = JS_GetPropertyStr(ctx, new_target, "prototype");
-    JSValue obj = JS_NewObjectProto(ctx, proto);
-    JS_FreeValue(ctx, proto);
+    /* The engine passes the already-created instance as this_val. */
+    JSValue obj = this_val;
 
     if (argc >= 1) {
         const char *type = JS_ToCString(ctx, argv[0]);
@@ -200,10 +199,10 @@ static JSValue lr_event_stopImmediatePropagation(JSContext *ctx, JSValueConst th
 
 /* ── CustomEvent ──────────────────────────────────────────────────────── */
 
-static JSValue lr_custom_event_constructor(JSContext *ctx, JSValueConst new_target,
+static JSValue lr_custom_event_constructor(JSContext *ctx, JSValueConst this_val,
                                             int argc, JSValueConst *argv)
 {
-    JSValue obj = lr_event_constructor(ctx, new_target, argc, argv);
+    JSValue obj = lr_event_constructor(ctx, this_val, argc, argv);
 
     if (argc >= 2 && JS_IsObject(argv[1])) {
         JSValue detail = JS_GetPropertyStr(ctx, argv[1], "detail");
@@ -219,13 +218,12 @@ static JSValue lr_custom_event_constructor(JSContext *ctx, JSValueConst new_targ
 
 /* ── AbortController / AbortSignal ────────────────────────────────────── */
 
-static JSValue lr_abort_controller_constructor(JSContext *ctx, JSValueConst new_target,
+static JSValue lr_abort_controller_constructor(JSContext *ctx, JSValueConst this_val,
                                                 int argc, JSValueConst *argv)
 {
     (void)argc; (void)argv;
-    JSValue proto = JS_GetPropertyStr(ctx, new_target, "prototype");
-    JSValue obj = JS_NewObjectProto(ctx, proto);
-    JS_FreeValue(ctx, proto);
+    /* The engine passes the already-created instance as this_val. */
+    JSValue obj = this_val;
     JSValue signal = JS_NewObject(ctx);
 
     JS_SetPropertyStr(ctx, signal, "aborted", JS_FALSE);

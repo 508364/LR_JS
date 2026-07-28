@@ -484,7 +484,7 @@ localStorage.clear();
 
 > **注意：** L/R_JS **不内置任何网络功能**。引擎本身不发任何网络包；`fetch()` 通过 `LR_HttpWrapper` 接口将请求委托给宿主应用程序（浏览器、WebUI 等）。
 > 宿主必须调用 `lr_http_set_wrapper()` 注册包装器，否则 `fetch()` 返回 rejected Promise。
-> 目前网络相关能力仅有 `fetch`（宿主委派）；`WebSocket` 尚未实现（规划中以同样的宿主委派方式提供）。
+> 网络相关能力均通过宿主委派实现：`fetch`（`LR_HttpWrapper`）与 `WebSocket`（`LR_WsWrapper`，见 §7.9）。
 
 ```js
 const resp = await fetch("https://api.example.com/data");
@@ -492,7 +492,95 @@ const json = await resp.json();
 console.log(json);
 ```
 
-### 7.9 Event
+### 7.9 WebSocket
+
+> **注意：** 与 `fetch` 一样，L/R_JS **不内置 WebSocket 协议**。连接通过 `LR_WsWrapper` 接口委托给宿主；引擎本身不收发任何 WebSocket 帧。宿主在 `connect`/`send`/`close` 回调中处理真实 I/O，并通过引擎侧 `lr_ws_on_*` 函数把事件回灌给 JS（**必须在引擎线程调用**，例如宿主接入引擎事件循环的 I/O 泵中）。
+
+#### C API
+
+```c
+// 设置 WebSocket 包装器（宿主拥有所有权，传 NULL 清除）
+void lr_ws_set_wrapper(LR_Runtime *rt, LR_WsWrapper *wrapper);
+
+// 获取当前 WebSocket 包装器
+LR_WsWrapper *lr_ws_get_wrapper(LR_Runtime *rt);
+```
+
+```c
+// WebSocket 包装器接口
+typedef struct LR_WsWrapper {
+    void *user_data;  // 透传给回调的 opaque 数据
+
+    // 发起连接。成功时把宿主连接句柄写入 *out_handle 并返回 0；
+    // 实际的 "open" 事件稍后通过 lr_ws_on_open() 上报。失败返回 -1。
+    int (*connect)(void *user_data, const char *url, const char *protocols,
+                   void **out_handle);
+
+    // 发送文本帧。成功返回 0，失败返回 -1。
+    int (*send)(void *user_data, void *conn_handle,
+                const void *data, size_t len);
+
+    // 关闭连接。code/reason 可为 0/NULL。成功返回 0。
+    int (*close)(void *user_data, void *conn_handle, int code, const char *reason);
+} LR_WsWrapper;
+```
+
+宿主在收到数据时调用引擎侧回调，把事件推送给 JS：
+
+```c
+void lr_ws_on_open(LR_Runtime *rt, void *conn_handle);
+void lr_ws_on_message(LR_Runtime *rt, void *conn_handle, const void *data, size_t len);
+void lr_ws_on_close(LR_Runtime *rt, void *conn_handle, int code, const char *reason);
+void lr_ws_on_error(LR_Runtime *rt, void *conn_handle, const char *message);
+```
+
+#### 使用示例（宿主侧）
+
+```c
+static int my_ws_connect(void *ud, const char *url, const char *protocols, void **out_handle) {
+    my_conn *c = my_ws_lib_connect(url, protocols);
+    if (!c) return -1;
+    *out_handle = c;            // 之后用同一句柄回灌事件
+    return 0;
+}
+static int my_ws_send(void *ud, void *h, const void *data, size_t len) {
+    return my_ws_lib_send((my_conn *)h, data, len);
+}
+static int my_ws_close(void *ud, void *h, int code, const char *reason) {
+    return my_ws_lib_close((my_conn *)h, code, reason);
+}
+
+LR_WsWrapper ws = { .user_data = NULL, .connect = my_ws_connect,
+                    .send = my_ws_send, .close = my_ws_close };
+lr_ws_set_wrapper(rt, &ws);
+
+// 连接打开/收到消息/关闭/出错时，在引擎线程调用：
+//   lr_ws_on_open(rt, conn);
+//   lr_ws_on_message(rt, conn, buf, n);
+//   lr_ws_on_close(rt, conn, code, reason);
+//   lr_ws_on_error(rt, conn, "reason");
+```
+
+#### JS API
+
+```js
+const ws = new WebSocket("wss://example.com/socket");
+
+ws.onopen    = () => console.log("connected");
+ws.onmessage = (e) => console.log("recv:", e.data);
+ws.onclose   = (e) => console.log("closed:", e.code, e.reason);
+ws.onerror   = (e) => console.log("error:", e.message);
+
+ws.addEventListener("message", (e) => console.log(e.data));
+
+ws.send("hello");
+// ...
+ws.close();
+```
+
+`WebSocket` 提供 `readyState`（0 `CONNECTING` / 1 `OPEN` / 2 `CLOSING` / 3 `CLOSED`）、`url`、`protocol`、`send()`、`close()`，以及 `onopen` / `onmessage` / `onclose` / `onerror` 事件属性。
+
+### 7.10 Event
 
 ```js
 const emitter = new EventTarget();
@@ -500,7 +588,7 @@ emitter.addEventListener("custom", (e) => console.log(e.detail));
 emitter.dispatchEvent(new CustomEvent("custom", { detail: 42 }));
 ```
 
-### 7.10 Worker
+### 7.11 Worker
 
 ```js
 const worker = new Worker("worker.js");

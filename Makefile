@@ -75,6 +75,7 @@ LR_SRCS = \
 	$(SRC_DIR)/lr_crypto.c \
 	$(SRC_DIR)/lr_storage.c \
 	$(SRC_DIR)/lr_fetch.c \
+	$(SRC_DIR)/lr_ws.c \
 	$(SRC_DIR)/lr_fs.c \
 	$(SRC_DIR)/lr_terminal.c \
 	$(SRC_DIR)/lr_sysinfo.c \

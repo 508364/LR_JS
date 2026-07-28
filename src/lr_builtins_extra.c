@@ -2038,6 +2038,138 @@ static const JSCFunctionListEntry js_weakset_proto_methods[] = {
 };
 
 /* ========================================================================
+ *  7b. WEAKREF
+ * ======================================================================== */
+
+/* Opaque data carried by every WeakRef object. Holds a raw (weak) pointer to
+ * the referent plus the runtime so the finalizer can release the weak ref. */
+typedef struct {
+    LRRuntime       *rt;
+    struct LRObject *target;   /* raw pointer; never dereferenced after GC */
+} WeakRefData;
+
+/* Called when the WeakRef object itself is collected: drop our weak reference
+ * so the target can be finalized if it has no other weak refs. */
+static void weak_ref_data_free(void *opaque)
+{
+    WeakRefData *w = (WeakRefData *)opaque;
+    if (!w) return;
+    lr_weak_ref_release(w->rt, w->target);
+    free(w);
+}
+
+/* WeakRef constructor: new WeakRef(target) */
+static LRValue js_weak_ref_constructor(LRContext *ctx, LRValue this_val,
+                                       int argc, LRValue *argv)
+{
+    if (argc < 1 || !JS_IsObject(argv[0]))
+        return JS_ThrowTypeError(ctx, "WeakRef: target must be an object");
+
+    WeakRefData *w = (WeakRefData *)malloc(sizeof(WeakRefData));
+    if (!w) return JS_ThrowTypeError(ctx, "WeakRef: out of memory");
+    w->rt     = ctx->rt;
+    w->target = (struct LRObject *)argv[0].u.ptr;
+    lr_weak_ref_retain(ctx->rt, w->target);
+    lr_set_opaque_with_free(this_val, w, weak_ref_data_free);
+    return JS_DupValue(ctx, this_val);
+}
+
+/* WeakRef.prototype.deref() */
+static LRValue js_weak_ref_deref(LRContext *ctx, LRValue this_val,
+                                 int argc, LRValue *argv)
+{
+    (void)argc; (void)argv;
+    WeakRefData *w = (WeakRefData *)JS_GetOpaque(this_val, NULL);
+    if (!w) return JS_ThrowTypeError(ctx, "WeakRef.prototype.deref called on non-WeakRef");
+    return lr_weak_ref_deref(ctx, w->target);
+}
+
+static const JSCFunctionListEntry js_weak_ref_proto_methods[] = {
+    JS_CFUNC_DEF("deref", 0, js_weak_ref_deref),
+};
+
+/* ========================================================================
+ *  7c. FINALIZATIONREGISTRY
+ * ======================================================================== */
+
+/* Opaque data carried by a FinalizationRegistry: the cleanup callback. */
+typedef struct {
+    LRContext *ctx;
+    LRValue    callback;
+} FinalizationRegistryData;
+
+static void finalization_registry_data_free(void *opaque)
+{
+    FinalizationRegistryData *d = (FinalizationRegistryData *)opaque;
+    if (!d) return;
+    lr_free_value(d->ctx, d->callback);
+    free(d);
+}
+
+/* FinalizationRegistry constructor: new FinalizationRegistry(cleanupCallback) */
+static LRValue js_finalization_registry_constructor(LRContext *ctx, LRValue this_val,
+                                                    int argc, LRValue *argv)
+{
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+        return JS_ThrowTypeError(ctx,
+            "FinalizationRegistry: cleanupCallback must be a function");
+
+    FinalizationRegistryData *d = (FinalizationRegistryData *)malloc(sizeof(*d));
+    if (!d) return JS_ThrowTypeError(ctx, "FinalizationRegistry: out of memory");
+    d->ctx      = ctx;
+    d->callback = lr_dup_value(ctx, argv[0]);
+    lr_set_opaque_with_free(this_val, d, finalization_registry_data_free);
+    return JS_DupValue(ctx, this_val);
+}
+
+/* FinalizationRegistry.prototype.register(target, heldValue [, unregisterToken]) */
+static LRValue js_finalization_registry_register(LRContext *ctx, LRValue this_val,
+                                                 int argc, LRValue *argv)
+{
+    if (argc < 2)
+        return JS_ThrowTypeError(ctx,
+            "FinalizationRegistry.prototype.register: target and heldValue required");
+    if (!JS_IsObject(argv[0]))
+        return JS_ThrowTypeError(ctx,
+            "FinalizationRegistry.prototype.register: target must be an object");
+
+    FinalizationRegistryData *d =
+        (FinalizationRegistryData *)JS_GetOpaque(this_val, NULL);
+    if (!d)
+        return JS_ThrowTypeError(ctx,
+            "FinalizationRegistry.prototype.register called on non-FinalizationRegistry");
+
+    LRValue token = (argc >= 3) ? lr_dup_value(ctx, argv[2]) : LR_VALUE_UNDEFINED;
+
+    /* lr_register_finalization takes ownership of every value passed, so we
+     * give it its own duplicates of the callback, heldValue, registry and token. */
+    lr_register_finalization(ctx->rt,
+                             (struct LRObject *)argv[0].u.ptr,
+                             lr_dup_value(ctx, d->callback),
+                             lr_dup_value(ctx, argv[1]),
+                             lr_dup_value(ctx, this_val),
+                             token);
+    return LR_VALUE_UNDEFINED;
+}
+
+/* FinalizationRegistry.prototype.unregister(unregisterToken) -> boolean */
+static LRValue js_finalization_registry_unregister(LRContext *ctx, LRValue this_val,
+                                                   int argc, LRValue *argv)
+{
+    (void)this_val;
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx,
+            "FinalizationRegistry.prototype.unregister: unregisterToken required");
+    int removed = lr_unregister_finalization(ctx->rt, argv[0]);
+    return removed ? JS_TRUE : JS_FALSE;
+}
+
+static const JSCFunctionListEntry js_finalization_registry_proto_methods[] = {
+    JS_CFUNC_DEF("register",   2, js_finalization_registry_register),
+    JS_CFUNC_DEF("unregister", 1, js_finalization_registry_unregister),
+};
+
+/* ========================================================================
  *  8. TYPED ARRAY AND DATA VIEW
  * ======================================================================== */
 
@@ -3274,6 +3406,307 @@ static LRValue js_array_buffer_constructor(LRContext *ctx, LRValue this_val,
     return result;
 }
 
+/* ── SharedArrayBuffer constructor ───────────────────────────────────── */
+
+static LRValue js_shared_array_buffer_constructor(LRContext *ctx, LRValue this_val,
+                                                  int argc, LRValue *argv)
+{
+    (void)this_val;
+    int32_t byte_len = 0;
+    if (argc >= 1) {
+        JS_ToInt32(ctx, &byte_len, argv[0]);
+        if (byte_len < 0) {
+            return JS_ThrowRangeError(ctx, "SharedArrayBuffer: invalid array buffer length");
+        }
+    }
+    uint8_t *buf = (uint8_t *)calloc(1, (size_t)byte_len);
+    if (!buf && byte_len > 0) {
+        return JS_ThrowTypeError(ctx, "SharedArrayBuffer: allocation failed");
+    }
+    JSValue result = lr_new_array_buffer(ctx, buf, (size_t)byte_len, lr_array_buffer_free, NULL, 1);
+    if (JS_IsException(result)) {
+        free(buf);
+    }
+    return result;
+}
+
+static LRValue js_shared_array_buffer_slice(LRContext *ctx, LRValue this_val,
+                                            int argc, LRValue *argv)
+{
+    LRValue len_val = JS_GetPropertyStr(ctx, this_val, "byteLength");
+    int32_t src_len = 0;
+    JS_ToInt32(ctx, &src_len, len_val);
+    JS_FreeValue(ctx, len_val);
+
+    int32_t start = 0, end = src_len;
+    if (argc >= 1) JS_ToInt32(ctx, &start, argv[0]);
+    if (argc >= 2 && !JS_IsUndefined(argv[1])) JS_ToInt32(ctx, &end, argv[1]);
+
+    if (start < 0) start = src_len + start;
+    if (start < 0) start = 0;
+    if (end < 0) end = src_len + end;
+    if (end > src_len) end = src_len;
+    if (start > end) start = end;
+
+    int32_t new_len = end - start;
+    uint8_t *src = lr_get_array_buffer(ctx, NULL, this_val);
+    uint8_t *dst = (uint8_t *)calloc(1, (size_t)(new_len > 0 ? new_len : 0));
+    if (src && new_len > 0) memcpy(dst, src + start, (size_t)new_len);
+
+    JSValue result = lr_new_array_buffer(ctx, dst, (size_t)new_len, lr_array_buffer_free, NULL, 1);
+    if (JS_IsException(result)) free(dst);
+    return result;
+}
+
+/* ── Atomics ────────────────────────────────────────────────────────────
+ * Operate on integer TypedArrays. The engine is single-threaded, so the
+ * read-modify-write steps are naturally uninterruptible; "atomic" semantics
+ * are therefore satisfied without explicit locking. */
+
+/* Validate a TypedArray for Atomics; on success returns the buffer base
+ * pointer and the byte offset of `index` within it. Returns NULL (with an
+ * exception already thrown) on failure. */
+static uint8_t *atomics_prepare(LRContext *ctx, LRValue ta_val, LRValue index_val,
+                                TypedArrayData **out_tad, size_t *out_byte_index)
+{
+    if (ta_val.tag != LR_TYPE_OBJECT) {
+        JS_ThrowTypeError(ctx, "Atomics: first argument must be an integer TypedArray");
+        return NULL;
+    }
+    LRObject *o = (LRObject *)ta_val.u.ptr;
+    if (o->type != LR_OBJ_TYPED_ARRAY || !o->opaque) {
+        JS_ThrowTypeError(ctx, "Atomics: first argument must be an integer TypedArray");
+        return NULL;
+    }
+    TypedArrayData *tad = (TypedArrayData *)o->opaque;
+    int magic = tad->magic;
+    if (magic == TA_MAGIC_FLOAT32 || magic == TA_MAGIC_FLOAT64 ||
+        magic == TA_MAGIC_BIGUINT64 || magic == TA_MAGIC_BIGINT64) {
+        JS_ThrowTypeError(ctx, "Atomics: cannot operate on float or BigInt TypedArray");
+        return NULL;
+    }
+
+    int32_t idx;
+    JS_ToInt32(ctx, &idx, index_val);
+    if (idx < 0) {
+        JS_ThrowRangeError(ctx, "Atomics: index must be a non-negative integer");
+        return NULL;
+    }
+    size_t elem_count = tad->byte_length / tad->element_size;
+    if ((size_t)idx >= elem_count) {
+        JS_ThrowRangeError(ctx, "Atomics: index out of range");
+        return NULL;
+    }
+    uint8_t *base = lr_get_array_buffer(ctx, NULL, tad->buffer);
+    if (!base) {
+        JS_ThrowTypeError(ctx, "Atomics: buffer is detached");
+        return NULL;
+    }
+    *out_tad = tad;
+    *out_byte_index = tad->byte_offset + (size_t)idx * tad->element_size;
+    return base;
+}
+
+static uint64_t atomics_read_raw(uint8_t *base, size_t bi, int magic, int *is_signed)
+{
+    switch (magic) {
+    case TA_MAGIC_UINT8:  *is_signed = 0; return ((uint8_t *)base)[bi];
+    case TA_MAGIC_INT8:   *is_signed = 1; return (uint64_t)(int64_t)((int8_t *)base)[bi];
+    case TA_MAGIC_UINT16: { uint16_t v; memcpy(&v, base + bi, 2); *is_signed = 0; return v; }
+    case TA_MAGIC_INT16:  { int16_t v;  memcpy(&v, base + bi, 2); *is_signed = 1; return (uint64_t)(int64_t)v; }
+    case TA_MAGIC_UINT32: { uint32_t v; memcpy(&v, base + bi, 4); *is_signed = 0; return v; }
+    case TA_MAGIC_INT32:  { int32_t v;  memcpy(&v, base + bi, 4); *is_signed = 1; return (uint64_t)(int64_t)v; }
+    }
+    *is_signed = 0;
+    return 0;
+}
+
+static void atomics_write_raw(uint8_t *base, size_t bi, int magic, uint64_t raw)
+{
+    switch (magic) {
+    case TA_MAGIC_UINT8:  ((uint8_t *)base)[bi] = (uint8_t)raw; break;
+    case TA_MAGIC_INT8:   ((int8_t *)base)[bi]  = (int8_t)raw; break;
+    case TA_MAGIC_UINT16: { uint16_t v = (uint16_t)raw; memcpy(base + bi, &v, 2); break; }
+    case TA_MAGIC_INT16:  { int16_t v = (int16_t)raw;  memcpy(base + bi, &v, 2); break; }
+    case TA_MAGIC_UINT32: { uint32_t v = (uint32_t)raw; memcpy(base + bi, &v, 4); break; }
+    case TA_MAGIC_INT32:  { int32_t v = (int32_t)raw;  memcpy(base + bi, &v, 4); break; }
+    }
+}
+
+static LRValue atomics_to_js(LRContext *ctx, int magic, uint64_t raw)
+{
+    if (magic == TA_MAGIC_UINT32)
+        return JS_NewFloat64(ctx, (double)(uint32_t)raw);
+    return JS_NewInt32(ctx, (int32_t)(int64_t)raw);
+}
+
+/* op: 0=add 1=sub 2=and 3=or 4=xor 5=exchange 6=compareExchange
+ *      7=load 8=store */
+static LRValue atomics_op(LRContext *ctx, LRValue ta, LRValue index, LRValue value,
+                          int op, LRValue expected)
+{
+    TypedArrayData *tad;
+    size_t bi;
+    uint8_t *base = atomics_prepare(ctx, ta, index, &tad, &bi);
+    if (!base) return JS_EXCEPTION;
+
+    int is_signed;
+    uint64_t old = atomics_read_raw(base, bi, tad->magic, &is_signed);
+    double dv = 0, de = 0;
+    if (value.tag != LR_TYPE_UNDEFINED)    JS_ToFloat64(ctx, &dv, value);
+    if (expected.tag != LR_TYPE_UNDEFINED) JS_ToFloat64(ctx, &de, expected);
+    uint64_t v = (uint64_t)(int64_t)dv;
+    uint64_t e = (uint64_t)(int64_t)de;
+
+    uint64_t mask = (tad->element_size == 1) ? 0xFFULL
+                  : (tad->element_size == 2) ? 0xFFFFULL
+                                             : 0xFFFFFFFFULL;
+
+    if (op == 6) { /* compareExchange: return the OLD value */
+        if (old == e) atomics_write_raw(base, bi, tad->magic, v & mask);
+        return atomics_to_js(ctx, tad->magic, old);
+    }
+
+    uint64_t r;
+    switch (op) {
+    case 0: r = (old + v);  break;
+    case 1: r = (old - v);  break;
+    case 2: r = (old & v);  break;
+    case 3: r = (old | v);  break;
+    case 4: r = (old ^ v);  break;
+    case 5: r = v;          break;  /* exchange */
+    case 7: r = old;        break;  /* load */
+    case 8: r = v;          break;  /* store */
+    default: r = old;
+    }
+    r &= mask;
+    if (op != 7) atomics_write_raw(base, bi, tad->magic, r);
+    return atomics_to_js(ctx, tad->magic, (op == 7) ? old : r);
+}
+
+static LRValue js_atomics_load(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "Atomics.load: requires (typedArray, index)");
+    return atomics_op(ctx, argv[0], argv[1], LR_VALUE_UNDEFINED, 7, LR_VALUE_UNDEFINED);
+}
+
+static LRValue js_atomics_store(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    if (argc < 3) return JS_ThrowTypeError(ctx, "Atomics.store: requires (typedArray, index, value)");
+    return atomics_op(ctx, argv[0], argv[1], argv[2], 8, LR_VALUE_UNDEFINED);
+}
+
+static LRValue js_atomics_add(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    if (argc < 3) return JS_ThrowTypeError(ctx, "Atomics.add: requires (typedArray, index, value)");
+    return atomics_op(ctx, argv[0], argv[1], argv[2], 0, LR_VALUE_UNDEFINED);
+}
+
+static LRValue js_atomics_sub(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    if (argc < 3) return JS_ThrowTypeError(ctx, "Atomics.sub: requires (typedArray, index, value)");
+    return atomics_op(ctx, argv[0], argv[1], argv[2], 1, LR_VALUE_UNDEFINED);
+}
+
+static LRValue js_atomics_and(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    if (argc < 3) return JS_ThrowTypeError(ctx, "Atomics.and: requires (typedArray, index, value)");
+    return atomics_op(ctx, argv[0], argv[1], argv[2], 2, LR_VALUE_UNDEFINED);
+}
+
+static LRValue js_atomics_or(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    if (argc < 3) return JS_ThrowTypeError(ctx, "Atomics.or: requires (typedArray, index, value)");
+    return atomics_op(ctx, argv[0], argv[1], argv[2], 3, LR_VALUE_UNDEFINED);
+}
+
+static LRValue js_atomics_xor(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    if (argc < 3) return JS_ThrowTypeError(ctx, "Atomics.xor: requires (typedArray, index, value)");
+    return atomics_op(ctx, argv[0], argv[1], argv[2], 4, LR_VALUE_UNDEFINED);
+}
+
+static LRValue js_atomics_exchange(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    if (argc < 3) return JS_ThrowTypeError(ctx, "Atomics.exchange: requires (typedArray, index, value)");
+    return atomics_op(ctx, argv[0], argv[1], argv[2], 5, LR_VALUE_UNDEFINED);
+}
+
+static LRValue js_atomics_compareExchange(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    if (argc < 4) return JS_ThrowTypeError(ctx,
+        "Atomics.compareExchange: requires (typedArray, index, expectedValue, replacementValue)");
+    /* argv[2] = expected, argv[3] = replacement */
+    return atomics_op(ctx, argv[0], argv[1], argv[3], 6, argv[2]);
+}
+
+static LRValue js_atomics_isLockFree(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    int32_t size = 4;
+    if (argc >= 1) JS_ToInt32(ctx, &size, argv[0]);
+    LRValue result = JS_NewBool(ctx, (size == 1 || size == 2 || size == 4));
+    return result;
+}
+
+static LRValue js_atomics_wait(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    if (argc < 3) return JS_ThrowTypeError(ctx,
+        "Atomics.wait: requires (typedArray, index, value[, timeout])");
+    TypedArrayData *tad;
+    size_t bi;
+    uint8_t *base = atomics_prepare(ctx, argv[0], argv[1], &tad, &bi);
+    if (!base) return JS_EXCEPTION;
+    if (tad->magic != TA_MAGIC_INT32) {
+        return JS_ThrowTypeError(ctx, "Atomics.wait: requires an Int32Array");
+    }
+    int is_signed;
+    uint64_t cur = atomics_read_raw(base, bi, tad->magic, &is_signed);
+    int32_t wait_val = 0;
+    JS_ToInt32(ctx, &wait_val, argv[2]);
+    if (cur != (uint64_t)(uint32_t)(int32_t)wait_val) {
+        return JS_NewString(ctx, "not-equal");
+    }
+    /* Single-threaded engine: we cannot block the agent. A timeout of 0 or
+     * any requested wait returns "timed-out" immediately (no real waiting). */
+    return JS_NewString(ctx, "timed-out");
+}
+
+static LRValue js_atomics_notify(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    (void)argv;
+    if (argc < 1) return JS_ThrowTypeError(ctx,
+        "Atomics.notify: requires (typedArray, index[, count])");
+    /* Single-threaded engine: there are no waiting agents to wake. */
+    return JS_NewInt32(ctx, 0);
+}
+
+static const JSCFunctionListEntry js_atomics_funcs[] = {
+    JS_CFUNC_DEF("load",            2, js_atomics_load),
+    JS_CFUNC_DEF("store",           3, js_atomics_store),
+    JS_CFUNC_DEF("add",             3, js_atomics_add),
+    JS_CFUNC_DEF("sub",             3, js_atomics_sub),
+    JS_CFUNC_DEF("and",             3, js_atomics_and),
+    JS_CFUNC_DEF("or",              3, js_atomics_or),
+    JS_CFUNC_DEF("xor",             3, js_atomics_xor),
+    JS_CFUNC_DEF("exchange",        3, js_atomics_exchange),
+    JS_CFUNC_DEF("compareExchange", 4, js_atomics_compareExchange),
+    JS_CFUNC_DEF("isLockFree",      1, js_atomics_isLockFree),
+    JS_CFUNC_DEF("wait",            4, js_atomics_wait),
+    JS_CFUNC_DEF("notify",          3, js_atomics_notify),
+};
+
 /* ========================================================================
  *  9. INITIALIZATION FUNCTION
  * ======================================================================== */
@@ -3467,6 +3900,34 @@ void lr_builtins_extra_init(LR_Runtime *rt)
         JS_SetPropertyStr(ctx, global, "WeakSet", ws_ctor);
     }
 
+    /* ── Register WeakRef ─────────────────────────────────────────────── */
+    {
+        JSValue wr_ctor = JS_NewCFunction(ctx, js_weak_ref_constructor, "WeakRef", 1);
+        JSValue wr_proto = JS_NewObject(ctx);
+
+        JS_SetPropertyFunctionList(ctx, wr_proto, js_weak_ref_proto_methods,
+                                    sizeof(js_weak_ref_proto_methods) / sizeof(js_weak_ref_proto_methods[0]));
+
+        JS_SetPropertyStr(ctx, wr_proto, "constructor", JS_DupValue(ctx, wr_ctor));
+        JS_SetPropertyStr(ctx, wr_ctor, "prototype", JS_DupValue(ctx, wr_proto));
+        JS_SetPropertyStr(ctx, global, "WeakRef", wr_ctor);
+    }
+
+    /* ── Register FinalizationRegistry ────────────────────────────────── */
+    {
+        JSValue fr_ctor = JS_NewCFunction(ctx, js_finalization_registry_constructor,
+                                          "FinalizationRegistry", 1);
+        JSValue fr_proto = JS_NewObject(ctx);
+
+        JS_SetPropertyFunctionList(ctx, fr_proto, js_finalization_registry_proto_methods,
+                                    sizeof(js_finalization_registry_proto_methods)
+                                        / sizeof(js_finalization_registry_proto_methods[0]));
+
+        JS_SetPropertyStr(ctx, fr_proto, "constructor", JS_DupValue(ctx, fr_ctor));
+        JS_SetPropertyStr(ctx, fr_ctor, "prototype", JS_DupValue(ctx, fr_proto));
+        JS_SetPropertyStr(ctx, global, "FinalizationRegistry", fr_ctor);
+    }
+
     /* ── Register ArrayBuffer ────────────────────────────────────────── */
     {
         JSValue ab = JS_GetPropertyStr(ctx, global, "ArrayBuffer");
@@ -3483,6 +3944,26 @@ void lr_builtins_extra_init(LR_Runtime *rt)
             JS_FreeValue(ctx, ab_ctor);
         } else {
             JS_FreeValue(ctx, ab);
+        }
+    }
+
+    /* ── Register SharedArrayBuffer ───────────────────────────────────── */
+    {
+        JSValue sab = JS_GetPropertyStr(ctx, global, "SharedArrayBuffer");
+        if (JS_IsUndefined(sab) || JS_IsException(sab)) {
+            JS_FreeValue(ctx, sab);
+            JSValue sab_ctor = JS_NewCFunction(ctx, js_shared_array_buffer_constructor,
+                                              "SharedArrayBuffer", 1);
+            JSValue sab_proto = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, sab_proto, "constructor", JS_DupValue(ctx, sab_ctor));
+            JS_SetPropertyStr(ctx, sab_proto, "slice",
+                JS_NewCFunction(ctx, js_shared_array_buffer_slice, "slice", 2));
+            JS_SetPropertyStr(ctx, sab_ctor, "prototype", JS_DupValue(ctx, sab_proto));
+            JS_SetPropertyStr(ctx, global, "SharedArrayBuffer", JS_DupValue(ctx, sab_ctor));
+            JS_FreeValue(ctx, sab_proto);
+            JS_FreeValue(ctx, sab_ctor);
+        } else {
+            JS_FreeValue(ctx, sab);
         }
     }
 
@@ -3539,6 +4020,15 @@ void lr_builtins_extra_init(LR_Runtime *rt)
         JS_SetPropertyStr(ctx, global, "DataView", JS_DupValue(ctx, dv_ctor));
         JS_FreeValue(ctx, dv_proto);
         JS_FreeValue(ctx, dv_ctor);
+    }
+
+    /* ── Register Atomics ─────────────────────────────────────────────── */
+    {
+        JSValue atomics_obj = JS_NewObject(ctx);
+        JS_SetPropertyFunctionList(ctx, atomics_obj, js_atomics_funcs,
+            sizeof(js_atomics_funcs) / sizeof(js_atomics_funcs[0]));
+        JS_SetPropertyStr(ctx, global, "Atomics", JS_DupValue(ctx, atomics_obj));
+        JS_FreeValue(ctx, atomics_obj);
     }
 
     JS_FreeValue(ctx, global);
