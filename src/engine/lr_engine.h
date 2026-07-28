@@ -348,6 +348,11 @@ struct LRContext {
                                          LRValue this_val, int argc, LRValue *argv);
     /* Opaque interpreter pointer for use by the callback */
     void             *opaque_interp;
+    /* Persistent evaluation state (interpreter + retained ASTs/sources).
+     * Keeps JS function objects callable after lr_engine_eval returns,
+     * which is required for timers, workers and other async callbacks.
+     * Owned by the context; freed in lr_free_context. */
+    void             *persistent_interp;
 };
 
 /* ── Runtime ───────────────────────────────────────────────────────────── */
@@ -914,6 +919,18 @@ void lr_set_can_block(LRRuntime *rt, int can_block);
 /* Forward declare array buffer support */
 LRValue lr_new_array_buffer(LRContext *ctx, uint8_t *buf, size_t len,
     void (*free_func)(void *opaque, void *ptr), void *opaque, int is_shared);
+
+/* Free the persistent interpreter + retained ASTs of a context.
+ * Called automatically by lr_free_context. */
+void lr_context_free_persistent_interp(LRContext *ctx);
+
+/* Returns 1 if the value is an ArrayBuffer created with is_shared=1
+ * (i.e. a SharedArrayBuffer), 0 otherwise. */
+int lr_array_buffer_is_shared(LRValue obj);
+/* Returns the opaque pointer passed to lr_new_array_buffer (the free_func
+ * argument), or NULL. Used by SharedArrayBuffer to retrieve its shared
+ * control block. */
+void *lr_array_buffer_get_opaque(LRValue obj);
 
 #define JS_GetArrayBuffer(ctx, psize, obj) lr_get_array_buffer(ctx, psize, obj)
 uint8_t *lr_get_array_buffer(LRContext *ctx, size_t *psize, LRValue obj);

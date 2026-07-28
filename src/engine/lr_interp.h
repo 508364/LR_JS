@@ -74,6 +74,10 @@ LRValue interp_eval(Interpreter *interp, ASTNode *node);
 /* Free all resources held by the interpreter */
 void interp_free(Interpreter *interp);
 
+/* Re-attach the interpreter's JS-call callback to the context
+ * (used by the persistent interpreter in lr_engine_eval) */
+void interp_reattach(Interpreter *interp, LRContext *ctx);
+
 #ifdef __cplusplus
 }
 #endif

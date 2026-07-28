@@ -686,7 +686,11 @@ int lr_event_loop_run(LR_Runtime *rt)
         /* Process timer callbacks */
         lr_timers_process(rt);
 
-        if (!has_jobs && !rt->has_pending_jobs) {
+        /* Drain worker -> parent message queues (fires onmessage/onerror).
+         * Live workers keep the event loop alive (Node-like semantics). */
+        int workers_alive = lr_worker_poll(rt);
+
+        if (!has_jobs && !rt->has_pending_jobs && workers_alive == 0) {
             /* Idle: do incremental GC work */
             lr_gc_idle_work(&rt->gc_ctx);
 
@@ -696,7 +700,8 @@ int lr_event_loop_run(LR_Runtime *rt)
 
         /* Small sleep to avoid busy-waiting */
         if (!JS_IsJobPending(rt->lr_rt) && !rt->has_pending_jobs) {
-            break;
+            if (workers_alive == 0) break;
+            lr_sleep_ms(1);  /* idle: wait for worker messages */
         }
     }
 
@@ -727,12 +732,16 @@ int lr_event_loop_run_timeout(LR_Runtime *rt, int timeout_ms)
         /* Process timers */
         lr_timers_process(rt);
 
+        /* Drain worker -> parent message queues */
+        int workers_alive = lr_worker_poll(rt);
+
         /* Check timeout */
         elapsed_ms = (int)(((clock() - start) * 1000) / CLOCKS_PER_SEC);
         if (elapsed_ms >= timeout_ms) break;
 
         if (!JS_IsJobPending(rt->lr_rt) && !rt->has_pending_jobs) {
-            break;
+            if (workers_alive == 0) break;
+            lr_sleep_ms(1);  /* idle: wait for worker messages */
         }
     }
 

@@ -1065,6 +1065,10 @@ static LRValue *shape_cache_lookup(LRContext *ctx, LRObject *obj, LRString *atom
             LRProperty *prop = obj->prop_hash;
             while (prop) {
                 if (prop->key == atom) {
+                    /* Accessor properties must go through the slow path so
+                     * the getter is actually invoked. */
+                    if (prop->flags & (LR_PROP_GETTER | LR_PROP_SETTER))
+                        return NULL;
                     return &prop->value;
                 }
                 prop = prop->next;
@@ -1412,6 +1416,26 @@ int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
         prop = prop->next;
     }
 
+    /* Spec [[Set]]: no own property - walk the prototype chain looking for
+     * an ACCESSOR property (e.g. a setter defined on a class prototype).
+     * If found, invoke the setter with the original receiver. Data
+     * properties on the prototype do NOT block shadowing. */
+    {
+        LRValue proto_v = o->proto;
+        while (proto_v.tag == LR_TYPE_OBJECT) {
+            LRObject *po = (LRObject *)proto_v.u.ptr;
+            LRProperty *pp = lr_object_find_own_prop(po, atom);
+            if (pp) {
+                if (pp->flags & (LR_PROP_GETTER | LR_PROP_SETTER)) {
+                    if (lr_property_try_set_accessor(ctx, obj, pp, val))
+                        return 0;
+                }
+                break; /* data property on proto: shadow with own prop */
+            }
+            proto_v = po->proto;
+        }
+    }
+
     /* Create new property */
     LRProperty *new_prop = (LRProperty *)calloc(1, sizeof(LRProperty));
     new_prop->key = lr_string_dup(atom);
@@ -1451,6 +1475,23 @@ int lr_set_property_direct(LRContext *ctx, LRValue obj, LRString *atom, LRValue 
             return 0;
         }
         prop = prop->next;
+    }
+
+    /* Walk prototype chain for an accessor property (setter) */
+    {
+        LRValue proto_v = o->proto;
+        while (proto_v.tag == LR_TYPE_OBJECT) {
+            LRObject *po = (LRObject *)proto_v.u.ptr;
+            LRProperty *pp = lr_object_find_own_prop(po, atom);
+            if (pp) {
+                if (pp->flags & (LR_PROP_GETTER | LR_PROP_SETTER)) {
+                    if (lr_property_try_set_accessor(ctx, obj, pp, val))
+                        return 0;
+                }
+                break;
+            }
+            proto_v = po->proto;
+        }
     }
 
     /* Create new property */
@@ -2383,6 +2424,11 @@ void lr_free_context(LRContext *ctx)
     if (!ctx) return;
     LRRuntime *rt = ctx->rt;
 
+    /* Free the persistent interpreter first: its scopes hold strong
+     * references to JS values that must be released while the context
+     * is still fully alive. Also frees all retained ASTs/sources. */
+    lr_context_free_persistent_interp(ctx);
+
     /* Remove from runtime's context list */
     if (rt && rt->ctx_list) {
         if (rt->ctx_list == ctx) {
@@ -2461,6 +2507,53 @@ void lr_set_module_loader_func(LRRuntime *rt,
 
 /* ── Evaluation ────────────────────────────────────────────────────────── */
 
+/* One retained compilation unit: heap copy of the source, the parser that
+ * owns the AST node pool + interned strings, and the AST itself.
+ * These must stay alive as long as JS function objects created from this
+ * unit can still be called (their LRObject.extra points into the AST). */
+typedef struct LREvalUnit {
+    char    *src;
+    Parser  *parser;
+    ASTNode *ast;
+    struct LREvalUnit *next;
+} LREvalUnit;
+
+/* Persistent per-context interpreter state. Created on first eval and
+ * kept alive until lr_free_context, so that async callbacks (timers,
+ * worker messages, promise jobs) can call JS functions after the initial
+ * script evaluation has returned. */
+typedef struct LRPersistentInterp {
+    Interpreter interp;
+    LREvalUnit *units;
+} LRPersistentInterp;
+
+static void lr_eval_unit_free(LREvalUnit *unit)
+{
+    if (!unit) return;
+    if (unit->ast) ast_free_ex(unit->ast, unit->parser);
+    if (unit->parser) {
+        parser_free(unit->parser);
+        free(unit->parser);
+    }
+    free(unit->src);
+    free(unit);
+}
+
+void lr_context_free_persistent_interp(LRContext *ctx)
+{
+    LRPersistentInterp *ps = (LRPersistentInterp *)ctx->persistent_interp;
+    if (!ps) return;
+    interp_free(&ps->interp);
+    LREvalUnit *u = ps->units;
+    while (u) {
+        LREvalUnit *next = u->next;
+        lr_eval_unit_free(u);
+        u = next;
+    }
+    free(ps);
+    ctx->persistent_interp = NULL;
+}
+
 LRValue lr_engine_eval(LRContext *ctx, const char *input, size_t input_len,
                 const char *filename, int flags)
 {
@@ -2468,42 +2561,73 @@ LRValue lr_engine_eval(LRContext *ctx, const char *input, size_t input_len,
         return LR_VALUE_UNDEFINED;
     }
 
-    /* Initialize lexer */
+    /* Allocate the compilation unit up-front. The source is copied because
+     * AST tokens keep pointers into it and the caller's buffer may be
+     * freed right after this call. */
+    LREvalUnit *unit = (LREvalUnit *)calloc(1, sizeof(LREvalUnit));
+    if (!unit) return lr_throw_internal_error(ctx, "eval: out of memory");
+    unit->src = (char *)malloc(input_len + 1);
+    unit->parser = (Parser *)calloc(1, sizeof(Parser));
+    if (!unit->src || !unit->parser) {
+        free(unit->src);
+        free(unit->parser);
+        free(unit);
+        return lr_throw_internal_error(ctx, "eval: out of memory");
+    }
+    memcpy(unit->src, input, input_len);
+    unit->src[input_len] = '\0';
+
+    /* Initialize lexer on the retained copy */
     Lexer lex;
-    lexer_init(&lex, input, input_len);
+    lexer_init(&lex, unit->src, input_len);
 
     /* Initialize parser */
-    Parser parser;
-    parser_init(&parser, &lex);
+    parser_init(unit->parser, &lex);
 
     /* Parse into AST */
     int is_module = flags & JS_EVAL_TYPE_MODULE;
-    ASTNode *ast = parse_program(&parser);
+    unit->ast = parse_program(unit->parser);
 
-    if (!ast || parser.has_error) {
-        const char *err_msg = parser_get_error(&parser, NULL, NULL);
+    if (!unit->ast || unit->parser->has_error) {
+        const char *err_msg = parser_get_error(unit->parser, NULL, NULL);
         if (err_msg) {
             fprintf(stderr, "[LR_JS] Parse error: %s\n", err_msg);
         }
-        /* Free AST if it was partially allocated (e.g. parse error after
-         * some nodes were created) */
-        if (ast) {
-            ast_free_ex(ast, &parser);
-        }
-        parser_free(&parser);
+        lr_eval_unit_free(unit);
         return lr_throw_syntax_error(ctx, "%s: parse error",
             filename ? filename : "input");
     }
 
-    /* Initialize interpreter */
-    Interpreter interp;
-    interp_init(&interp, ctx, is_module);
+    /* Get or create the persistent interpreter for this context */
+    LRPersistentInterp *ps = (LRPersistentInterp *)ctx->persistent_interp;
+    if (!ps) {
+        ps = (LRPersistentInterp *)calloc(1, sizeof(LRPersistentInterp));
+        if (!ps) {
+            lr_eval_unit_free(unit);
+            return lr_throw_internal_error(ctx, "eval: out of memory");
+        }
+        interp_init(&ps->interp, ctx, is_module);
+        ctx->persistent_interp = ps;
+    } else {
+        /* Re-attach callbacks in case they were cleared */
+        interp_reattach(&ps->interp, ctx);
+    }
+    Interpreter *interp = &ps->interp;
+
+    /* Support nested evals: run program-level code in the global scope,
+     * then restore whatever scope the outer execution was in. */
+    InterpScope *saved_scope = interp->current_scope;
+    int saved_is_module = interp->is_module;
+    interp->current_scope = interp->global_scope;
+    interp->is_module = is_module;
 
     /* Evaluate the AST */
-    LRValue result = interp_eval(&interp, ast);
+    LRValue result = interp_eval(interp, unit->ast);
 
-    /* Process pending microtasks (Promise jobs) while the interpreter
-     * is still alive, since ctx->call_js_function is needed for JS calls */
+    interp->current_scope = saved_scope;
+    interp->is_module = saved_is_module;
+
+    /* Process pending microtasks (Promise jobs) */
     if (lr_is_job_pending(ctx->rt)) {
         int job_count = 0;
         while (lr_is_job_pending(ctx->rt) && job_count < 1000) {
@@ -2515,10 +2639,11 @@ LRValue lr_engine_eval(LRContext *ctx, const char *input, size_t input_len,
         }
     }
 
-    /* Cleanup */
-    ast_free_ex(ast, &parser);
-    parser_free(&parser);
-    interp_free(&interp);
+    /* Retain the unit: JS functions created during eval reference the AST
+     * (LRObject.extra), so it must outlive this call. Freed with the
+     * context in lr_context_free_persistent_interp(). */
+    unit->next = ps->units;
+    ps->units = unit;
 
     return result;
 }
@@ -3494,6 +3619,24 @@ LRValue lr_new_array_buffer(LRContext *ctx, uint8_t *buf, size_t len,
     /* Set length property */
     lr_set_property_str(ctx, v, "byteLength", lr_new_int32(ctx, (int32_t)len));
     return v;
+}
+
+int lr_array_buffer_is_shared(LRValue obj)
+{
+    if (obj.tag != LR_TYPE_OBJECT) return 0;
+    LRObject *o = (LRObject *)obj.u.ptr;
+    if (o->type != LR_OBJ_ARRAY_BUFFER) return 0;
+    ArrayBufferMeta *meta = (ArrayBufferMeta *)o->opaque;
+    return meta ? meta->is_shared : 0;
+}
+
+void *lr_array_buffer_get_opaque(LRValue obj)
+{
+    if (obj.tag != LR_TYPE_OBJECT) return NULL;
+    LRObject *o = (LRObject *)obj.u.ptr;
+    if (o->type != LR_OBJ_ARRAY_BUFFER) return NULL;
+    ArrayBufferMeta *meta = (ArrayBufferMeta *)o->opaque;
+    return meta ? meta->opaque : NULL;
 }
 
 uint8_t *lr_get_array_buffer(LRContext *ctx, size_t *psize, LRValue obj)

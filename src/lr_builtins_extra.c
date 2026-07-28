@@ -97,6 +97,7 @@ static const char *lr_strptime(const char *s, const char *fmt, struct tm *tm)
 
 #include "lr_runtime.h"
 #include "lr_builtins.h"
+#include "lr_sab.h"
 
 /* ========================================================================
  *  UTILITY HELPERS
@@ -3408,6 +3409,26 @@ static LRValue js_array_buffer_constructor(LRContext *ctx, LRValue this_val,
 
 /* ── SharedArrayBuffer constructor ───────────────────────────────────── */
 
+/* free_func for SAB-backed ArrayBuffers: drop one reference on the shared
+ * control block instead of freeing the raw pointer. */
+static void lr_sab_buffer_free(void *opaque, void *ptr)
+{
+    (void)ptr;
+    lr_sab_unref((LRSabBlock *)opaque);
+}
+
+/* Wrap a shared block into a JS SharedArrayBuffer object.
+ * Takes over one reference to the block. */
+LRValue lr_sab_wrap_block(LRContext *ctx, LRSabBlock *blk)
+{
+    LRValue result = lr_new_array_buffer(ctx, blk->data, blk->size,
+                                         lr_sab_buffer_free, blk, 1);
+    if (JS_IsException(result)) {
+        lr_sab_unref(blk);
+    }
+    return result;
+}
+
 static LRValue js_shared_array_buffer_constructor(LRContext *ctx, LRValue this_val,
                                                   int argc, LRValue *argv)
 {
@@ -3419,15 +3440,11 @@ static LRValue js_shared_array_buffer_constructor(LRContext *ctx, LRValue this_v
             return JS_ThrowRangeError(ctx, "SharedArrayBuffer: invalid array buffer length");
         }
     }
-    uint8_t *buf = (uint8_t *)calloc(1, (size_t)byte_len);
-    if (!buf && byte_len > 0) {
+    LRSabBlock *blk = lr_sab_alloc((size_t)byte_len);
+    if (!blk) {
         return JS_ThrowTypeError(ctx, "SharedArrayBuffer: allocation failed");
     }
-    JSValue result = lr_new_array_buffer(ctx, buf, (size_t)byte_len, lr_array_buffer_free, NULL, 1);
-    if (JS_IsException(result)) {
-        free(buf);
-    }
-    return result;
+    return lr_sab_wrap_block(ctx, blk);
 }
 
 static LRValue js_shared_array_buffer_slice(LRContext *ctx, LRValue this_val,
@@ -3450,24 +3467,24 @@ static LRValue js_shared_array_buffer_slice(LRContext *ctx, LRValue this_val,
 
     int32_t new_len = end - start;
     uint8_t *src = lr_get_array_buffer(ctx, NULL, this_val);
-    uint8_t *dst = (uint8_t *)calloc(1, (size_t)(new_len > 0 ? new_len : 0));
-    if (src && new_len > 0) memcpy(dst, src + start, (size_t)new_len);
-
-    JSValue result = lr_new_array_buffer(ctx, dst, (size_t)new_len, lr_array_buffer_free, NULL, 1);
-    if (JS_IsException(result)) free(dst);
-    return result;
+    LRSabBlock *blk = lr_sab_alloc((size_t)(new_len > 0 ? new_len : 0));
+    if (!blk) return JS_ThrowTypeError(ctx, "SharedArrayBuffer.slice: allocation failed");
+    if (src && new_len > 0) memcpy(blk->data, src + start, (size_t)new_len);
+    return lr_sab_wrap_block(ctx, blk);
 }
 
 /* ── Atomics ────────────────────────────────────────────────────────────
- * Operate on integer TypedArrays. The engine is single-threaded, so the
- * read-modify-write steps are naturally uninterruptible; "atomic" semantics
- * are therefore satisfied without explicit locking. */
+ * Operate on integer TypedArrays. Buffers may be SharedArrayBuffers that
+ * are genuinely shared with Worker threads, so every read-modify-write is
+ * implemented with real hardware CAS (lr_atomic_cas_32 from lr_platform.h)
+ * on the aligned 32-bit machine word containing the element. */
 
 /* Validate a TypedArray for Atomics; on success returns the buffer base
- * pointer and the byte offset of `index` within it. Returns NULL (with an
- * exception already thrown) on failure. */
+ * pointer, the byte offset of `index` within it and the total buffer size.
+ * Returns NULL (with an exception already thrown) on failure. */
 static uint8_t *atomics_prepare(LRContext *ctx, LRValue ta_val, LRValue index_val,
-                                TypedArrayData **out_tad, size_t *out_byte_index)
+                                TypedArrayData **out_tad, size_t *out_byte_index,
+                                size_t *out_buf_size)
 {
     if (ta_val.tag != LR_TYPE_OBJECT) {
         JS_ThrowTypeError(ctx, "Atomics: first argument must be an integer TypedArray");
@@ -3497,47 +3514,105 @@ static uint8_t *atomics_prepare(LRContext *ctx, LRValue ta_val, LRValue index_va
         JS_ThrowRangeError(ctx, "Atomics: index out of range");
         return NULL;
     }
-    uint8_t *base = lr_get_array_buffer(ctx, NULL, tad->buffer);
+    size_t buf_size = 0;
+    uint8_t *base = lr_get_array_buffer(ctx, &buf_size, tad->buffer);
     if (!base) {
         JS_ThrowTypeError(ctx, "Atomics: buffer is detached");
         return NULL;
     }
     *out_tad = tad;
     *out_byte_index = tad->byte_offset + (size_t)idx * tad->element_size;
+    if (out_buf_size) *out_buf_size = buf_size;
     return base;
 }
 
-static uint64_t atomics_read_raw(uint8_t *base, size_t bi, int magic, int *is_signed)
+/* Apply the abstract operation to an element value (all raw unsigned).
+ * op: 0=add 1=sub 2=and 3=or 4=xor 5=exchange 6=compareExchange
+ *     7=load 8=store
+ * Sets *do_write = 0 when no store is needed (load / failed CAS). */
+static uint32_t atomics_apply_op(int op, uint32_t old, uint32_t v, uint32_t e,
+                                 int *do_write)
 {
-    switch (magic) {
-    case TA_MAGIC_UINT8:  *is_signed = 0; return ((uint8_t *)base)[bi];
-    case TA_MAGIC_INT8:   *is_signed = 1; return (uint64_t)(int64_t)((int8_t *)base)[bi];
-    case TA_MAGIC_UINT16: { uint16_t v; memcpy(&v, base + bi, 2); *is_signed = 0; return v; }
-    case TA_MAGIC_INT16:  { int16_t v;  memcpy(&v, base + bi, 2); *is_signed = 1; return (uint64_t)(int64_t)v; }
-    case TA_MAGIC_UINT32: { uint32_t v; memcpy(&v, base + bi, 4); *is_signed = 0; return v; }
-    case TA_MAGIC_INT32:  { int32_t v;  memcpy(&v, base + bi, 4); *is_signed = 1; return (uint64_t)(int64_t)v; }
+    *do_write = 1;
+    switch (op) {
+    case 0: return old + v;
+    case 1: return old - v;
+    case 2: return old & v;
+    case 3: return old | v;
+    case 4: return old ^ v;
+    case 5: return v;                                   /* exchange */
+    case 6:                                             /* compareExchange */
+        if (old != e) { *do_write = 0; return old; }
+        return v;
+    case 7: *do_write = 0; return old;                  /* load */
+    case 8: return v;                                   /* store */
     }
-    *is_signed = 0;
-    return 0;
+    *do_write = 0;
+    return old;
 }
 
-static void atomics_write_raw(uint8_t *base, size_t bi, int magic, uint64_t raw)
+/* Atomically apply `op` to the element at byte index `bi` using a hardware
+ * CAS loop (lr_atomic_cas_32) on the aligned 32-bit word containing it
+ * (little-endian byte layout). Returns the OLD element value, zero-extended.
+ *
+ * SharedArrayBuffer allocations are padded to a 4-byte multiple, so the
+ * containing word is always addressable for shared buffers. The non-atomic
+ * tail fallback only triggers for unshared, oddly-sized plain buffers
+ * (single-threaded by construction, so it is still race-free). */
+static uint32_t atomics_cas_apply(uint8_t *base, size_t buf_size, size_t bi,
+                                  size_t esize, int op, uint32_t v, uint32_t e)
 {
-    switch (magic) {
-    case TA_MAGIC_UINT8:  ((uint8_t *)base)[bi] = (uint8_t)raw; break;
-    case TA_MAGIC_INT8:   ((int8_t *)base)[bi]  = (int8_t)raw; break;
-    case TA_MAGIC_UINT16: { uint16_t v = (uint16_t)raw; memcpy(base + bi, &v, 2); break; }
-    case TA_MAGIC_INT16:  { int16_t v = (int16_t)raw;  memcpy(base + bi, &v, 2); break; }
-    case TA_MAGIC_UINT32: { uint32_t v = (uint32_t)raw; memcpy(base + bi, &v, 4); break; }
-    case TA_MAGIC_INT32:  { int32_t v = (int32_t)raw;  memcpy(base + bi, &v, 4); break; }
+    uint32_t mask = (esize == 1) ? 0xFFu : (esize == 2) ? 0xFFFFu : 0xFFFFFFFFu;
+    v &= mask;
+    e &= mask;
+
+    size_t word_off = bi & ~(size_t)3;
+    int aligned = ((bi & (esize - 1)) == 0);
+
+    if (aligned && word_off + 4 <= buf_size) {
+        volatile int32_t *wp = (volatile int32_t *)(base + word_off);
+        unsigned shift = (unsigned)((bi - word_off) * 8);   /* little-endian */
+        for (;;) {
+            uint32_t oldword = (uint32_t)lr_atomic_load_32(wp);
+            uint32_t oldelem = (oldword >> shift) & mask;
+            int do_write;
+            uint32_t newelem = atomics_apply_op(op, oldelem, v, e, &do_write) & mask;
+            if (!do_write) return oldelem;
+            uint32_t newword = (oldword & ~(mask << shift)) | (newelem << shift);
+            if ((uint32_t)lr_atomic_cas_32(wp, (int32_t)oldword,
+                                           (int32_t)newword) == oldword)
+                return oldelem;
+        }
+    }
+
+    /* Non-atomic fallback (never reached for SharedArrayBuffers) */
+    {
+        uint32_t oldelem;
+        if (esize == 1)      oldelem = base[bi];
+        else if (esize == 2) { uint16_t t; memcpy(&t, base + bi, 2); oldelem = t; }
+        else                 { uint32_t t; memcpy(&t, base + bi, 4); oldelem = t; }
+        int do_write;
+        uint32_t newelem = atomics_apply_op(op, oldelem, v, e, &do_write) & mask;
+        if (do_write) {
+            if (esize == 1)      base[bi] = (uint8_t)newelem;
+            else if (esize == 2) { uint16_t t = (uint16_t)newelem; memcpy(base + bi, &t, 2); }
+            else                 { uint32_t t = newelem; memcpy(base + bi, &t, 4); }
+        }
+        return oldelem;
     }
 }
 
-static LRValue atomics_to_js(LRContext *ctx, int magic, uint64_t raw)
+/* Convert a raw (zero-extended) element value to a JS number with the
+ * correct signedness for the TypedArray type. */
+static LRValue atomics_result(LRContext *ctx, int magic, uint32_t raw)
 {
-    if (magic == TA_MAGIC_UINT32)
-        return JS_NewFloat64(ctx, (double)(uint32_t)raw);
-    return JS_NewInt32(ctx, (int32_t)(int64_t)raw);
+    switch (magic) {
+    case TA_MAGIC_INT8:   return JS_NewInt32(ctx, (int32_t)(int8_t)raw);
+    case TA_MAGIC_INT16:  return JS_NewInt32(ctx, (int32_t)(int16_t)raw);
+    case TA_MAGIC_INT32:  return JS_NewInt32(ctx, (int32_t)raw);
+    case TA_MAGIC_UINT32: return JS_NewFloat64(ctx, (double)raw);
+    default:              return JS_NewInt32(ctx, (int32_t)raw); /* Uint8/16 */
+    }
 }
 
 /* op: 0=add 1=sub 2=and 3=or 4=xor 5=exchange 6=compareExchange
@@ -3546,42 +3621,28 @@ static LRValue atomics_op(LRContext *ctx, LRValue ta, LRValue index, LRValue val
                           int op, LRValue expected)
 {
     TypedArrayData *tad;
-    size_t bi;
-    uint8_t *base = atomics_prepare(ctx, ta, index, &tad, &bi);
+    size_t bi, buf_size = 0;
+    uint8_t *base = atomics_prepare(ctx, ta, index, &tad, &bi, &buf_size);
     if (!base) return JS_EXCEPTION;
 
-    int is_signed;
-    uint64_t old = atomics_read_raw(base, bi, tad->magic, &is_signed);
     double dv = 0, de = 0;
     if (value.tag != LR_TYPE_UNDEFINED)    JS_ToFloat64(ctx, &dv, value);
     if (expected.tag != LR_TYPE_UNDEFINED) JS_ToFloat64(ctx, &de, expected);
-    uint64_t v = (uint64_t)(int64_t)dv;
-    uint64_t e = (uint64_t)(int64_t)de;
+    uint32_t v = (uint32_t)(int64_t)dv;
+    uint32_t e = (uint32_t)(int64_t)de;
 
-    uint64_t mask = (tad->element_size == 1) ? 0xFFULL
-                  : (tad->element_size == 2) ? 0xFFFFULL
-                                             : 0xFFFFFFFFULL;
+    uint32_t old = atomics_cas_apply(base, buf_size, bi,
+                                     tad->element_size, op, v, e);
 
-    if (op == 6) { /* compareExchange: return the OLD value */
-        if (old == e) atomics_write_raw(base, bi, tad->magic, v & mask);
-        return atomics_to_js(ctx, tad->magic, old);
+    /* Per spec: store returns the stored value; every other operation
+     * (add/sub/and/or/xor/exchange/compareExchange/load) returns the
+     * previous value at the location. */
+    if (op == 8) {
+        uint32_t mask = (tad->element_size == 1) ? 0xFFu
+                      : (tad->element_size == 2) ? 0xFFFFu : 0xFFFFFFFFu;
+        return atomics_result(ctx, tad->magic, v & mask);
     }
-
-    uint64_t r;
-    switch (op) {
-    case 0: r = (old + v);  break;
-    case 1: r = (old - v);  break;
-    case 2: r = (old & v);  break;
-    case 3: r = (old | v);  break;
-    case 4: r = (old ^ v);  break;
-    case 5: r = v;          break;  /* exchange */
-    case 7: r = old;        break;  /* load */
-    case 8: r = v;          break;  /* store */
-    default: r = old;
-    }
-    r &= mask;
-    if (op != 7) atomics_write_raw(base, bi, tad->magic, r);
-    return atomics_to_js(ctx, tad->magic, (op == 7) ? old : r);
+    return atomics_result(ctx, tad->magic, old);
 }
 
 static LRValue js_atomics_load(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
@@ -3664,22 +3725,44 @@ static LRValue js_atomics_wait(LRContext *ctx, LRValue this_val, int argc, LRVal
     if (argc < 3) return JS_ThrowTypeError(ctx,
         "Atomics.wait: requires (typedArray, index, value[, timeout])");
     TypedArrayData *tad;
-    size_t bi;
-    uint8_t *base = atomics_prepare(ctx, argv[0], argv[1], &tad, &bi);
+    size_t bi, buf_size = 0;
+    uint8_t *base = atomics_prepare(ctx, argv[0], argv[1], &tad, &bi, &buf_size);
     if (!base) return JS_EXCEPTION;
     if (tad->magic != TA_MAGIC_INT32) {
         return JS_ThrowTypeError(ctx, "Atomics.wait: requires an Int32Array");
     }
-    int is_signed;
-    uint64_t cur = atomics_read_raw(base, bi, tad->magic, &is_signed);
+
+    volatile int32_t *p = (volatile int32_t *)(base + bi);
     int32_t wait_val = 0;
     JS_ToInt32(ctx, &wait_val, argv[2]);
-    if (cur != (uint64_t)(uint32_t)(int32_t)wait_val) {
+
+    if (lr_atomic_load_32(p) != wait_val) {
         return JS_NewString(ctx, "not-equal");
     }
-    /* Single-threaded engine: we cannot block the agent. A timeout of 0 or
-     * any requested wait returns "timed-out" immediately (no real waiting). */
-    return JS_NewString(ctx, "timed-out");
+
+    /* Timeout in ms; missing/NaN means infinite. */
+    double timeout_ms = -1.0;   /* < 0 => infinite */
+    if (argc >= 4 && !JS_IsUndefined(argv[3])) {
+        double t = 0;
+        JS_ToFloat64(ctx, &t, argv[3]);
+        if (t == t) timeout_ms = (t < 0) ? 0 : t;   /* NaN keeps infinite */
+    }
+
+    /* Polling wait: the memory is genuinely shared with worker threads, so
+     * we sleep-poll the location until the value changes ("ok") or the
+     * timeout expires ("timed-out"). This approximates futex semantics
+     * without a waiter registry (Atomics.notify wakes by mutating). */
+    double waited = 0;
+    for (;;) {
+        if (lr_atomic_load_32(p) != wait_val) {
+            return JS_NewString(ctx, "ok");
+        }
+        if (timeout_ms >= 0 && waited >= timeout_ms) {
+            return JS_NewString(ctx, "timed-out");
+        }
+        lr_sleep_ms(1);
+        waited += 1;
+    }
 }
 
 static LRValue js_atomics_notify(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
@@ -3688,7 +3771,9 @@ static LRValue js_atomics_notify(LRContext *ctx, LRValue this_val, int argc, LRV
     (void)argv;
     if (argc < 1) return JS_ThrowTypeError(ctx,
         "Atomics.notify: requires (typedArray, index[, count])");
-    /* Single-threaded engine: there are no waiting agents to wake. */
+    /* Waiters are sleep-polling the shared location (see Atomics.wait); they
+     * wake up when the value changes, so there is no waiter registry to
+     * notify. Return 0 (number of agents woken directly). */
     return JS_NewInt32(ctx, 0);
 }
 

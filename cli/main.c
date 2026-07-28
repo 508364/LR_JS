@@ -295,10 +295,9 @@ int main(int argc, char *argv[])
         repl_run(g_rt);
     }
 
-    /* Run event loop for pending async operations */
-    if (lr_event_loop_pending(g_rt)) {
-        lr_event_loop_run(g_rt);
-    }
+    /* Run event loop for pending async operations (timers, microtasks,
+     * worker messages). Returns immediately if there is nothing to do. */
+    lr_event_loop_run(g_rt);
 
     /* Print GC statistics if requested */
     if (print_gc_stats) {

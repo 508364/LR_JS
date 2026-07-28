@@ -120,6 +120,11 @@ void lr_timers_cleanup(LR_Runtime *rt);
 /* Timer processing (called from event loop) */
 void lr_timers_process(LR_Runtime *rt);
 
+/* Worker message pump (called from event loop): drains worker->parent
+ * message queues and fires onmessage/onerror callbacks.
+ * Returns the number of still-running workers owned by rt. */
+int lr_worker_poll(LR_Runtime *rt);
+
 /* ── Performance optimization helpers (internal) ──────────────────────── */
 
 void lr_perfopt_attach(LR_PerfOptCtx *opt, LR_Runtime *rt);

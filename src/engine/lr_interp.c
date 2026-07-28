@@ -2991,6 +2991,12 @@ static LRValue interp_callback_call(LRContext *ctx, LRValue func,
     return LR_VALUE_UNDEFINED;
 }
 
+void interp_reattach(Interpreter *interp, LRContext *ctx)
+{
+    ctx->call_js_function = interp_callback_call;
+    ctx->opaque_interp = interp;
+}
+
 void interp_init(Interpreter *interp, LRContext *ctx, int is_module)
 {
     memset(interp, 0, sizeof(*interp));
