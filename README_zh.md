@@ -337,7 +337,7 @@ lr_render_pipeline_destroy(pipe);
 
 ## 特别感谢
 
-- **QuickJS** —— 本项目基于 Fabrice Bellard 的 [QuickJS](https://bellard.org/quickjs/) JavaScript 引擎构建，其精简、可嵌入的 C 语言实现为本项目提供了核心 JavaScript 运行时基础。
+- **QuickJS** —— 本项目最初是基于 Fabrice Bellard 的 [QuickJS](https://bellard.org/quickjs/) JavaScript 引擎构建的分支（fork），其精简、可嵌入的 C 语言实现提供了最初的运行时基础。随着功能不断加入、架构被反复重构，代码逐渐偏离、演变为一套完全自研的引擎——如今已不再包含任何 QuickJS 源码，但血统仍可追溯到它。
 - **V8** —— 本项目在对象模型、Promise/任务队列、字节码设计等架构与行为决策上，参考并借鉴了 Google [V8](https://v8.dev/) 引擎的设计思路。
 
 ## 许可证

@@ -253,7 +253,7 @@ int main() {
 
 ## Special Thanks
 
-- **QuickJS** — This project is built upon the [QuickJS](https://bellard.org/quickjs/) JavaScript engine by Fabrice Bellard. Its compact, embeddable C implementation provides the core JavaScript runtime foundation.
+- **QuickJS** — This project originally started as a fork built upon the [QuickJS](https://bellard.org/quickjs/) JavaScript engine by Fabrice Bellard, whose compact, embeddable C implementation provided the initial runtime foundation. Over time, as features were added and the architecture was reworked, the codebase diverged so heavily that it became a fully self-implemented engine of its own — today it no longer shares QuickJS source code, but its lineage traces back to it.
 - **V8** — Many architectural and behavioral decisions (object model, Promise/job queues, bytecode design, etc.) are informed by and reference the design of Google's [V8](https://v8.dev/) engine.
 
 ## License
