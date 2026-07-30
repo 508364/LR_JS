@@ -1886,7 +1886,50 @@ static const JSCFunctionListEntry js_symbol_static_methods[] = {
 };
 
 /* ========================================================================
- *  6. ERROR SUBCLASSES
+ *  6. BIGINT
+ * ======================================================================== */
+
+static LRValue js_bigint_constructor(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)this_val;
+    int64_t val = 0;
+    if (argc >= 1) {
+        if (lr_is_bigint(argv[0])) {
+            lr_to_bigint64(ctx, &val, argv[0]);
+        } else if (argv[0].tag == LR_TYPE_INT32) {
+            val = argv[0].u.int32;
+        } else if (argv[0].tag == LR_TYPE_FLOAT64) {
+            val = (int64_t)argv[0].u.float64;
+        } else {
+            /* Try to parse from string */
+            const char *s = lr_to_cstring(ctx, argv[0]);
+            if (s) val = strtoll(s, NULL, 10);
+            lr_free_cstring(ctx, s);
+        }
+    }
+    return lr_new_bigint(ctx, val);
+}
+
+static LRValue js_bigint_to_string(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)argc; (void)argv;
+    int64_t val = 0;
+    if (!lr_is_bigint(this_val)) return JS_ThrowTypeError(ctx, "not a BigInt");
+    lr_to_bigint64(ctx, &val, this_val);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)val);
+    return lr_new_string(ctx, buf);
+}
+
+static LRValue js_bigint_value_of(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)argc; (void)argv;
+    if (!lr_is_bigint(this_val)) return JS_ThrowTypeError(ctx, "not a BigInt");
+    return lr_dup_value(ctx, this_val);
+}
+
+/* ========================================================================
+ *  7. ERROR SUBCLASSES (was §6)
  * ======================================================================== */
 
 /* Generic error subclass constructor */
@@ -4082,6 +4125,25 @@ void lr_builtins_extra_init(LR_Runtime *rt)
 
         /* Register on global */
         JS_SetPropertyStr(ctx, global, "Symbol", sym_ctor);
+    }
+
+    /* ── BigInt ───────────────────────────────────────────────────────── */
+    {
+        /* BigInt constructor: BigInt(value) → BigInt object (int64 for now) */
+        JSValue bigint_ctor = JS_NewCFunction(ctx, js_bigint_constructor, "BigInt", 1);
+        JSValue bigint_proto = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, bigint_ctor, "prototype", JS_DupValue(ctx, bigint_proto));
+        JS_SetPropertyStr(ctx, bigint_proto, "constructor", JS_DupValue(ctx, bigint_ctor));
+        /* toString / valueOf on prototype */
+        JS_SetPropertyStr(ctx, bigint_proto, "toString",
+            JS_NewCFunction(ctx, js_bigint_to_string, "toString", 0));
+        JS_SetPropertyStr(ctx, bigint_proto, "valueOf",
+            JS_NewCFunction(ctx, js_bigint_value_of, "valueOf", 0));
+        /* Cache for fast BigInt object creation */
+        ctx->bigint_proto = JS_DupValue(ctx, bigint_proto);
+        JS_SetPropertyStr(ctx, global, "BigInt", bigint_ctor);
+        JS_FreeValue(ctx, bigint_proto);
+        JS_FreeValue(ctx, bigint_ctor);
     }
 
     /* ── Register Error Subclasses ───────────────────────────────────── */

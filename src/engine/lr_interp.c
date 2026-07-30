@@ -48,6 +48,7 @@ static LRValue eval_if(Interpreter *interp, ASTNode *node);
 static LRValue eval_for(Interpreter *interp, ASTNode *node);
 static LRValue eval_for_in(Interpreter *interp, ASTNode *node);
 static LRValue eval_for_of(Interpreter *interp, ASTNode *node);
+static LRValue eval_with(Interpreter *interp, ASTNode *node);
 static LRValue eval_while(Interpreter *interp, ASTNode *node);
 static LRValue eval_do_while(Interpreter *interp, ASTNode *node);
 static LRValue eval_switch(Interpreter *interp, ASTNode *node);
@@ -189,6 +190,30 @@ static void mirror_global_binding(Interpreter *interp, const char *name, LRValue
     lr_set_property_str(interp->ctx, global, name,
                         lr_dup_value(interp->ctx, value));
     lr_free_value(interp->ctx, global);
+}
+
+/* Two-way global binding (closure of the external-write gap): when something
+ * assigns to the global object directly (e.g. `globalThis.x = v`), and `name`
+ * is a top-level var/function binding in the global scope, mirror the value
+ * back into the interpreter's global scope so a subsequent bare `x` sees it.
+ * The scope stays the source of truth for reads; this is called only from
+ * lr_set_property (write path), never from the hot identifier-lookup path, so
+ * it cannot reintroduce the memory-corruption issue that reading the global
+ * object in scope_lookup_internal caused. */
+void interp_sync_global_binding(LRContext *ctx, const char *name, LRValue val)
+{
+    Interpreter *interp = (Interpreter *)ctx->opaque_interp;
+    if (!interp || !interp->global_scope || interp->is_module)
+        return;
+    InterpScope *gs = interp->global_scope;
+    for (int i = 0; i < gs->count; i++) {
+        if (gs->names[i] && strcmp(gs->names[i], name) == 0
+            && !gs->is_lexical[i]) {
+            lr_free_value(ctx, gs->values[i]);
+            gs->values[i] = lr_dup_value(ctx, val);
+            break;
+        }
+    }
 }
 
 /* Declare a variable in the current scope (for let/const) or function scope (for var).
@@ -390,6 +415,9 @@ static LRValue eval_literal(Interpreter *interp, ASTNode *node)
             return lr_new_int32(interp->ctx, (int32_t)d);
         }
         return lr_new_float64(interp->ctx, d);
+    }
+    if (tt == TOK_BIGINT_LIT) {
+        return lr_new_bigint(interp->ctx, node->u.bigint_val.val);
     }
     if (tt == TOK_STRING) {
         const char *s = node->u.string.str;
@@ -1119,8 +1147,54 @@ static LRValue eval_assign(Interpreter *interp, ASTNode *node)
     return ret;
 }
 
+/* C callback for import.meta.resolve(specifier).
+ * Resolves a relative specifier against the module's directory. */
+static LRValue import_meta_resolve_cfunc(LRContext *ctx, LRValue this_val,
+                                          int argc, LRValue *argv)
+{
+    (void)this_val;
+    const char *base_dir = NULL;
+    if (this_val.tag == LR_TYPE_OBJECT) {
+        LRObject *o = (LRObject *)this_val.u.ptr;
+        /* The captured directory lives in the function object's opaque */
+        LRObject *go = NULL;
+        LRValue resolve_fn = lr_get_property_str(ctx,
+            lr_dup_value(ctx, this_val), "resolve");
+        if (resolve_fn.tag == LR_TYPE_OBJECT)
+            go = (LRObject *)resolve_fn.u.ptr;
+        if (go && go->opaque)
+            base_dir = (const char *)go->opaque;
+        lr_free_value(ctx, resolve_fn);
+    }
+    /* Fallback: use the fn opaque from the call context */
+    if (!base_dir) {
+        if (ctx->current_func.tag == LR_TYPE_OBJECT) {
+            LRObject *cf = (LRObject *)ctx->current_func.u.ptr;
+            if (cf->opaque)
+                base_dir = (const char *)cf->opaque;
+        }
+    }
+
+    const char *spec = (argc >= 1)
+        ? lr_to_cstring(ctx, argv[0]) : "";
+    if (!spec) spec = "";
+
+    /* Simple path resolution: if spec starts with ./ or ../, concat;
+     * otherwise return spec as-is (absolute / protocol / bare name). */
+    char resolved[4096];
+    if (strncmp(spec, "./", 2) == 0 || strncmp(spec, "../", 3) == 0) {
+        snprintf(resolved, sizeof(resolved), "%s/%s",
+                 base_dir ? base_dir : ".", spec);
+    } else {
+        strncpy(resolved, spec, sizeof(resolved) - 1);
+        resolved[sizeof(resolved) - 1] = '\0';
+    }
+
+    return lr_new_string(ctx, resolved);
+}
+
 /* Build (or return cached) import.meta object for the current unit.
- * Exposes: url (file:// URL), filename (absolute path), dirname. */
+ * Exposes: url (file:// URL), filename (absolute path), dirname, resolve. */
 static LRValue interp_get_import_meta(Interpreter *interp)
 {
     LRContext *ctx = interp->ctx;
@@ -1165,15 +1239,28 @@ static LRValue interp_get_import_meta(Interpreter *interp)
     lr_set_property_str(ctx, meta, "filename", lr_new_string(ctx, abs));
 
     /* dirname: strip last path component */
+    char dir[4096], *last_sep = NULL;
+    strncpy(dir, abs, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = '\0';
+    for (char *p = dir; *p; p++)
+        if (*p == '/' || *p == '\\') last_sep = p;
+    if (last_sep) *last_sep = '\0';
+    lr_set_property_str(ctx, meta, "dirname", lr_new_string(ctx, dir));
+
+    /* import.meta.resolve(specifier) — resolves a specifier relative to the
+     * module's directory (path concatenation + basic normalization). */
     {
-        char dir[4096];
-        strncpy(dir, abs, sizeof(dir) - 1);
-        dir[sizeof(dir) - 1] = '\0';
-        char *last = NULL;
-        for (char *p = dir; *p; p++)
-            if (*p == '/' || *p == '\\') last = p;
-        if (last) *last = '\0';
-        lr_set_property_str(ctx, meta, "dirname", lr_new_string(ctx, dir));
+        char *captured_dir = strdup(dir[0] ? dir : ".");
+        LRValue resolve_fn = lr_new_cfunction(ctx,
+            import_meta_resolve_cfunc, "resolve", 1);
+        if (resolve_fn.tag == LR_TYPE_OBJECT) {
+            LRObject *fo = (LRObject *)resolve_fn.u.ptr;
+            fo->opaque = captured_dir;
+            fo->opaque_free = free;
+        } else {
+            free(captured_dir);
+        }
+        lr_set_property_str(ctx, meta, "resolve", resolve_fn);
     }
 
     interp->import_meta = lr_dup_value(ctx, meta);
@@ -2491,11 +2578,15 @@ static LRValue eval_pattern(Interpreter *interp, ASTNode *node, LRValue value)
  * next()/return() and is iterable (Symbol.iterator returns itself).
  * A yield cap guards against unbounded/infinite generators. */
 
-#define GEN_MAX_YIELDS 65536
 #define GEN_ITEMS_PROP "__gen_items"
+#define GEN_BUF_PROP   "__gen_buf"   /* buffered yields from nested eval */
+#define GEN_BUF_IDX    "__gen_bufi"  /* next index in buf */
 #define GEN_INDEX_PROP "__gen_i"
 #define GEN_DONE_PROP  "__gen_done"
 #define GEN_RET_PROP   "__gen_ret"
+#define GEN_BODY_PROP  "__gen_body"  /* AST_BLOCK: function body statements */
+#define GEN_PC_PROP    "__gen_pc"    /* next statement index in body */
+#define GEN_SCOPE_PROP "__gen_scope" /* scope at creation time */
 
 /* Build a { value, done } iterator result (takes ownership of value) */
 static LRValue gen_make_result(LRContext *ctx, LRValue value, int done)
@@ -2515,24 +2606,125 @@ static LRValue gen_next_cfunc(LRContext *ctx, LRValue this_val,
     lr_free_value(ctx, done_v);
     if (done) return gen_make_result(ctx, LR_VALUE_UNDEFINED, 1);
 
+    /* Get the GenLazyData stored in the generator object's opaque */
+    struct GenLazyData { ASTNode *body; InterpScope *scope; int pc; int done; };
+    struct GenLazyData *gd = NULL;
+    if (this_val.tag == LR_TYPE_OBJECT) {
+        LRObject *go = (LRObject *)this_val.u.ptr;
+        gd = (struct GenLazyData *)go->opaque;
+    }
+    if (!gd || !gd->body || gd->body->type != AST_BLOCK) {
+        lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
+        return gen_make_result(ctx, LR_VALUE_UNDEFINED, 1);
+    }
+
+    /* Get the interpreter from opaque_interp for evaluation */
+    Interpreter *interp = (Interpreter *)ctx->opaque_interp;
+    if (!interp) {
+        lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
+        return gen_make_result(ctx, LR_VALUE_UNDEFINED, 1);
+    }
+
+    ASTNode *body = gd->body;
+    if (!body->u.list.items) {
+        gd->done = 1;
+        lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
+        return gen_make_result(ctx, LR_VALUE_UNDEFINED, 1);
+    }
+    int nstmts = body->u.list.count;
+    ASTNode **stmts = body->u.list.items;
+    int *pc = &gd->pc;
+
+    /* First, check for buffered yields from a previous nested statement */
     LRValue items = lr_get_property_str(ctx, this_val, GEN_ITEMS_PROP);
     LRValue iv = lr_get_property_str(ctx, this_val, GEN_INDEX_PROP);
-    int32_t i = 0; lr_to_int32(ctx, &i, iv);
+    int32_t buf_i = 0; lr_to_int32(ctx, &buf_i, iv);
     lr_free_value(ctx, iv);
+
     LRValue lv = lr_get_property_str(ctx, items, "length");
-    int32_t len = 0; lr_to_int32(ctx, &len, lv);
+    int32_t buf_len = 0; lr_to_int32(ctx, &buf_len, lv);
     lr_free_value(ctx, lv);
 
-    if (i >= len) {
+    if (buf_i < buf_len) {
+        /* Drain buffered yield */
+        LRValue item = lr_get_property_uint32(ctx, items, (uint32_t)buf_i);
+        lr_set_property_str(ctx, this_val, GEN_INDEX_PROP, lr_new_int32(ctx, buf_i + 1));
         lr_free_value(ctx, items);
-        lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
-        LRValue ret = lr_get_property_str(ctx, this_val, GEN_RET_PROP);
-        return gen_make_result(ctx, ret, 1);
+        return gen_make_result(ctx, item, 0);
     }
-    LRValue item = lr_get_property_uint32(ctx, items, (uint32_t)i);
     lr_free_value(ctx, items);
-    lr_set_property_str(ctx, this_val, GEN_INDEX_PROP, lr_new_int32(ctx, i + 1));
-    return gen_make_result(ctx, item, 0);
+
+    /* Buffer is empty; advance to next statement in body */
+    while (*pc < nstmts && !gd->done) {
+        ASTNode *stmt = stmts[(*pc)++];
+
+        /* Save gen state and set up for nested evaluation */
+        int saved_gen_active = interp->gen_active;
+        LRValue saved_gen_items = interp->gen_items;
+        int saved_gen_count = interp->gen_count;
+
+        /* Use a fresh items array for yields within this statement */
+        interp->gen_active = 1;
+        interp->gen_items = lr_new_array(ctx);
+        interp->gen_count = 0;
+
+        /* Evaluate the statement. If it contains yields, gen_append
+         * buffers them into gen_items. Non-yield statements run
+         * normally and produce no buffers. */
+        LRValue r = interp_eval_node(interp, stmt);
+        lr_free_value(ctx, r);
+
+        int yielded = interp->gen_count;
+
+        /* Restore gen state */
+        interp->gen_active = saved_gen_active;
+
+        if (yielded > 0) {
+            /* Store buffered yields in the generator object for
+             * future next() calls to drain. */
+            LRValue gobj = lr_dup_value(ctx, this_val);
+            if (gobj.tag == LR_TYPE_OBJECT) {
+                LRObject *o = (LRObject *)gobj.u.ptr;
+                /* Replace gen_items with the fresh buffer */
+                if (o->prop_hash) {
+                    /* write through set_property */
+                }
+            }
+            lr_set_property_str(ctx, this_val, GEN_ITEMS_PROP, interp->gen_items);
+            lr_set_property_str(ctx, this_val, GEN_INDEX_PROP, lr_new_int32(ctx, 0));
+            /* Set the length on gen_items so indexing works */
+            lr_set_property_str(ctx, interp->gen_items, "length",
+                lr_new_int32(ctx, yielded));
+            /* Return the first yielded item */
+            LRValue first = lr_get_property_uint32(ctx, interp->gen_items, 0);
+            lr_set_property_str(ctx, this_val, GEN_INDEX_PROP, lr_new_int32(ctx, 1));
+            lr_free_value(ctx, saved_gen_items);
+            lr_free_value(ctx, gobj);
+
+            /* Update generator PC */
+            if (this_val.tag == LR_TYPE_OBJECT) {
+                LRObject *go = (LRObject *)this_val.u.ptr;
+                if (go->opaque) ((struct GenLazyData *)go->opaque)->pc = *pc;
+            }
+            return gen_make_result(ctx, first, 0);
+        }
+
+        /* No yields in this statement: clean up and continue */
+        lr_free_value(ctx, interp->gen_items);
+        interp->gen_items = saved_gen_items;
+        interp->gen_count = saved_gen_count;
+
+        /* Check for error or return from function body */
+        if (interp->error_flag || interp->has_returned) {
+            gd->done = 1;
+            break;
+        }
+    }
+
+    /* All statements exhausted, or done flag set */
+    gd->done = 1;
+    lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
+    return gen_make_result(ctx, LR_VALUE_UNDEFINED, 1);
 }
 
 static LRValue gen_return_cfunc(LRContext *ctx, LRValue this_val,
@@ -2543,6 +2735,15 @@ static LRValue gen_return_cfunc(LRContext *ctx, LRValue this_val,
     return gen_make_result(ctx, v, 1);
 }
 
+static LRValue gen_throw_cfunc(LRContext *ctx, LRValue this_val,
+                               int argc, LRValue *argv)
+{
+    lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
+    if (argc > 0)
+        return lr_dup_value(ctx, argv[0]);   /* throw exception to caller */
+    return LR_VALUE_UNDEFINED;
+}
+
 static LRValue gen_self_cfunc(LRContext *ctx, LRValue this_val,
                               int argc, LRValue *argv)
 {
@@ -2550,19 +2751,43 @@ static LRValue gen_self_cfunc(LRContext *ctx, LRValue this_val,
     return lr_dup_value(ctx, this_val);
 }
 
-/* Build the generator object (takes ownership of items and ret_val) */
-static LRValue gen_build_object(Interpreter *interp, LRValue items, LRValue ret_val)
+/* Build the generator object. For lazy generators, stores the body AST
+ * and creation scope so gen_next can drive incremental execution. */
+static LRValue gen_build_object(Interpreter *interp, ASTNode *body, InterpScope *scope)
 {
     LRContext *ctx = interp->ctx;
     LRValue gen = lr_new_object(ctx);
-    lr_set_property_str(ctx, gen, GEN_ITEMS_PROP, items);
+    /* Store body AST + creation scope for lazy incremental evaluation */
+    lr_set_property_str(ctx, gen, GEN_BODY_PROP, lr_new_int32(ctx, 0));
+    /* Use opaque: store body pointer & scope for gen_next */
+    if (gen.tag == LR_TYPE_OBJECT && body) {
+        LRObject *o = (LRObject *)gen.u.ptr;
+        struct GenLazyData {
+            ASTNode *body;
+            InterpScope *scope;
+            int pc;
+            int done;
+        } *gd = (struct GenLazyData *)calloc(1, sizeof(struct GenLazyData));
+        if (gd) {
+            gd->body = body;     /* AST_BLOCK of function body */
+            gd->scope = scope;
+            gd->pc = 0;
+            gd->done = 0;
+            o->opaque = gd;
+            o->opaque_free = free;
+        }
+    }
+    lr_set_property_str(ctx, gen, GEN_ITEMS_PROP, lr_new_array(ctx));
     lr_set_property_str(ctx, gen, GEN_INDEX_PROP, lr_new_int32(ctx, 0));
     lr_set_property_str(ctx, gen, GEN_DONE_PROP, LR_VALUE_FALSE);
-    lr_set_property_str(ctx, gen, GEN_RET_PROP, ret_val);
+    lr_set_property_str(ctx, gen, GEN_RET_PROP, LR_VALUE_UNDEFINED);
+    lr_set_property_str(ctx, gen, GEN_PC_PROP, lr_new_int32(ctx, 0));
     lr_set_property_str(ctx, gen, "next",
         lr_new_cfunction(ctx, gen_next_cfunc, "next", 0));
     lr_set_property_str(ctx, gen, "return",
         lr_new_cfunction(ctx, gen_return_cfunc, "return", 1));
+    lr_set_property_str(ctx, gen, "throw",
+        lr_new_cfunction(ctx, gen_throw_cfunc, "throw", 1));
     lr_set_property_str(ctx, gen, "Symbol.iterator",
         lr_new_cfunction(ctx, gen_self_cfunc, "[Symbol.iterator]", 0));
     return gen;
@@ -2571,14 +2796,6 @@ static LRValue gen_build_object(Interpreter *interp, LRValue items, LRValue ret_
 /* Append one yielded value to the active generator buffer (dups v) */
 static void gen_append(Interpreter *interp, LRValue v)
 {
-    if (interp->gen_count >= GEN_MAX_YIELDS) {
-        snprintf(interp->error_message, sizeof(interp->error_message),
-                 "generator yield limit exceeded (%d); lazy/infinite "
-                 "generators are not supported", GEN_MAX_YIELDS);
-        interp->exception_value = LR_VALUE_UNDEFINED;
-        interp->error_flag = 1;
-        return;
-    }
     lr_set_property_uint32(interp->ctx, interp->gen_items,
                            (uint32_t)interp->gen_count++,
                            lr_dup_value(interp->ctx, v));
@@ -2850,15 +3067,12 @@ static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
         body = func_node->u.arrow.body;
     }
 
-    if (body) {
+    if (body && !is_generator) {
+        /* Lazy generators: body evaluation is driven by gen_next. */
         if (body->type == AST_BLOCK) {
-            /* Function body is a block */
             result = interp_eval_node(interp, body);
-            /* Don't free result - it's the return value */
         } else {
-            /* Arrow function with expression body: () => expr */
             result = interp_eval_node(interp, body);
-            /* Don't free - it's the return value */
         }
 
         /* Check for return statement */
@@ -2878,19 +3092,15 @@ static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
         result = lr_dup_value(interp->ctx, interp->return_value);
     }
 
-    /* Generator: wrap the buffered yields into a generator object */
+    /* Generator: build the generator object with the body AST
+     * stored for lazy incremental evaluation. */
     if (is_generator) {
-        LRValue items = interp->gen_items;
-        lr_set_property_str(interp->ctx, items, "length",
-                            lr_new_int32(interp->ctx, interp->gen_count));
+        lr_free_value(interp->ctx, interp->gen_items);
         if (interp->error_flag) {
-            lr_free_value(interp->ctx, items);
             lr_free_value(interp->ctx, result);
             result = LR_VALUE_UNDEFINED;
         } else {
-            /* result (the generator's return value) becomes the final
-             * done:true value; ownership transfers to the object */
-            result = gen_build_object(interp, items, result);
+            result = gen_build_object(interp, body, interp->current_scope);
         }
     }
     interp->gen_active = saved_gen_active;
@@ -3445,6 +3655,48 @@ static LRValue eval_for_of(Interpreter *interp, ASTNode *node)
     return result;
 }
 
+/* with (obj) body — pushes the object's properties as a temporary scope so
+ * that unqualified identifiers in the body resolve against the object first,
+ * then fall through to the outer scope chain. */
+static LRValue eval_with(Interpreter *interp, ASTNode *node)
+{
+    LRContext *ctx = interp->ctx;
+    LRValue obj = interp_eval_node(interp, node->u.with_stmt.obj);
+    if (interp->error_flag) return obj;
+
+    if (obj.tag != LR_TYPE_OBJECT) {
+        lr_free_value(ctx, obj);
+        snprintf(interp->error_message, sizeof(interp->error_message),
+                 "with statement requires an object");
+        interp->error_flag = 1;
+        return LR_VALUE_UNDEFINED;
+    }
+
+    /* Push a scope that will hold the object's enumerable own properties.
+     * We enumerate the object and declare each key as a var in the
+     * inner scope so that identifier resolution finds them first. */
+    interp_push_scope(interp, 0);
+
+    LRPropertyEnum *props = NULL;
+    uint32_t nprops = 0;
+    lr_get_own_property_names(ctx, &props, &nprops, obj,
+                              JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY);
+
+    for (uint32_t i = 0; i < nprops; i++) {
+        if (!props[i].atom || !props[i].atom->str) continue;
+        LRValue pv = lr_get_property(ctx, obj, props[i].atom);
+        scope_declare_name(interp, props[i].atom->str, pv, 1 /* let-like */);
+        lr_free_value(ctx, pv);
+    }
+    if (props) lr_free_property_enum(ctx, props, nprops);
+
+    LRValue result = interp_eval_node(interp, node->u.with_stmt.body);
+
+    interp_pop_scope(interp);
+    lr_free_value(ctx, obj);
+    return result;
+}
+
 static LRValue eval_while(Interpreter *interp, ASTNode *node)
 {
     const char *my_label = interp->pending_label;
@@ -3948,6 +4200,122 @@ static LRValue eval_import(Interpreter *interp, ASTNode *node)
     return LR_VALUE_UNDEFINED;
 }
 
+/* ── Module live-binding accessors (ES spec-compliant) ──────────────── */
+
+/* Data captured by live-binding getter/setter so they can read/write the
+ * interpreter scope directly instead of using a stale snapshot. */
+typedef struct {
+    InterpScope *scope;
+    char         name[256];
+} LiveBindData;
+
+/* Live-binding getter: searches the captured scope for `name` and returns
+ * the current value. (scope is the source of truth; value can change.) */
+static LRValue live_bind_getter_cfunc(LRContext *ctx, LRValue this_val,
+                                       int argc, LRValue *argv)
+{
+    (void)this_val; (void)argc; (void)argv;
+    LiveBindData *bd = NULL;
+    if (ctx->current_func.tag == LR_TYPE_OBJECT) {
+        LRObject *fo = (LRObject *)ctx->current_func.u.ptr;
+        if (fo->type == LR_OBJ_CFUNCTION && fo->extra) {
+            LRCFunction *cf = (LRCFunction *)fo->extra;
+            bd = (LiveBindData *)cf->data;
+        }
+    }
+    if (!bd || !bd->scope) return LR_VALUE_UNDEFINED;
+    LRValue val = LR_VALUE_UNDEFINED;
+    if (scope_lookup_internal(bd->scope, ctx, bd->name, &val))
+        return val;
+    return LR_VALUE_UNDEFINED;
+}
+
+/* Live-binding setter: searches the captured scope for `name` and writes
+ * the new value back. (Only installed for mutable var/let bindings.) */
+static LRValue live_bind_setter_cfunc(LRContext *ctx, LRValue this_val,
+                                       int argc, LRValue *argv)
+{
+    (void)this_val;
+    LiveBindData *bd = NULL;
+    if (ctx->current_func.tag == LR_TYPE_OBJECT) {
+        LRObject *fo = (LRObject *)ctx->current_func.u.ptr;
+        if (fo->type == LR_OBJ_CFUNCTION && fo->extra) {
+            LRCFunction *cf = (LRCFunction *)fo->extra;
+            bd = (LiveBindData *)cf->data;
+        }
+    }
+    if (!bd || !bd->scope) return LR_VALUE_UNDEFINED;
+    LRValue newval = (argc > 0) ? argv[0] : LR_VALUE_UNDEFINED;
+    if (scope_set_name_in_scope(bd->scope, ctx, bd->name, newval))
+        return LR_VALUE_UNDEFINED;
+    return LR_VALUE_UNDEFINED;
+}
+
+/* Install a live binding on the module namespace object as a getter/setter
+ * accessor that aliases the named slot in the given scope. */
+static void lr_export_live_binding(LRContext *ctx, LRValue ns_val,
+                                    InterpScope *scope, const char *name,
+                                    int mutable)
+{
+    LiveBindData *bd = (LiveBindData *)calloc(1, sizeof(LiveBindData));
+    if (!bd) return;
+    bd->scope = scope;
+    strncpy(bd->name, name ? name : "", sizeof(bd->name) - 1);
+
+    /* Create getter. Store closure data in the C function's data slot
+     * (LRCFunction.data / data_free) — the same pattern used by
+     * promise resolve/reject and finalization jobs. */
+    LRValue getter = lr_new_cfunction(ctx, live_bind_getter_cfunc, name, 0);
+    if (getter.tag == LR_TYPE_OBJECT) {
+        LRObject *gobj = (LRObject *)getter.u.ptr;
+        if (gobj->type == LR_OBJ_CFUNCTION && gobj->extra) {
+            LRCFunction *gcf = (LRCFunction *)gobj->extra;
+            gcf->data = bd;
+            gcf->data_free = free;
+        }
+    }
+
+    /* Setter only for mutable bindings. */
+    LRValue setter = LR_VALUE_UNDEFINED;
+    if (mutable) {
+        setter = lr_new_cfunction(ctx, live_bind_setter_cfunc, name, 0);
+        if (setter.tag == LR_TYPE_OBJECT) {
+            LRObject *sobj = (LRObject *)setter.u.ptr;
+            if (sobj->type == LR_OBJ_CFUNCTION && sobj->extra) {
+                LRCFunction *scf = (LRCFunction *)sobj->extra;
+                scf->data = bd;
+                /* Don't set data_free — getter already owns bd */
+            }
+        }
+    }
+
+    lr_set_accessor_property_str(ctx, ns_val, name, getter, setter);
+
+    /* accessor took ownership of getter (+ setter when present);
+     * only free the unused setter stub. */
+    if (setter.tag != LR_TYPE_OBJECT && setter.tag != LR_TYPE_UNDEFINED)
+        lr_free_value(ctx, setter);
+}
+
+/* Like scope_set_name but searches a specific scope (not interp->current_scope). */
+static int scope_set_name_in_scope(InterpScope *scope, LRContext *ctx,
+                                    const char *name, LRValue value)
+{
+    while (scope) {
+        for (int i = 0; i < scope->count; i++) {
+            if (scope->names[i] && strcmp(scope->names[i], name) == 0) {
+                lr_free_value(ctx, scope->values[i]);
+                scope->values[i] = lr_dup_value(ctx, value);
+                return 1;
+            }
+        }
+        scope = scope->parent;
+    }
+    return 0;
+}
+
+/* ── Export statement evaluator ──────────────────────────────────────── */
+
 static LRValue eval_export(Interpreter *interp, ASTNode *node)
 {
     LRObject *ns = interp->module_ns;
@@ -3988,13 +4356,17 @@ static LRValue eval_export(Interpreter *interp, ASTNode *node)
 
             LRValue val;
             if (re_mod) {
+                /* Re-export: snapshot from source module (will become
+                 * live once source modules use accessor exports too). */
                 val = lr_get_property_str(interp->ctx, re_ns, local_name ? local_name : "");
-            } else {
-                val = LR_VALUE_UNDEFINED;
-                scope_lookup_internal(interp->current_scope, interp->ctx, local_name, &val);
+                if (ns) lr_set_property_str(interp->ctx, ns_val, exported_name, val);
+                else lr_free_value(interp->ctx, val);
+            } else if (ns) {
+                /* Local export: live bidirectional binding via
+                 * getter/setter accessor on the namespace object. */
+                lr_export_live_binding(interp->ctx, ns_val,
+                    interp->current_scope, exported_name, 1 /* mutable */);
             }
-            if (ns) lr_set_property_str(interp->ctx, ns_val, exported_name, val); /* takes ownership */
-            else lr_free_value(interp->ctx, val);
         } else if (spec->type == AST_EXPORT_ALL) {
             /* export * from "module" */
             if (re_mod) {
@@ -4013,7 +4385,8 @@ static LRValue eval_export(Interpreter *interp, ASTNode *node)
                 lr_free_property_enum(interp->ctx, tab, plen);
             }
         } else if (spec->type == AST_VAR_DECL) {
-            /* export var/let/const ... : evaluate (binds names), then export them */
+            /* export var/let/const ... : evaluate (binds names), then
+             * install live bidirectional accessor bindings. */
             LRValue val = interp_eval_node(interp, spec);
             lr_free_value(interp->ctx, val);
             char **names = NULL;
@@ -4023,36 +4396,27 @@ static LRValue eval_export(Interpreter *interp, ASTNode *node)
                 if (decl && decl->type == AST_VAR_DECLARATOR)
                     collect_export_names(decl->u.declarator.var, &names, &n, &cap);
             }
-            for (int v = 0; v < n; v++) {
-                LRValue bval = LR_VALUE_UNDEFINED;
-                scope_lookup_internal(interp->current_scope, interp->ctx, names[v], &bval);
-                if (ns) lr_set_property_str(interp->ctx, ns_val, names[v], bval); /* takes ownership */
-                else lr_free_value(interp->ctx, bval);
+            if (ns) {
+                for (int v = 0; v < n; v++)
+                    lr_export_live_binding(interp->ctx, ns_val,
+                        interp->current_scope, names[v], 1 /* mutable */);
             }
             free(names);
         } else if (spec->type == AST_FUNC_DECL) {
-            /* export function name() {} — eval_func_decl only declares the
-             * name and returns UNDEFINED, so read the function object back
-             * from the scope to export it. */
             const char *fname = spec->u.func.name;
             LRValue decl = interp_eval_node(interp, spec);
             lr_free_value(interp->ctx, decl);
-            if (fname) {
-                LRValue bval = LR_VALUE_UNDEFINED;
-                scope_lookup_internal(interp->current_scope, interp->ctx, fname, &bval);
-                if (ns) lr_set_property_str(interp->ctx, ns_val, fname, bval); /* takes ownership */
-                else lr_free_value(interp->ctx, bval);
-            }
+            if (fname && ns)
+                lr_export_live_binding(interp->ctx, ns_val,
+                    interp->current_scope, fname, 1);
         } else if (spec->type == AST_CLASS_DECL) {
-            /* export class Name {} */
             const char *cname = spec->u.class_decl.name;
             LRValue val = interp_eval_node(interp, spec);
-            if (cname) {
-                if (ns) lr_set_property_str(interp->ctx, ns_val, cname, val); /* takes ownership */
-                else lr_free_value(interp->ctx, val);
-            } else {
-                lr_free_value(interp->ctx, val);
+            if (cname && ns) {
+                lr_export_live_binding(interp->ctx, ns_val,
+                    interp->current_scope, cname, 1);
             }
+            lr_free_value(interp->ctx, val);
         }
     }
     return LR_VALUE_UNDEFINED;
@@ -4070,6 +4434,7 @@ static LRValue interp_eval_stmt(Interpreter *interp, ASTNode *node)
     case AST_FOR:         return eval_for(interp, node);
     case AST_FOR_IN:      return eval_for_in(interp, node);
     case AST_FOR_OF:      return eval_for_of(interp, node);
+    case AST_WITH:        return eval_with(interp, node);
     case AST_WHILE:       return eval_while(interp, node);
     case AST_DO_WHILE:    return eval_do_while(interp, node);
     case AST_SWITCH:      return eval_switch(interp, node);

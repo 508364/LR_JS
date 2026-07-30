@@ -133,4 +133,18 @@
 - [x] 修复 `lr_engine.c` 残留的悬挂空代码块 (旧 `lr_engine_eval_function` 桩体, 是导致编译失败的多余块)
 - [x] 验证: `tests/module_test.js` (默认/具名/命名空间/解构/再导出, 闭包状态跨调用保持 INC:1/INC2:2) 与 `_fx*`/`_t1`/`_t2` 全部 PASS
 - [x] 模块现已纳入 IOME586 缓存 (见 §4.3): `-m`/`--module` 执行的脚本同样会落盘归档, 热路径以模块方式重跑; 默认导入 `is_default` 序列化往返已修复
-- [ ] 语义限制 (非缓存 blocker): 模块导出为静态快照, 非 ES 规范的实时绑定 (命名空间属性在导出语句执行时定格, 后续 `let` 变更不反映到 `import` 侧)
+- [x] 语义限制 (非缓存 blocker): 模块导出为静态快照, 非 ES 规范的实时绑定 — **已修复**: 命名空间属性现为 getter/setter 访问器，直接读写作用域绑定（LiveBindData + LRCFunction.data 闭包），`export let x` 后续变更即时反映到 `import` 侧，module_test 全线 PASS
+  
+---  
+  
+## 六、缺陷修复 2026-07-30  
+
+- [x] import.meta.resolve — interp_get_import_meta 添加 resolve C 函数回调  
+- [x] Generator.throw() — gen_throw_cfunc 注册到 gen_build_object  
+- [x] with 语句 — 实现 eval_with (作用域级对象属性解析) + AST_WITH case  
+- [x] new Function() — 实现 lr_engine_build_function + js_function_constructor  
+- [x] 模块导出实时绑定 — LiveBindData + LRCFunction.data getter/setter 访问器  
+- [x] BigInt — TOK_BIGINT_LIT + LR_OBJ_BIGINT (int64_t) + 构造函数 + toString/valueOf + LRA ltag=5; console.log 仍走 Object.toString 显示 [object Object]（堆对象类型），typeof 返回 "object"
+- [x] test_engine.c 值断言 — 新增 eval_expect 助手 + 算术/逻辑/比较/三元/变量/函数 >30 项值断言升级
+- [x] Generator 移除 GEN_MAX_YIELDS 硬上限 — gen_append 不再限制 yield 次数
+- [ ] 生成器惰性求值 (GEN_LAZY) — 需 trampoline/状态机/协程架构级重构；yield 值传递 (next(v)→yield expr) 也依赖此能力；记录为远期待办

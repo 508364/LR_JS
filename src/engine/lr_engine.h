@@ -139,6 +139,7 @@ typedef enum {
     LR_OBJ_TYPED_ARRAY = 12,
     LR_OBJ_DATA_VIEW   = 13,
     LR_OBJ_SCRIPT      = 14,  /* compiled script (COMPILE_ONLY result); owns an LREvalUnit */
+    LR_OBJ_BIGINT      = 15,  /* BigInt: wraps int64_t in a heap object */
 } LRObjectType;
 
 struct LRObject {
@@ -190,6 +191,16 @@ typedef struct LRFinalizationJobData {
     LRValue    callback;
     LRValue    heldValue;
 } LRFinalizationJobData;
+
+/* ── BigInt ────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    int64_t value;    /* currently 64-bit; upgradeable to arbitrary precision */
+} LRBigIntData;
+
+LRValue  lr_new_bigint(LRContext *ctx, int64_t value);
+int      lr_is_bigint(LRValue v);
+int      lr_to_bigint64(LRContext *ctx, int64_t *out, LRValue v);
 
 /* ── C Function ───────────────────────────────────────────────────────── */
 
@@ -356,6 +367,7 @@ struct LRContext {
     LRValue          string_proto;      /* String.prototype */
     LRValue          number_proto;      /* Number.prototype */
     LRValue          function_proto;    /* Function.prototype */
+    LRValue          bigint_proto;      /* BigInt.prototype */
     /* Callback for calling JS interpreter functions from C builtins */
     LRValue          (*call_js_function)(struct LRContext *ctx, LRValue func,
                                          LRValue this_val, int argc, LRValue *argv);
@@ -587,6 +599,9 @@ LRValue lr_get_property_uint32(LRContext *ctx, LRValue obj, uint32_t idx);
 
 int     lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val);
 int     lr_set_property_str(LRContext *ctx, LRValue obj, const char *name, LRValue val);
+/* Mirror an external write to the global object back into the interpreter's
+ * global scope (two-way global-object binding). Called from lr_set_property. */
+void    interp_sync_global_binding(LRContext *ctx, const char *name, LRValue val);
 int     lr_set_property_uint32(LRContext *ctx, LRValue obj, uint32_t idx, LRValue val);
 /* Define an accessor (getter/setter) property. getter/setter are function
  * values (or LR_VALUE_UNDEFINED when absent). */
@@ -730,6 +745,9 @@ LRValue lr_engine_eval_function(LRContext *ctx, LRValue func_obj);
  * that `import` can read another module's exports. */
 LRValue lr_engine_run_module(LRContext *ctx, const char *input, size_t input_len,
                      const char *filename, LRValue *out_ns);
+/* Build a Function object from param names + body string (new Function()). */
+LRValue lr_engine_build_function(LRContext *ctx, int nparams,
+                                  const char **params, const char *body);
 /* AST (de)serialization used by the IOME586 result cache. */
 uint8_t  *lr_ast_serialize(ASTNode *root, size_t *out_len);
 ASTNode  *lr_ast_deserialize(const uint8_t *buf, size_t len, Parser **out_parser);

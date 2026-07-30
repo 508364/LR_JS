@@ -332,9 +332,10 @@ static Token lex_number(Lexer *lex)
     }
 
     /* BigInt suffix */
+    int is_bigint = 0;
     if (lexer_peek_char(lex) == 'n') {
         lexer_advance(lex); /* n */
-        /* TODO: BigInt support - store as string for now */
+        is_bigint = 1;
     }
 
 done: {
@@ -350,10 +351,15 @@ done: {
             buf[j++] = lex->src[start + i];
         }
     }
+    /* Strip trailing 'n' for BigInt literals */
+    if (is_bigint && j > 0 && buf[j-1] == 'n')
+        buf[--j] = '\0';
     buf[j] = '\0';
 
-    Token t = make_token_from(lex, TOK_NUMBER, start);
-    if (is_hex) {
+    Token t = make_token_from(lex, is_bigint ? TOK_BIGINT_LIT : TOK_NUMBER, start);
+    if (is_bigint) {
+        t.bigint_val = strtoll(buf, NULL, 0);
+    } else if (is_hex) {
         t.num_val = (double)strtoll(buf, NULL, 16);
     } else if (is_octal) {
         t.num_val = (double)strtoll(buf + 2, NULL, 8);

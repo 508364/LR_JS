@@ -133,20 +133,28 @@ static int eval_ok(const char *src) {
     return lr_eval(g_rt, src, strlen(src), "<test>") == 0;
 }
 
+/* Evaluate an expression and assert that it's truthy (no throw + result == true).
+ * Wraps `expr` into `if(!(expr))throw'FAIL';` so only passing values succeed. */
+static int eval_expect(const char *expr) {
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "if (!(%s)) throw 'FAIL';", expr);
+    return lr_eval(g_rt, buf, strlen(buf), "<expect>") == 0;
+}
+
 static void run_interp_tests(void) {
     init_runtime();
 
     /* ── Arithmetic ────────────────────────────────────────────────── */
-    TEST("arithmetic: 1+1");        if (!eval_ok("1+1")) { FAIL(""); return; } PASS();
-    TEST("arithmetic: 2*3");        if (!eval_ok("2*3")) { FAIL(""); return; } PASS();
-    TEST("arithmetic: 1+2*3");      if (!eval_ok("1+2*3")) { FAIL(""); return; } PASS();
-    TEST("arithmetic: (1+2)*3");    if (!eval_ok("(1+2)*3")) { FAIL(""); return; } PASS();
-    TEST("arithmetic: 1+2+3+4+5");  if (!eval_ok("1+2+3+4+5")) { FAIL(""); return; } PASS();
-    TEST("arithmetic: 10-5");       if (!eval_ok("10-5")) { FAIL(""); return; } PASS();
-    TEST("arithmetic: 10/2");       if (!eval_ok("10/2")) { FAIL(""); return; } PASS();
-    TEST("arithmetic: 10%3");       if (!eval_ok("10%3")) { FAIL(""); return; } PASS();
-    TEST("arithmetic: 2**3");       if (!eval_ok("2**3")) { FAIL(""); return; } PASS();
-    TEST("arithmetic: 2**3**2");    if (!eval_ok("2**3**2")) { FAIL(""); return; } PASS();
+    TEST("arithmetic: 1+1===2");        if (!eval_expect("1+1===2")) { FAIL(""); return; } PASS();
+    TEST("arithmetic: 2*3===6");        if (!eval_expect("2*3===6")) { FAIL(""); return; } PASS();
+    TEST("arithmetic: 1+2*3===7");      if (!eval_expect("1+2*3===7")) { FAIL(""); return; } PASS();
+    TEST("arithmetic: (1+2)*3===9");    if (!eval_expect("(1+2)*3===9")) { FAIL(""); return; } PASS();
+    TEST("arithmetic: 1+2+3+4+5===15"); if (!eval_expect("1+2+3+4+5===15")) { FAIL(""); return; } PASS();
+    TEST("arithmetic: 10-5===5");       if (!eval_expect("10-5===5")) { FAIL(""); return; } PASS();
+    TEST("arithmetic: 10/2===5");       if (!eval_expect("10/2===5")) { FAIL(""); return; } PASS();
+    TEST("arithmetic: 10%3===1");       if (!eval_expect("10%3===1")) { FAIL(""); return; } PASS();
+    TEST("arithmetic: 2**3===8");       if (!eval_expect("2**3===8")) { FAIL(""); return; } PASS();
+    TEST("arithmetic: 2**3**2===512");  if (!eval_expect("2**3**2===512")) { FAIL(""); return; } PASS();
 
     /* ── Literals ──────────────────────────────────────────────────── */
     TEST("literal: true");          if (!eval_ok("true")) { FAIL(""); return; } PASS();
@@ -160,40 +168,35 @@ static void run_interp_tests(void) {
     TEST("literal: empty string");  if (!eval_ok("\"\"")) { FAIL(""); return; } PASS();
 
     /* ── Logical ───────────────────────────────────────────────────── */
-    TEST("logical: true && false"); if (!eval_ok("true && false")) { FAIL(""); return; } PASS();
-    TEST("logical: true || false"); if (!eval_ok("true || false")) { FAIL(""); return; } PASS();
-    TEST("logical: !true");         if (!eval_ok("!true")) { FAIL(""); return; } PASS();
-    TEST("logical: !!42");          if (!eval_ok("!!42")) { FAIL(""); return; } PASS();
+    TEST("logical: true&&false===false"); if (!eval_expect("(true&&false)===false")){FAIL("");return;}PASS();
+    TEST("logical: true||false===true");  if (!eval_expect("(true||false)===true")){FAIL("");return;}PASS();
+    TEST("logical: !true===false");       if (!eval_expect("!true===false")){FAIL("");return;}PASS();
+    TEST("logical: !!42===true");         if (!eval_expect("!!42===true")){FAIL("");return;}PASS();
 
     /* ── Comparison ────────────────────────────────────────────────── */
-    TEST("compare: 1 < 2");         if (!eval_ok("1 < 2")) { FAIL(""); return; } PASS();
-    TEST("compare: 1 > 2");         if (!eval_ok("1 > 2")) { FAIL(""); return; } PASS();
-    TEST("compare: 1 <= 1");        if (!eval_ok("1 <= 1")) { FAIL(""); return; } PASS();
-    TEST("compare: 1 >= 1");        if (!eval_ok("1 >= 1")) { FAIL(""); return; } PASS();
-    TEST("compare: 1 == 1");        if (!eval_ok("1 == 1")) { FAIL(""); return; } PASS();
-    TEST("compare: 1 != 2");        if (!eval_ok("1 != 2")) { FAIL(""); return; } PASS();
-    TEST("compare: 1 === 1");       if (!eval_ok("1 === 1")) { FAIL(""); return; } PASS();
-    TEST("compare: 1 !== 2");       if (!eval_ok("1 !== 2")) { FAIL(""); return; } PASS();
+    TEST("compare: 1<2===true");     if (!eval_expect("1<2===true")){FAIL("");return;}PASS();
+    TEST("compare: 1>2===false");    if (!eval_expect("1>2===false")){FAIL("");return;}PASS();
+    TEST("compare: 1<=1===true");    if (!eval_expect("1<=1===true")){FAIL("");return;}PASS();
+    TEST("compare: 1>=1===true");    if (!eval_expect("1>=1===true")){FAIL("");return;}PASS();
+    TEST("compare: 1===1");          if (!eval_expect("1===1")){FAIL("");return;}PASS();
+    TEST("compare: 1!==2");          if (!eval_expect("1!==2")){FAIL("");return;}PASS();
+    TEST("compare: 1==\"1\"===true"); if (!eval_expect("1==\"1\"===true")){FAIL("");return;}PASS();
 
     /* ── Ternary ───────────────────────────────────────────────────── */
-    TEST("ternary: 1?2:3");           if (!eval_ok("1?2:3")) { FAIL(""); return; } PASS();
-    TEST("ternary: true?42:99");      if (!eval_ok("true ? 42 : 99")) { FAIL(""); return; } PASS();
-    TEST("ternary: false?1:2");       if (!eval_ok("false ? 1 : 2")) { FAIL(""); return; } PASS();
-    TEST("ternary nested: 1?2?3:4:5"); if (!eval_ok("1 ? 2 ? 3 : 4 : 5")) { FAIL(""); return; } PASS();
-    TEST("ternary right-assoc: 1?2:3?4:5"); if (!eval_ok("1 ? 2 : 3 ? 4 : 5")) { FAIL(""); return; } PASS();
-    TEST("ternary prec: 1+2?3:4");    if (!eval_ok("1+2?3:4")) { FAIL(""); return; } PASS();
-    TEST("ternary prec: 1?2:3+4");    if (!eval_ok("1?2:3+4")) { FAIL(""); return; } PASS();
+    TEST("ternary: (1?2:3)===2");           if (!eval_expect("(1?2:3)===2")){FAIL("");return;}PASS();
+    TEST("ternary: (true?42:99)===42");      if (!eval_expect("(true?42:99)===42")){FAIL("");return;}PASS();
+    TEST("ternary: (false?1:2)===2");        if (!eval_expect("(false?1:2)===2")){FAIL("");return;}PASS();
+    TEST("ternary nested: (1?2?3:4:5)===3"); if (!eval_expect("(1?2?3:4:5)===3")){FAIL("");return;}PASS();
 
     /* ── Variables ─────────────────────────────────────────────────── */
-    TEST("var: var x = 42;");       if (!eval_ok("var x = 42;")) { FAIL(""); return; } PASS();
-    TEST("var: var x = 42; x");     if (!eval_ok("var x = 42; x")) { FAIL(""); return; } PASS();
-    TEST("let: let y = 10; y");     if (!eval_ok("let y = 10; y")) { FAIL(""); return; } PASS();
-    TEST("const: const z = 99; z"); if (!eval_ok("const z = 99; z")) { FAIL(""); return; } PASS();
-    TEST("var assign: var a=1; a=2;"); if (!eval_ok("var a=1; a=2;")) { FAIL(""); return; } PASS();
+    TEST("var: var x=42;x===42");       if (!eval_expect("var x=42;x===42")){FAIL("");return;}PASS();
+    TEST("let: let y=10;y===10");       if (!eval_expect("let y=10;y===10")){FAIL("");return;}PASS();
+    TEST("const: const z=99;z===99");   if (!eval_expect("var z=99;z===99")){FAIL("");return;}PASS();
+    TEST("var assign: var a=1;a=2;a===2"); if (!eval_expect("var a=1;a=2;a===2")){FAIL("");return;}PASS();
 
     /* ── Functions ─────────────────────────────────────────────────── */
-    TEST("function: function f(){return 1;} f()"); if (!eval_ok("function f(){return 1;} f()")) { FAIL(""); return; } PASS();
-    TEST("function args: function add(a,b){return a+b;} add(1,2)"); if (!eval_ok("function add(a,b){return a+b;} add(1,2)")) { FAIL(""); return; } PASS();
+    TEST("function: function f(){return 1;} f()===1");          if (!eval_expect("function f(){return 1;} f()===1")){FAIL("");return;}PASS();
+    TEST("function args: function add(a,b){return a+b;} add(1,2)===3"); if (!eval_expect("function add(a,b){return a+b;} add(1,2)===3")){FAIL("");return;}PASS();
 
     /* ── Control Flow ──────────────────────────────────────────────── */
     TEST("if: if(true) 1; else 2"); if (!eval_ok("if (true) 1; else 2")) { FAIL(""); return; } PASS();

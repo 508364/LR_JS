@@ -59,6 +59,7 @@ struct ASTNode {
         struct { double num; } number;
         struct { char *str; } string;
         struct { int val; } bool_val;
+        struct { int64_t val; } bigint_val;
 
         /* Identifiers */
         struct { char *name; } ident;
@@ -212,6 +213,7 @@ ASTNode *ast_alloc(ASTNodeType type);
 ASTNode *ast_literal_number(Parser *parser, double num);
 ASTNode *ast_literal_string(Parser *parser, const char *str);
 ASTNode *ast_literal_bool(Parser *parser, int val);
+ASTNode *ast_literal_bigint(Parser *parser, int64_t val);
 ASTNode *ast_identifier(Parser *parser, const char *name);
 ASTNode *ast_binary(ASTNode *left, ASTNode *right, const char *op);
 ASTNode *ast_unary(ASTNode *arg, const char *op, int prefix);

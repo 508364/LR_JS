@@ -743,6 +743,40 @@ LRValue lr_new_array(LRContext *ctx)
     return v;
 }
 
+/* ── BigInt Creation / Query ───────────────────────────────────────────── */
+
+LRValue lr_new_bigint(LRContext *ctx, int64_t value)
+{
+    LRBigIntData *bd = (LRBigIntData *)malloc(sizeof(LRBigIntData));
+    if (!bd) return LR_VALUE_UNDEFINED;
+    bd->value = value;
+    LRValue v = lr_new_object_proto(ctx, ctx->bigint_proto);
+    if (v.tag != LR_TYPE_OBJECT) { free(bd); return LR_VALUE_UNDEFINED; }
+    LRObject *o = (LRObject *)v.u.ptr;
+    o->type = LR_OBJ_BIGINT;
+    o->opaque = bd;
+    o->opaque_free = free;
+    return v;
+}
+
+int lr_is_bigint(LRValue v)
+{
+    if (v.tag != LR_TYPE_OBJECT) return 0;
+    LRObject *o = (LRObject *)v.u.ptr;
+    return (o->type == LR_OBJ_BIGINT);
+}
+
+int lr_to_bigint64(LRContext *ctx, int64_t *out, LRValue v)
+{
+    (void)ctx;
+    if (!lr_is_bigint(v)) return 0;
+    LRObject *o = (LRObject *)v.u.ptr;
+    LRBigIntData *bd = (LRBigIntData *)o->opaque;
+    if (!bd) return 0;
+    if (out) *out = bd->value;
+    return 1;
+}
+
 /* ── C Function Creation ──────────────────────────────────────────────── */
 
 LRValue lr_new_cfunction(LRContext *ctx, LRCFunctionFunc func,
@@ -1395,6 +1429,13 @@ int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
 {
     if (obj.tag != LR_TYPE_OBJECT) return -1;
     LRObject *o = (LRObject *)obj.u.ptr;
+
+    /* Two-way global binding: an external write to the global object that
+     * targets a top-level var/function binding is mirrored back into the
+     * interpreter's global scope so bare reads see it. (Reads stay on the
+     * scope path; this only handles the globalThis.x = v direction.) */
+    if (obj.u.ptr == ctx->global_obj.u.ptr)
+        interp_sync_global_binding(ctx, atom->str, val);
 
     /* Check if it's a Proxy */
     if (o->type == LR_OBJ_PROXY) {
@@ -2966,6 +3007,27 @@ LRValue lr_engine_run_module(LRContext *ctx, const char *input, size_t input_len
         *out_ns = (unit->ns.tag == LR_TYPE_OBJECT)
                     ? lr_dup_value(ctx, unit->ns) : LR_VALUE_UNDEFINED;
     return result;
+}
+
+/* ── new Function(…) helper ─────────────────────────────────────────────── */
+
+LRValue lr_engine_build_function(LRContext *ctx, int nparams,
+                                  const char **params, const char *body)
+{
+    /* Build source: (function(p1, p2, ...) { body }) */
+    char buf[65536];
+    int off = snprintf(buf, sizeof(buf), "(function(");
+    for (int i = 0; i < nparams && off < (int)sizeof(buf) - 1; i++) {
+        if (i > 0) off += snprintf(buf + off, sizeof(buf) - off, ",");
+        off += snprintf(buf + off, sizeof(buf) - off, "%s",
+                        params[i] ? params[i] : "");
+    }
+    snprintf(buf + off, sizeof(buf) - off, "){%s})", body ? body : "");
+    LRValue r = lr_engine_eval_source(ctx, buf, strlen(buf), 0,
+                                      "<anonymous>", NULL, NULL);
+    /* The result of evaluating (function(...){...}) is the function object.
+     * Errors are already set on the context. */
+    return r;
 }
 
 int lr_engine_detect_module(const char *input, size_t input_len)

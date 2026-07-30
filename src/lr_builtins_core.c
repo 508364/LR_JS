@@ -3977,10 +3977,39 @@ static const JSCFunctionListEntry js_function_proto_funcs[] = {
 static JSValue js_function_constructor(JSContext *ctx, JSValue this_val,
                                         int argc, JSValue *argv)
 {
-    (void)ctx; (void)this_val; (void)argc; (void)argv;
-    /* Minimal Function constructor */
-    /* In full implementation, this would parse the arguments as function body */
-    return JS_UNDEFINED;
+    (void)this_val;
+
+    /* new Function(p1, ..., pN, body) — last arg is the function body,
+     * all preceding are parameter names. */
+    const char *body = "";
+    const char *param_names[256];
+    int nparams = 0;
+
+    if (argc == 0) {
+        /* new Function() → empty function body, no params */
+    } else if (argc == 1) {
+        /* new Function(body) — single arg is the body */
+        body = JS_ToCString(ctx, argv[0]);
+        if (!body) body = "";
+    } else {
+        /* new Function(p1, p2, ..., pN, body) */
+        for (int i = 0; i < argc - 1 && i < 256; i++) {
+            param_names[i] = JS_ToCString(ctx, argv[i]);
+            if (!param_names[i]) param_names[i] = "";
+            nparams++;
+        }
+        body = JS_ToCString(ctx, argv[argc - 1]);
+        if (!body) body = "";
+    }
+
+    LRValue result = lr_engine_build_function(ctx, nparams, param_names, body);
+
+    /* Free the C strings we obtained (via JS_ToCString / lr_to_cstring) */
+    if (body && body[0]) JS_FreeCString(ctx, body);
+    for (int i = 0; i < nparams; i++)
+        if (param_names[i] && param_names[i][0]) JS_FreeCString(ctx, param_names[i]);
+
+    return result;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

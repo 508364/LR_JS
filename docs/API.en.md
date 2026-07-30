@@ -2343,6 +2343,9 @@ typeof globalThis.topFunc;   // "function"
 topVar = 200;
 globalThis.topVar;           // 200 (assignment is mirrored onto the global object)
 
+globalThis.topVar = 100;
+topVar;                      // 100 (two-way binding: external write reflects back to bare)
+
 // Run as a module (-m / .mjs)
 //   'mVar' in globalThis  -> false
 //   'mFunc' in globalThis -> false

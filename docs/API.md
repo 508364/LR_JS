@@ -2371,7 +2371,10 @@ typeof globalThis.topFunc;   // "function"
 "TopClass"  in globalThis;   // false
 
 topVar = 200;
-globalThis.topVar;           // 200（赋值经镜像同步到全局对象）
+globalThis.topVar;           // 200（裸赋值经镜像同步到全局对象）
+
+globalThis.topVar = 100;
+topVar;                      // 100（双向绑定：外部写全局对象反射回裸变量）
 
 // 以模块方式运行（-m / .mjs）
 //   'mVar' in globalThis  -> false

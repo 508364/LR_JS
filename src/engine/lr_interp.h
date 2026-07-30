@@ -89,6 +89,11 @@ typedef struct {
     int           gen_active;
     LRValue       gen_items;    /* JS array of yielded values */
     int           gen_count;
+    /* Generator lazy mode: when non-zero, yields are collected into
+     * gen_items as an eager substep of the current top-level statement,
+     * then returned one-at-a-time by gen_next. */
+    int           gen_lazy;      /* 1 = running generator lazily */
+    int           gen_resume_pc; /* next statement index in body */
 } Interpreter;
 
 /* ── API ───────────────────────────────────────────────────────────────── */

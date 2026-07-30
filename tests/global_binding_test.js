@@ -20,6 +20,10 @@ console.log("'TopClass' in globalThis ?", "TopClass" in globalThis);
 topVar = 200;
 console.log("after topVar=200, globalThis.topVar =", globalThis.topVar);
 
+// Two-way binding: external write to the global object reflects back to bare.
+globalThis.topVar = 100;
+console.log("after globalThis.topVar=100, bare topVar =", topVar);
+
 // function identity preserved
 console.log("typeof topFunc === 'function' ?", typeof topFunc === "function");
 console.log("GLOBAL BINDING OK");

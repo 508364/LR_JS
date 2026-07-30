@@ -20,7 +20,7 @@ extern "C" {
 
 typedef enum {
     TOK_EOF = 0,
-    TOK_NUMBER, TOK_STRING, TOK_IDENTIFIER, TOK_REGEXP,
+    TOK_NUMBER, TOK_BIGINT_LIT, TOK_STRING, TOK_IDENTIFIER, TOK_REGEXP,
     TOK_BOOL_LIT, TOK_NULL_LIT, TOK_UNDEFINED_LIT,
     /* Punctuators */
     TOK_LPAREN, TOK_RPAREN, TOK_LBRACKET, TOK_RBRACKET,
@@ -64,6 +64,7 @@ typedef struct {
     const char *start;  /* pointer into source */
     size_t len;
     double num_val;     /* for TOK_NUMBER */
+    int64_t  bigint_val; /* for TOK_BIGINT_LIT */
     char *str_val;      /* for TOK_STRING (allocated) */
     size_t line;
     size_t col;

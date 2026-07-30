@@ -433,6 +433,16 @@ ASTNode *ast_literal_bool(Parser *parser, int val)
     return val ? cached_true_node : cached_false_node;
 }
 
+ASTNode *ast_literal_bigint(Parser *parser, int64_t val)
+{
+    ASTNode *node = parser_ast_alloc(parser, AST_LITERAL);
+    if (node) {
+        node->token.type = TOK_BIGINT_LIT;
+        node->u.bigint_val.val = val;
+    }
+    return node;
+}
+
 ASTNode *ast_identifier(Parser *parser, const char *name)
 {
     ASTNode *node = parser_ast_alloc(parser, AST_IDENTIFIER);
@@ -506,7 +516,7 @@ static int is_expr_start(Parser *parser)
 {
     Token t = lexer_peek(parser->lexer);
     switch (t.type) {
-    case TOK_NUMBER: case TOK_STRING: case TOK_IDENTIFIER:
+    case TOK_NUMBER: case TOK_BIGINT_LIT: case TOK_STRING: case TOK_IDENTIFIER:
     case TOK_BOOL_LIT: case TOK_NULL_LIT: case TOK_UNDEFINED_LIT:
     case TOK_THIS: case TOK_SUPER:
     case TOK_LPAREN: case TOK_LBRACKET: case TOK_LBRACE:
@@ -537,6 +547,11 @@ static ASTNode *parse_primary_expr(Parser *parser)
     switch (t.type) {
     case TOK_NUMBER: {
         ASTNode *n = ast_literal_number(parser,t.num_val);
+        if (n) n->token = t;
+        return n;
+    }
+    case TOK_BIGINT_LIT: {
+        ASTNode *n = ast_literal_bigint(parser, t.bigint_val);
         if (n) n->token = t;
         return n;
     }
@@ -3673,6 +3688,11 @@ static void ser_f64(SerBuf *b, double v)
     ser_u32(b, (uint32_t)(bits & 0xFFFFFFFF));
     ser_u32(b, (uint32_t)(bits >> 32));
 }
+static void ser_i64(SerBuf *b, int64_t v)
+{
+    ser_u32(b, (uint32_t)(v & 0xFFFFFFFF));
+    ser_u32(b, (uint32_t)((uint64_t)v >> 32));
+}
 static void ser_str(SerBuf *b, const char *s)
 {
     if (!s) { ser_u32(b, 0); return; }
@@ -3827,12 +3847,14 @@ static void ser_node(SerBuf *b, ASTNode *node)
             case TOK_STRING:        ltag = 1; break;
             case TOK_NULL_LIT:      ltag = 3; break;
             case TOK_UNDEFINED_LIT: ltag = 4; break;
+            case TOK_BIGINT_LIT:    ltag = 5; break;
             default:                ltag = 2; break; /* TOK_NUMBER + safety */
         }
         ser_u8(b, ltag);
         if (ltag == 0)      ser_u32(b, (uint32_t)node->u.bool_val.val);
         else if (ltag == 1) ser_str(b, node->u.string.str);
         else if (ltag == 2) ser_f64(b, node->u.number.num);
+        else if (ltag == 5) ser_i64(b, node->u.bigint_val.val);
         /* ltag 3 (null) and 4 (undefined) carry no extra payload */
         break;
     }
@@ -4010,6 +4032,12 @@ static double read_f64(DeserState *st)
                   | ((uint64_t)st->buf[st->pos + 4] << 32) | ((uint64_t)st->buf[st->pos + 5] << 40)
                   | ((uint64_t)st->buf[st->pos + 6] << 48) | ((uint64_t)st->buf[st->pos + 7] << 56);
     st->pos += 8; double d; memcpy(&d, &bits, sizeof(d)); return d;
+}
+static int64_t read_i64(DeserState *st)
+{
+    uint32_t lo = read_u32(st);
+    uint32_t hi = read_u32(st);
+    return (int64_t)(((uint64_t)hi << 32) | lo);
 }
 /* Interned copy (freed by parser_free via the intern table). */
 static const char *deser_str(DeserState *st, Parser *intern)
@@ -4204,6 +4232,9 @@ static ASTNode *deser_node(DeserState *st, Parser *intern)
         } else if (ltag == 3) {
             node->token.type      = TOK_NULL_LIT;
             node->u.number.num    = 0.0;
+        } else if (ltag == 5) {
+            node->token.type      = TOK_BIGINT_LIT;
+            node->u.bigint_val.val = read_i64(st);
         } else { /* ltag == 4 */
             node->token.type      = TOK_UNDEFINED_LIT;
             node->u.number.num    = -1.0;
