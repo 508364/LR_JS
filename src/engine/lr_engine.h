@@ -13,6 +13,13 @@
 #include <stddef.h>
 #include <stdarg.h>
 
+/* AST node / parser types are defined in engine/lr_ast.h. We forward-declare
+ * them here instead of including lr_ast.h, because lr_ast.h transitively
+ * includes lr_lexer.h whose `TokenType` enum collides with winnt.h's
+ * `TokenType` in any translation unit that also pulls in the Windows headers. */
+typedef struct ASTNode ASTNode;
+typedef struct Parser  Parser;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -131,6 +138,7 @@ typedef enum {
     LR_OBJ_MODULE     = 11,
     LR_OBJ_TYPED_ARRAY = 12,
     LR_OBJ_DATA_VIEW   = 13,
+    LR_OBJ_SCRIPT      = 14,  /* compiled script (COMPILE_ONLY result); owns an LREvalUnit */
 } LRObjectType;
 
 struct LRObject {
@@ -142,6 +150,7 @@ struct LRObject {
     uint32_t      prop_count;     /* allocated slots */
     LRValue       proto;          /* prototype */
     void         *extra;          /* type-specific data (array data, function code, etc.) */
+    void         *def_scope;      /* captured lexical scope (interpreter closures) */
     void         *opaque;         /* user data (for JS_SetOpaque/JS_GetOpaque) */
     void         (*opaque_free)(void *opaque); /* destructor for opaque data, NULL = free() */
     LRContext    *ctx;            /* owning context */
@@ -157,6 +166,10 @@ struct LRObject {
     int           weak_ref_count;       /* number of WeakRefs targeting this object */
     struct LRObject *finalize_next;     /* pending-finalization list link */
 };
+
+/* Hook installed by the interpreter: releases a captured closure scope
+ * (LRObject.def_scope) when a function object is destroyed. */
+extern void (*lr_closure_scope_release)(void *scope, LRContext *ctx);
 
 /* ── FinalizationRegistry support ─────────────────────────────────────── */
 
@@ -353,6 +366,9 @@ struct LRContext {
      * which is required for timers, workers and other async callbacks.
      * Owned by the context; freed in lr_free_context. */
     void             *persistent_interp;
+    /* Resolved-module registry (LRModuleCacheEntry list), per context.
+     * Managed by the module loader; freed in lr_free_context. */
+    void             *module_registry;
 };
 
 /* ── Runtime ───────────────────────────────────────────────────────────── */
@@ -456,6 +472,14 @@ struct LRModuleDef {
     LRValue    result;
     LRContext *ctx;
 };
+
+/* Resolved-module cache entry (per context). The def owns a reference to
+ * def->obj (the module namespace object). */
+typedef struct LRModuleCacheEntry {
+    char                  *name;   /* resolved module path */
+    struct LRModuleDef    *def;
+    struct LRModuleCacheEntry *next;
+} LRModuleCacheEntry;
 
 /* ── Memory Usage Structure ────────────────────────────────────────────── */
 
@@ -691,7 +715,49 @@ void lr_set_module_loader_func(LRRuntime *rt,
 
 LRValue lr_engine_eval(LRContext *ctx, const char *input, size_t input_len,
                 const char *filename, int flags);
+/* Parse + (optionally serialize the AST into *out_bc/*out_bc_len) + execute.
+ * If out_bc/out_bc_len are NULL, no serialization is performed. */
+LRValue lr_engine_eval_source(LRContext *ctx, const char *input, size_t input_len,
+                int is_module, const char *filename, uint8_t **out_bc, size_t *out_bc_len);
+/* Execute an already-parsed AST (e.g. one loaded from the bytecode cache). */
+LRValue lr_engine_eval_ast(LRContext *ctx, ASTNode *ast, Parser *parser,
+                int is_module, const char *filename);
+/* Execute a compiled-script object produced by lr_engine_eval with
+ * JS_EVAL_FLAG_COMPILE_ONLY. */
 LRValue lr_engine_eval_function(LRContext *ctx, LRValue func_obj);
+/* Parse + execute a module from source and return its namespace object
+ * (the set of exported bindings) in *out_ns. Used by the module loader so
+ * that `import` can read another module's exports. */
+LRValue lr_engine_run_module(LRContext *ctx, const char *input, size_t input_len,
+                     const char *filename, LRValue *out_ns);
+/* AST (de)serialization used by the IOME586 result cache. */
+uint8_t  *lr_ast_serialize(ASTNode *root, size_t *out_len);
+ASTNode  *lr_ast_deserialize(const uint8_t *buf, size_t len, Parser **out_parser);
+
+/* ── IOME586 support: split parse / execute phases ──────────────────────
+ * lr_engine_parse_unit parses the source into an opaque retained unit and
+ * (optionally) serializes its AST, WITHOUT executing it. This lets the
+ * cache write a WRITING-state archive to disk before/while the script runs.
+ * lr_engine_exec_unit_handle then executes the unit (ownership transfers to
+ * the persistent interpreter). lr_engine_unit_ast_handle exposes the parsed
+ * program node for result snapshotting. */
+void    *lr_engine_parse_unit(LRContext *ctx, const char *input, size_t input_len,
+                              int is_module, const char *filename,
+                              uint8_t **out_bc, size_t *out_bc_len);
+LRValue  lr_engine_exec_unit_handle(LRContext *ctx, void *unit_handle,
+                                    int is_module, const char *filename);
+const ASTNode *lr_engine_unit_ast_handle(void *unit_handle);
+
+/* Top-level program node inspection for IOME586 result snapshots.
+ * (ASTNode internals stay private to the engine: lr_ast.h cannot be included
+ * from TUs that pull in windows.h due to the TokenType name collision.)
+ * Returns the number of top-level nodes, or fills type/line/binding-name for
+ * node i (binding name is the declared identifier for func/class/var decls,
+ * NULL otherwise). Returns 0/-1 respectively when program is not a program. */
+int      lr_engine_program_count(const ASTNode *program);
+int      lr_engine_program_node_info(const ASTNode *program, int i,
+                                     uint16_t *out_type, uint32_t *out_line,
+                                     const char **out_binding_name);
 int     lr_engine_detect_module(const char *input, size_t input_len);
 
 /* ── Bytecode Serialization ───────────────────────────────────────────── */

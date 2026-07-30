@@ -501,7 +501,14 @@ static LRValue js_map_constructor(JSContext *ctx, JSValueConst this_val,
         }
     }
 
+    lr_set_property_str(ctx, map, "size", lr_new_int32(ctx, md->count));
     return map;
+}
+
+/* Keep the instance "size" data property in sync with the hash table */
+static void map_sync_size(JSContext *ctx, JSValueConst map_obj, LRMapData *md)
+{
+    lr_set_property_str(ctx, map_obj, "size", lr_new_int32(ctx, md->count));
 }
 
 /* ── Map.prototype.set ─────────────────────────────────────────────────── */
@@ -522,6 +529,7 @@ static LRValue js_map_set(JSContext *ctx, JSValueConst this_val,
     LRValue value = (argc > 1) ? argv[1] : LR_VALUE_UNDEFINED;
 
     map_data_set(ctx, md, key, value);
+    map_sync_size(ctx, this_val, md);
 
     return lr_dup_value(ctx, this_val);
 }
@@ -617,6 +625,7 @@ static LRValue js_map_delete(JSContext *ctx, JSValueConst this_val,
             md->entries[idx].alive = 0;
             md->count--;
             md->iter_count++;
+            map_sync_size(ctx, this_val, md);
             return LR_VALUE_TRUE;
         }
         idx = (idx + 1) & (md->capacity - 1);
@@ -651,6 +660,7 @@ static LRValue js_map_clear(JSContext *ctx, JSValueConst this_val,
     }
     md->count = 0;
     md->iter_count++;
+    map_sync_size(ctx, this_val, md);
 
     return LR_VALUE_UNDEFINED;
 }

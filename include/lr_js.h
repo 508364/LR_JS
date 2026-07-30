@@ -2,7 +2,7 @@
  * L/R_JS - Lightweight/Runtime JavaScript Engine
  * Pure C, ES2022-compatible, browser-style JS runtime built on lightweight JS engine.
  *
- * Copyright (c) 2024 L/R_JS Authors
+ * Copyright (c) 2026 L/R_JS Authors
  * MIT License
  */
 #ifndef LR_JS_H
@@ -66,8 +66,8 @@ struct LR_Config {
     size_t        gc_nursery_size;     /* nursery size in bytes, 0 = default (4MB) */
     int64_t       gc_pause_target_ns;  /* target max pause per GC slice, 0 = default (5ms) */
 
-    /* Bytecode cache */
-    char         *bytecode_cache_dir;  /* Path to .lrfile cache directory (NULL = disabled) */
+    /* IOME586 result cache */
+    char         *bytecode_cache_dir;  /* IOME586 cache directory (.lrfile.lz4 archives, NULL = disabled) */
 
     /* Sandbox log */
     char         *sandbox_log_dir;     /* Path to sandbox log directory (NULL = disabled) */
@@ -165,12 +165,15 @@ LR_API void lr_gc_print_stats(LR_Runtime *rt, FILE *fp);
 /* Reset GC statistics. */
 LR_API void lr_gc_reset_stats(LR_Runtime *rt);
 
-/* ── Bytecode Cache ────────────────────────────────────────────────────── */
+/* ── IOME586 Result Cache ──────────────────────────────────────────────── */
+/* IOME586 archives interpreter results (AST + globals + per-node results +
+ * run state) as hash-keyed LZ4 packages (<hash>.lrfile.lz4). The historical
+ * function names are kept for API stability. */
 
-/* Print bytecode cache statistics. */
+/* Print IOME586 cache statistics. */
 LR_API void lr_bytecode_cache_stats(LR_Runtime *rt, FILE *fp);
 
-/* Clear bytecode cache. */
+/* Reset IOME586 cache statistics. */
 LR_API void lr_bytecode_cache_clear(LR_Runtime *rt);
 
 /* ── Memory usage ─────────────────────────────────────────────────────── */
@@ -321,10 +324,19 @@ LR_API void lr_terminal_result_free(LR_TerminalResult *result);
 
 /* ── Version ──────────────────────────────────────────────────────────── */
 
-#define LR_JS_VERSION_MAJOR 1
-#define LR_JS_VERSION_MINOR 0
+#define LR_JS_VERSION_MAJOR 0
+#define LR_JS_VERSION_MINOR 1
 #define LR_JS_VERSION_PATCH 0
-#define LR_JS_VERSION_STRING "1.0.0"
+
+/* Single source of truth: LR_JS_VERSION_STRING is derived from the three
+ * numbers above, so the version only needs to be bumped in one place.
+ * Build scripts (build_*.sh / build_all.bat) parse these macros too. */
+#define LR_JS_VERSION_XSTR_(x) #x
+#define LR_JS_VERSION_XSTR(x)  LR_JS_VERSION_XSTR_(x)
+#define LR_JS_VERSION_STRING \
+    LR_JS_VERSION_XSTR(LR_JS_VERSION_MAJOR) "." \
+    LR_JS_VERSION_XSTR(LR_JS_VERSION_MINOR) "." \
+    LR_JS_VERSION_XSTR(LR_JS_VERSION_PATCH)
 
 LR_API const char *lr_version(void);
 

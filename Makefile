@@ -89,7 +89,7 @@ LR_SRCS = \
 	$(SRC_DIR)/lr_perf_opt.c \
 	$(SRC_DIR)/lr_worker.c \
 	$(SRC_DIR)/lr_gc.c \
-	$(SRC_DIR)/lr_bytecode.c \
+	$(SRC_DIR)/lr_iome586.c \
 	$(SRC_DIR)/lr_compress.c \
 	$(SRC_DIR)/lr_sandbox_log.c \
 	$(SRC_DIR)/lr_promise.c \

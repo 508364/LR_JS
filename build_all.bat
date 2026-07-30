@@ -1,7 +1,11 @@
 @echo off
 chcp 65001 >nul 2>&1
 REM L/R_JS Multi-Architecture Build Script (Windows x86, x64, ARM64)
-set VERSION=0.1.0
+REM Derive the version from include/lr_js.h (single source of truth).
+for /f "tokens=3" %%a in ('findstr /C:"#define LR_JS_VERSION_MAJOR" "%~dp0include\lr_js.h"') do set VM=%%a
+for /f "tokens=3" %%a in ('findstr /C:"#define LR_JS_VERSION_MINOR" "%~dp0include\lr_js.h"') do set VN=%%a
+for /f "tokens=3" %%a in ('findstr /C:"#define LR_JS_VERSION_PATCH" "%~dp0include\lr_js.h"') do set VP=%%a
+set VERSION=%VM%.%VN%.%VP%
 
 echo ========================================
 echo   L/R_JS v%VERSION% Build Script

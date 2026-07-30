@@ -18,9 +18,14 @@
 #
 set -euo pipefail
 
-VERSION="0.1.0"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
+
+# Derive the version from include/lr_js.h (single source of truth).
+VER_MAJOR=$(grep -E '^#define +LR_JS_VERSION_MAJOR ' include/lr_js.h | awk '{print $3}')
+VER_MINOR=$(grep -E '^#define +LR_JS_VERSION_MINOR ' include/lr_js.h | awk '{print $3}')
+VER_PATCH=$(grep -E '^#define +LR_JS_VERSION_PATCH ' include/lr_js.h | awk '{print $3}')
+VERSION="${VER_MAJOR}.${VER_MINOR}.${VER_PATCH}"
 
 echo "========================================"
 echo "  L/R_JS v$VERSION - Linux Cross Build"

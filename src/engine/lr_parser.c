@@ -17,17 +17,13 @@
 /* Check if a token type can be used as a property name (identifier or contextual keyword) */
 static int is_prop_name_token(TokenType type)
 {
-    switch (type) {
-    case TOK_IDENTIFIER:
-    case TOK_PRIVATE_NAME:
-    case TOK_FROM: case TOK_AS: case TOK_OF:
-    case TOK_GET: case TOK_SET: case TOK_STATIC:
-    case TOK_ASYNC: case TOK_AWAIT: case TOK_YIELD:
-    case TOK_LET:
-        return 1;
-    default:
-        return 0;
-    }
+    /* Identifiers, private names, literal keywords, and ALL reserved
+     * words are valid property names after '.' (e.g. p.catch, o.default).
+     * Keywords are contiguous in the enum: TOK_LET .. TOK_SET. */
+    if (type == TOK_IDENTIFIER || type == TOK_PRIVATE_NAME) return 1;
+    if (type == TOK_BOOL_LIT || type == TOK_NULL_LIT || type == TOK_UNDEFINED_LIT) return 1;
+    if (type >= TOK_LET && type <= TOK_SET) return 1;
+    return 0;
 }
 
 static void *p_malloc(size_t size)
@@ -156,6 +152,42 @@ static int peek_token(Parser *parser, TokenType type)
 {
     Token t = lexer_peek(parser->lexer);
     return t.type == type;
+}
+
+/* ── Lexer State Save/Restore (for speculative parsing) ────────────────── */
+
+typedef struct {
+    size_t pos;
+    size_t line;
+    size_t col;
+    Token  peek;
+    int    has_peek;
+    int    allow_regexp;
+    int    in_template;
+} LexState;
+
+static LexState lex_state_save(Lexer *lex)
+{
+    LexState st;
+    st.pos = lex->pos;
+    st.line = lex->line;
+    st.col = lex->col;
+    st.peek = lex->peek;
+    st.has_peek = lex->has_peek;
+    st.allow_regexp = lex->allow_regexp;
+    st.in_template = lex->in_template;
+    return st;
+}
+
+static void lex_state_restore(Lexer *lex, LexState st)
+{
+    lex->pos = st.pos;
+    lex->line = st.line;
+    lex->col = st.col;
+    lex->peek = st.peek;
+    lex->has_peek = st.has_peek;
+    lex->allow_regexp = st.allow_regexp;
+    lex->in_template = st.in_template;
 }
 
 /* Check if current token is an assignment operator */
@@ -444,7 +476,7 @@ static ASTNode *parse_primary_expr(Parser *parser);
 static ASTNode *parse_postfix_expr(Parser *parser, ASTNode *left);
 static ASTNode *parse_unary_expr(Parser *parser);
 static ASTNode *parse_block(Parser *parser);
-static ASTNode *parse_var_declaration(Parser *parser, TokenType decl_type);
+static ASTNode *parse_var_declaration(Parser *parser, TokenType decl_type, int allow_no_init);
 static ASTNode *parse_function(Parser *parser, int is_async, int is_generator, int is_decl);
 static ASTNode **parse_params(Parser *parser);
 static ASTNode *parse_array_literal(Parser *parser);
@@ -453,9 +485,21 @@ static ASTNode *parse_pattern(Parser *parser);
 static ASTNode *parse_import_decl(Parser *parser);
 static ASTNode *parse_export_decl(Parser *parser);
 static ASTNode *parse_template_literal(Parser *parser, ASTNode *tag);
+static int parse_template_body(Parser *parser, Token first,
+                               char ***out_parts, int *out_nparts,
+                               ASTNode ***out_exprs, int *out_nexp);
 static ASTNode *parse_class_decl(Parser *parser, int is_decl);
 
 /* ── Expression Parsing ───────────────────────────────────────────────── */
+
+/* Arrow function body: `{ ... }` is a block, otherwise an expression. */
+static ASTNode *parse_arrow_body(Parser *parser)
+{
+    if (peek_token(parser, TOK_LBRACE)) {
+        return parse_block(parser);
+    }
+    return parse_assignment_expr(parser);
+}
 
 /* Check if a token can start an expression */
 static int is_expr_start(Parser *parser)
@@ -472,9 +516,13 @@ static int is_expr_start(Parser *parser)
     case TOK_INC: case TOK_DEC:
     case TOK_AWAIT: case TOK_YIELD:
     case TOK_ASYNC:
-    case TOK_TEMPLATE:
+    case TOK_TEMPLATE: case TOK_TEMPLATE_END:
     case TOK_ELLIPSIS:
     case TOK_IMPORT:
+    case TOK_REGEXP:
+    case TOK_PRIVATE_NAME:
+    case TOK_GET: case TOK_SET: case TOK_STATIC: case TOK_OF:
+    case TOK_FROM: case TOK_AS:
         return 1;
     default:
         return 0;
@@ -498,6 +546,67 @@ static ASTNode *parse_primary_expr(Parser *parser)
             n->token = t;
             token_free_data(&t);
             n->token.str_val = NULL; /* already freed above */
+        }
+        return n;
+    }
+    case TOK_REGEXP: {
+        /* Regex literal /pattern/flags -> new RegExp("pattern", "flags") */
+        const char *src = t.start;
+        size_t len = t.len;
+        char *pattern = NULL, *flags = NULL;
+        if (src && len >= 2 && src[0] == '/') {
+            /* Find the closing '/' scanning from the end (flags are idents) */
+            size_t close = len - 1;
+            while (close > 0 && src[close] != '/') close--;
+            if (close > 0) {
+                pattern = (char *)p_malloc(close);
+                if (pattern) {
+                    memcpy(pattern, src + 1, close - 1);
+                    pattern[close - 1] = '\0';
+                }
+                size_t flen = len - close - 1;
+                flags = (char *)p_malloc(flen + 1);
+                if (flags) {
+                    memcpy(flags, src + close + 1, flen);
+                    flags[flen] = '\0';
+                }
+            }
+        }
+        if (!pattern) {
+            parser_error_token(parser, t, "invalid regular expression literal");
+            return NULL;
+        }
+        ASTNode *n = ast_alloc(AST_NEW);
+        if (n) {
+            n->token = t;
+            n->u.new_expr.callee = ast_identifier(parser, "RegExp");
+            n->u.new_expr.args = (ASTNode **)p_malloc(2 * sizeof(ASTNode *));
+            if (n->u.new_expr.args) {
+                n->u.new_expr.args[0] = ast_literal_string(parser, pattern);
+                n->u.new_expr.args[1] = ast_literal_string(parser, flags ? flags : "");
+                n->u.new_expr.argc = 2;
+            } else {
+                n->u.new_expr.argc = 0;
+            }
+        }
+        p_free(pattern);
+        if (flags) p_free(flags);
+        return n;
+    }
+    case TOK_PRIVATE_NAME: {
+        /* Ergonomic brand check: `#field in obj`. Private fields are stored
+         * as regular properties named "#field", so treat the private name
+         * as a string literal for the `in` operator. */
+        char buf[128];
+        size_t len = t.len < sizeof(buf) - 1 ? t.len : sizeof(buf) - 1;
+        if (t.start) memcpy(buf, t.start, len); else len = 0;
+        buf[len] = '\0';
+        ASTNode *n = ast_literal_string(parser, buf);
+        if (n) {
+            /* Keep position info but preserve TOK_STRING so the literal
+             * evaluates as a string (not an unknown token -> null). */
+            n->token.line = t.line;
+            n->token.col = t.col;
         }
         return n;
     }
@@ -547,93 +656,29 @@ static ASTNode *parse_primary_expr(Parser *parser)
         if (name) p_free(name);
 
         /* Check for template literal after identifier (tagged template) */
-        if (peek_token(parser, TOK_TEMPLATE)) {
+        if (peek_token(parser, TOK_TEMPLATE) || peek_token(parser, TOK_TEMPLATE_END)) {
             return parse_template_literal(parser, n);
         }
         return n;
     }
-    case TOK_TEMPLATE: {
+    case TOK_TEMPLATE:
+    case TOK_TEMPLATE_END: {
         ASTNode *n = ast_alloc(AST_TEMPLATE);
         if (n) {
             n->token = t;
-            n->u.template_lit.raw = t.str_val ? strdup(t.str_val) : NULL;
-            n->u.template_lit.exprs = NULL;
-            n->u.template_lit.nexp = 0;
-
-            /* If the template starts with ${...}, parse expressions */
-            if (t.start && t.len > 0 && t.start[t.len - 1] == '{') {
-                /* Collect template parts and expressions */
-                int cap = 4;
-                ASTNode **exprs = (ASTNode **)p_malloc(cap * sizeof(ASTNode *));
-                int nexp = 0;
-
-                while (!parser->has_error) {
-                    ASTNode *expr = parse_expression(parser);
-                    if (expr) {
-                        if (nexp >= cap) {
-                            cap *= 2;
-                            exprs = (ASTNode **)p_realloc(exprs, cap * sizeof(ASTNode *));
-                        }
-                        exprs[nexp++] = expr;
-                    }
-
-                    /* Expect } */
-                    if (!match_token(parser, TOK_RBRACE)) {
-                        if (!parser->has_error)
-                            parser_error(parser, "expected '}' after template expression");
-                        break;
-                    }
-
-                    /* Check for next template part or end */
-                    Token next = lexer_next(parser->lexer);
-                    if (next.type == TOK_TEMPLATE) {
-                        /* Add as template part */
-                        /* We need to realloc to add the text part */
-                        /* For simplicity, we store the raw string of each part */
-                        /* The raw strings are concatenated in the evaluator */
-                        /* Actually, we just continue collecting expressions */
-                        /* The template literal's raw string contains all text parts */
-                        if (n->u.template_lit.raw) {
-                            /* Append the new text part */
-                            size_t old_len = strlen(n->u.template_lit.raw);
-                            size_t new_len = old_len + (next.str_val ? strlen(next.str_val) : 0) + 1;
-                            char *new_raw = (char *)p_malloc(new_len);
-                            if (new_raw) {
-                                memcpy(new_raw, n->u.template_lit.raw, old_len);
-                                if (next.str_val)
-                                    memcpy(new_raw + old_len, next.str_val, strlen(next.str_val));
-                                new_raw[new_len - 1] = '\0';
-                                p_free(n->u.template_lit.raw);
-                                n->u.template_lit.raw = new_raw;
-                            }
-                        }
-                        token_free_data(&next);
-
-                        /* Check if this is the end (no more ${) */
-                        /* A template token ends with ` if it's complete, or `${ if it continues */
-                        if (next.start && next.len > 0) {
-                            const char *end = next.start + next.len - 1;
-                            if (*end == '`') {
-                                /* Complete template */
-                                token_free_data(&next);
-                                goto template_done;
-                            }
-                            /* Otherwise it continues with ${...} */
-                        }
-                    } else if (next.type == TOK_EOF) {
-                        parser_error(parser, "unterminated template literal");
-                        break;
-                    } else {
-                        /* It's the end of template */
-                        token_free_data(&next);
-                        goto template_done;
-                    }
-                    token_free_data(&next);
-                }
-template_done:
-                n->u.template_lit.exprs = exprs;
-                n->u.template_lit.nexp = nexp;
-            }
+            char **parts = NULL;
+            int nparts = 0;
+            ASTNode **exprs = NULL;
+            int nexp = 0;
+            parse_template_body(parser, t, &parts, &nparts, &exprs, &nexp);
+            n->u.template_lit.parts = parts;
+            n->u.template_lit.nparts = nparts;
+            n->u.template_lit.tag = NULL;
+            n->u.template_lit.exprs = exprs;
+            n->u.template_lit.nexp = nexp;
+            /* The first fragment (t.str_val) is now owned by parts[0]; clear the
+             * token copy so ast_free_ex's generic token_free_data is a no-op. */
+            n->token.str_val = NULL;
         }
         return n;
     }
@@ -648,7 +693,7 @@ template_done:
             match_token(parser, TOK_RPAREN); /* consume ) */
             if (peek_token(parser, TOK_ARROW)) {
                 lexer_skip(parser->lexer); /* consume => */
-                ASTNode *body = parse_assignment_expr(parser);
+                ASTNode *body = parse_arrow_body(parser);
                 ASTNode *arrow = ast_alloc(AST_ARROW);
                 if (arrow) {
                     arrow->u.arrow.params = NULL;
@@ -678,7 +723,7 @@ template_done:
             /* Actually, for a single-param arrow like (x) => x+1, we can just use the identifier */
             if (expr->type == AST_IDENTIFIER) {
                 lexer_skip(parser->lexer); /* consume => */
-                ASTNode *body = parse_assignment_expr(parser);
+                ASTNode *body = parse_arrow_body(parser);
                 ASTNode *arrow = ast_alloc(AST_ARROW);
                 if (arrow) {
                     arrow->u.arrow.params = (ASTNode **)p_malloc(sizeof(ASTNode *));
@@ -692,7 +737,7 @@ template_done:
             /* Multi-param: (a, b) => ... */
             /* We need to reconstruct from the sequence expression */
             lexer_skip(parser->lexer); /* consume => */
-            ASTNode *body = parse_assignment_expr(parser);
+            ASTNode *body = parse_arrow_body(parser);
 
             ASTNode *arrow = ast_alloc(AST_ARROW);
             if (arrow) {
@@ -886,10 +931,52 @@ template_done:
             lexer_skip(parser->lexer); /* consume function */
             return parse_function(parser, 1, 0, 0);
         }
-        /* async arrow function */
-        /* Need to parse async as identifier and then handle arrow */
-        /* Actually, re-parse this as an identifier and handle arrow later */
-        /* For now, treat async as an identifier and let the postfix parser handle arrow */
+        /* async arrow function: async (params) => body  |  async x => body */
+        {
+            Token nt = lexer_peek(parser->lexer);
+            if (nt.type == TOK_LPAREN) {
+                size_t save_pos = (size_t)(nt.start - parser->lexer->src);
+                ASTNode *sub = parse_primary_expr(parser);
+                if (sub && sub->type == AST_ARROW && !parser->has_error) {
+                    sub->u.arrow.is_async = 1;
+                    return sub;
+                }
+                /* Not an arrow: it was a call like async(...). Rewind and
+                 * treat 'async' as a plain identifier. */
+                if (sub) ast_free_ex(sub, parser);
+                parser->has_error = 0;
+                parser->lexer->pos = save_pos;
+                lexer_reset_peek(parser->lexer);
+            } else if (nt.type == TOK_IDENTIFIER) {
+                size_t save_pos = (size_t)(nt.start - parser->lexer->src);
+                Token name_tok = lexer_next(parser->lexer);
+                if (peek_token(parser, TOK_ARROW)) {
+                    lexer_skip(parser->lexer); /* consume => */
+                    ASTNode *param = ast_alloc(AST_IDENTIFIER);
+                    if (param) {
+                        param->u.ident.name = (char *)p_malloc(name_tok.len + 1);
+                        if (param->u.ident.name) {
+                            memcpy(param->u.ident.name, name_tok.start, name_tok.len);
+                            param->u.ident.name[name_tok.len] = '\0';
+                        }
+                    }
+                    ASTNode *body = parse_arrow_body(parser);
+                    ASTNode *arrow = ast_alloc(AST_ARROW);
+                    if (arrow) {
+                        arrow->u.arrow.params = (ASTNode **)p_malloc(sizeof(ASTNode *));
+                        if (arrow->u.arrow.params) arrow->u.arrow.params[0] = param;
+                        arrow->u.arrow.nparams = 1;
+                        arrow->u.arrow.body = body;
+                        arrow->u.arrow.is_async = 1;
+                    }
+                    return arrow;
+                }
+                /* Not an arrow; rewind to before the identifier */
+                parser->lexer->pos = save_pos;
+                lexer_reset_peek(parser->lexer);
+            }
+        }
+        /* Fall back: treat async as identifier */
         ASTNode *n = ast_identifier(parser,"async");
         if (n) n->token = t;
         return n;
@@ -1020,7 +1107,7 @@ static ASTNode *parse_postfix_expr(Parser *parser, ASTNode *left)
                     n->u.call.is_optional = 1;
                 }
                 left = n;
-            } else if (prop.type == TOK_TEMPLATE) {
+            } else if (prop.type == TOK_TEMPLATE || prop.type == TOK_TEMPLATE_END) {
                 /* ?.`template` - tagged template with optional chaining */
                 ASTNode *n = parse_template_literal(parser, left);
                 if (n) {
@@ -1105,7 +1192,8 @@ static ASTNode *parse_postfix_expr(Parser *parser, ASTNode *left)
             left = ast_unary(left, "--", 0);
             break;
         }
-        case TOK_TEMPLATE: {
+        case TOK_TEMPLATE:
+        case TOK_TEMPLATE_END: {
             /* Tagged template literal */
             left = parse_template_literal(parser, left);
             break;
@@ -1134,7 +1222,7 @@ static ASTNode *parse_expr(Parser *parser, int min_prec)
         if (t.type == TOK_ARROW) {
             if (left->type == AST_IDENTIFIER) {
                 lexer_skip(parser->lexer); /* consume => */
-                ASTNode *body = parse_assignment_expr(parser);
+                ASTNode *body = parse_arrow_body(parser);
                 ASTNode *arrow = ast_alloc(AST_ARROW);
                 if (arrow) {
                     arrow->u.arrow.params = (ASTNode **)p_malloc(sizeof(ASTNode *));
@@ -1325,20 +1413,116 @@ static ASTNode *parse_object_literal(Parser *parser)
         } else {
             ASTNode *prop = NULL;
 
+            /* Detect accessor syntax: get name() {} / set name(v) {}
+             * ('get'/'set' followed by a property name, not by ':'/'('/','/'}'/'=') */
+            int accessor = 0, accessor_is_get = 0;
+            if (peek_token(parser, TOK_GET) || peek_token(parser, TOK_SET)) {
+                accessor_is_get = peek_token(parser, TOK_GET);
+                LexState st = lex_state_save(parser->lexer);
+                lexer_skip(parser->lexer);
+                if (!(peek_token(parser, TOK_COLON) || peek_token(parser, TOK_LPAREN) ||
+                      peek_token(parser, TOK_COMMA) || peek_token(parser, TOK_RBRACE) ||
+                      peek_token(parser, TOK_ASSIGN))) {
+                    accessor = 1;
+                }
+                lex_state_restore(parser->lexer, st);
+            }
+
+            if (accessor) {
+                lexer_skip(parser->lexer); /* consume 'get'/'set' */
+
+                /* Accessor property name */
+                char *pname = NULL;
+                if (peek_token(parser, TOK_STRING) || peek_token(parser, TOK_NUMBER)) {
+                    Token kt = lexer_next(parser->lexer);
+                    if (kt.type == TOK_STRING) {
+                        if (kt.str_val) pname = strdup(kt.str_val);
+                        token_free_data(&kt);
+                    } else {
+                        char numbuf[40];
+                        snprintf(numbuf, sizeof(numbuf), "%.17g", kt.num_val);
+                        pname = strdup(numbuf);
+                    }
+                } else {
+                    Token kt = lexer_next(parser->lexer);
+                    if (kt.start && kt.len > 0) {
+                        pname = (char *)p_malloc(kt.len + 1);
+                        if (pname) {
+                            memcpy(pname, kt.start, kt.len);
+                            pname[kt.len] = '\0';
+                        }
+                    } else {
+                        parser_error_token(parser, kt, "expected accessor property name");
+                        break;
+                    }
+                }
+
+                /* Parameters + body */
+                ASTNode **params = parse_params(parser);
+                int nparams = 0;
+                if (params) {
+                    while (params[nparams]) nparams++;
+                }
+                ASTNode *body = parse_block(parser);
+
+                ASTNode *func = ast_alloc(AST_FUNC_EXPR);
+                if (func) {
+                    func->u.func.name = pname ? strdup(pname) : NULL;
+                    func->u.func.params = params;
+                    func->u.func.nparams = nparams;
+                    func->u.func.body = body;
+                    func->u.func.is_getter = accessor_is_get ? 1 : 0;
+                    func->u.func.is_setter = accessor_is_get ? 0 : 1;
+                }
+
+                prop = ast_alloc(AST_PROPERTY);
+                if (prop) {
+                    prop->u.property.key = ast_identifier(parser, pname ? pname : "");
+                    prop->u.property.val = func;
+                    prop->u.property.computed = 0;
+                    prop->u.property.shorthand = 0;
+                }
+                if (pname) p_free(pname);
+
+                if (prop) {
+                    if (n->u.object.nprops >= cap) {
+                        cap = cap ? cap * 2 : 4;
+                        n->u.object.props = (ASTNode **)p_realloc(n->u.object.props,
+                            cap * sizeof(ASTNode *));
+                    }
+                    n->u.object.props[n->u.object.nprops++] = prop;
+                }
+
+                if (!match_token(parser, TOK_COMMA)) break;
+                continue;
+            }
+
             /* Shorthand property name or computed property */
             int computed = match_token(parser, TOK_LBRACKET);
             if (computed) {
                 ASTNode *key = parse_expression(parser);
                 expect_token(parser, TOK_RBRACKET);
-                expect_token(parser, TOK_COLON);
-                ASTNode *val = parse_assignment_expr(parser);
+                if (peek_token(parser, TOK_LPAREN) || peek_token(parser, TOK_TEMPLATE)) {
+                    /* Computed method shorthand: [key]() {} */
+                    ASTNode *func = parse_function(parser, 0, 0, 0);
+                    prop = ast_alloc(AST_PROPERTY);
+                    if (prop) {
+                        prop->u.property.key = key;
+                        prop->u.property.val = func;
+                        prop->u.property.computed = 1;
+                        prop->u.property.shorthand = 0;
+                    }
+                } else {
+                    expect_token(parser, TOK_COLON);
+                    ASTNode *val = parse_assignment_expr(parser);
 
-                prop = ast_alloc(AST_PROPERTY);
-                if (prop) {
-                    prop->u.property.key = key;
-                    prop->u.property.val = val;
-                    prop->u.property.computed = 1;
-                    prop->u.property.shorthand = 0;
+                    prop = ast_alloc(AST_PROPERTY);
+                    if (prop) {
+                        prop->u.property.key = key;
+                        prop->u.property.val = val;
+                        prop->u.property.computed = 1;
+                        prop->u.property.shorthand = 0;
+                    }
                 }
             } else if (peek_token(parser, TOK_STRING) || peek_token(parser, TOK_NUMBER)) {
                 /* Property with string/number key */
@@ -1453,83 +1637,100 @@ static ASTNode *parse_object_literal(Parser *parser)
 
 /* ── Template Literal ─────────────────────────────────────────────────── */
 
+/* Collect the parts/exprs of a template literal.
+ * `first` is the template token the caller already consumed (TOK_TEMPLATE or
+ * TOK_TEMPLATE_END). Its str_val is transferred into the returned parts array
+ * and must NOT be freed by the caller. Returns 1 on success. */
+static int parse_template_body(Parser *parser, Token first,
+                               char ***out_parts, int *out_nparts,
+                               ASTNode ***out_exprs, int *out_nexp)
+{
+    char **parts = (char **)p_malloc(4 * sizeof(char *));
+    int nparts = 0, parts_cap = 4;
+    ASTNode **exprs = NULL;
+    int nexp = 0, exprs_cap = 0;
+
+    parts[nparts++] = first.str_val; /* transfer ownership; never freed here */
+
+    if (first.type == TOK_TEMPLATE) {
+        /* A TOK_TEMPLATE segment is always followed by an interpolation. */
+        while (!parser->has_error) {
+            ASTNode *expr = parse_expression(parser);
+            if (!expr) {
+                parser_error(parser, "expected template interpolation expression");
+                break;
+            }
+            if (nexp >= exprs_cap) {
+                exprs_cap = exprs_cap ? exprs_cap * 2 : 4;
+                exprs = (ASTNode **)p_realloc(exprs, exprs_cap * sizeof(ASTNode *));
+            }
+            exprs[nexp++] = expr;
+
+            if (!match_token(parser, TOK_RBRACE)) {
+                if (!parser->has_error)
+                    parser_error(parser, "expected '}' after template expression");
+                break;
+            }
+
+            Token next = lexer_template_next(parser->lexer);
+            if (next.type == TOK_TEMPLATE) {
+                if (nparts >= parts_cap) {
+                    parts_cap *= 2;
+                    parts = (char **)p_realloc(parts, parts_cap * sizeof(char *));
+                }
+                parts[nparts++] = next.str_val; /* transfer ownership */
+                /* another interpolation follows: continue */
+            } else if (next.type == TOK_TEMPLATE_END) {
+                parts[nparts++] = next.str_val; /* transfer ownership */
+                break;
+            } else if (next.type == TOK_EOF) {
+                parser_error(parser, "unterminated template literal");
+                break;
+            } else {
+                parser_error(parser, "expected template literal continuation");
+                token_free_data(&next);
+                break;
+            }
+        }
+    }
+
+    *out_parts = parts;
+    *out_nparts = nparts;
+    *out_exprs = exprs;
+    *out_nexp = nexp;
+    return 1;
+}
+
 static ASTNode *parse_template_literal(Parser *parser, ASTNode *tag)
 {
     Token t = lexer_next(parser->lexer);
-    if (t.type != TOK_TEMPLATE) {
+    if (t.type != TOK_TEMPLATE && t.type != TOK_TEMPLATE_END) {
         parser_error_token(parser, t, "expected template literal");
+        token_free_data(&t);
         return tag;
     }
 
     ASTNode *n = ast_alloc(AST_TAGGED_TEMPLATE);
-    if (!n) return tag;
+    if (!n) {
+        token_free_data(&t);
+        return tag;
+    }
 
     n->token = t;
-    n->u.template_lit.raw = t.str_val ? strdup(t.str_val) : NULL;
-    n->u.template_lit.exprs = NULL;
-    n->u.template_lit.nexp = 0;
-
-    /* Store the tag (the function being called) */
-    /* We'll use the first expression slot for the tag, but that's a bit hacky */
-    /* For simplicity, we store tag separately. Since tagged templates are calls,
-       we'll wrap them as a call node instead. */
-    {
-        ASTNode *call_node = ast_alloc(AST_CALL);
-        if (call_node) {
-            call_node->u.call.callee = tag;
-            call_node->u.call.args = (ASTNode **)p_malloc(sizeof(ASTNode *));
-            call_node->u.call.args[0] = n;
-            call_node->u.call.argc = 1;
-            call_node->u.call.is_optional = 0;
-        }
-
-        /* Parse template expressions if any */
-        if (t.start && t.len > 0) {
-            const char *end = t.start + t.len - 1;
-            if (*end == '{') {
-                /* Template has expressions */
-                int cap = 4;
-                ASTNode **exprs = (ASTNode **)p_malloc(cap * sizeof(ASTNode *));
-                int nexp = 0;
-
-                while (!parser->has_error) {
-                    ASTNode *expr = parse_expression(parser);
-                    if (nexp >= cap) {
-                        cap *= 2;
-                        exprs = (ASTNode **)p_realloc(exprs, cap * sizeof(ASTNode *));
-                    }
-                    exprs[nexp++] = expr;
-
-                    expect_token(parser, TOK_RBRACE);
-
-                    Token next = lexer_next(parser->lexer);
-                    if (next.type == TOK_TEMPLATE) {
-                        if (next.start && next.len > 0) {
-                            const char *next_end = next.start + next.len - 1;
-                            if (*next_end == '`') {
-                                /* End of template */
-                                token_free_data(&next);
-                                break;
-                            }
-                            /* Otherwise continues */
-                        }
-                        token_free_data(&next);
-                    } else if (next.type == TOK_EOF) {
-                        parser_error(parser, "unterminated template literal");
-                        break;
-                    } else {
-                        /* End of template */
-                        break;
-                    }
-                }
-
-                n->u.template_lit.exprs = exprs;
-                n->u.template_lit.nexp = nexp;
-            }
-        }
-
-        return call_node;
-    }
+    char **parts = NULL;
+    int nparts = 0;
+    ASTNode **exprs = NULL;
+    int nexp = 0;
+    parse_template_body(parser, t, &parts, &nparts, &exprs, &nexp);
+    n->u.template_lit.parts = parts;
+    n->u.template_lit.nparts = nparts;
+    n->u.template_lit.tag = tag;
+    n->u.template_lit.exprs = exprs;
+    n->u.template_lit.nexp = nexp;
+    /* The first fragment (t.str_val) is now owned by parts[0]; clear the token
+     * copy so ast_free_ex's generic token_free_data is a no-op. */
+    n->token.str_val = NULL;
+    return n;
 }
 
 /* ── Function Parsing ─────────────────────────────────────────────────── */
@@ -1546,6 +1747,12 @@ static ASTNode *parse_function(Parser *parser, int is_async, int is_generator, i
     n->u.func.nparams = 0;
     n->u.func.body = NULL;
 
+    /* Generator asterisk comes BEFORE the name: function* g() {} */
+    if (peek_token(parser, TOK_MUL)) {
+        lexer_skip(parser->lexer);
+        n->u.func.is_generator = 1;
+    }
+
     /* Parse function name (optional for expressions) */
     if (peek_token(parser, TOK_IDENTIFIER)) {
         Token name_tok = lexer_next(parser->lexer);
@@ -1558,23 +1765,6 @@ static ASTNode *parse_function(Parser *parser, int is_async, int is_generator, i
         }
     } else if (is_decl) {
         parser_error(parser, "function declaration requires a name");
-    }
-
-    /* Check for generator asterisk */
-    if (peek_token(parser, TOK_MUL)) {
-        lexer_skip(parser->lexer);
-        n->u.func.is_generator = 1;
-        /* Parse optional name after * */
-        if (!n->u.func.name && peek_token(parser, TOK_IDENTIFIER)) {
-            Token name_tok = lexer_next(parser->lexer);
-            if (name_tok.start && name_tok.len > 0) {
-                n->u.func.name = (char *)p_malloc(name_tok.len + 1);
-                if (n->u.func.name) {
-                    memcpy(n->u.func.name, name_tok.start, name_tok.len);
-                    n->u.func.name[name_tok.len] = '\0';
-                }
-            }
-        }
     }
 
     /* Parse parameters */
@@ -1695,6 +1885,7 @@ static ASTNode *parse_pattern(Parser *parser)
 
         n->u.pattern_array.elements = NULL;
         n->u.pattern_array.nelem = 0;
+        n->u.pattern_array.is_object = 0;
         int cap = 0;
 
         while (!parser->has_error && !peek_token(parser, TOK_RBRACKET)) {
@@ -1766,6 +1957,7 @@ static ASTNode *parse_pattern(Parser *parser)
 
         n->u.pattern_object.props = NULL;
         n->u.pattern_object.nprops = 0;
+        n->u.pattern_object.is_object = 1;
         int cap = 0;
 
         while (!parser->has_error && !peek_token(parser, TOK_RBRACE)) {
@@ -1925,7 +2117,7 @@ static ASTNode *parse_block(Parser *parser)
 
 /* ── Variable Declaration ─────────────────────────────────────────────── */
 
-static ASTNode *parse_var_declaration(Parser *parser, TokenType decl_type)
+static ASTNode *parse_var_declaration(Parser *parser, TokenType decl_type, int allow_no_init)
 {
     ASTNode *n = ast_alloc(AST_VAR_DECL);
     if (!n) return NULL;
@@ -1960,7 +2152,7 @@ static ASTNode *parse_var_declaration(Parser *parser, TokenType decl_type)
         /* Optional initializer */
         if (match_token(parser, TOK_ASSIGN)) {
             init = parse_assignment_expr(parser);
-        } else if (decl_type == TOK_CONST) {
+        } else if (decl_type == TOK_CONST && !allow_no_init) {
             parser_error(parser, "const declaration requires an initializer");
         }
 
@@ -2000,7 +2192,7 @@ ASTNode *parse_statement(Parser *parser)
     case TOK_VAR: {
         TokenType decl = t.type;
         lexer_skip(parser->lexer);
-        ASTNode *n = parse_var_declaration(parser, decl);
+        ASTNode *n = parse_var_declaration(parser, decl, 0);
         /* Semicolon is optional for var declarations (ASI) */
         match_token(parser, TOK_SEMICOLON);
         return n;
@@ -2061,7 +2253,7 @@ ASTNode *parse_statement(Parser *parser)
         if (peek_token(parser, TOK_VAR) || peek_token(parser, TOK_LET) ||
             peek_token(parser, TOK_CONST)) {
             TokenType decl_type = lexer_next(parser->lexer).type;
-            n->u.for_stmt.init = parse_var_declaration(parser, decl_type);
+            n->u.for_stmt.init = parse_var_declaration(parser, decl_type, 1);
         } else if (!peek_token(parser, TOK_SEMICOLON)) {
             n->u.for_stmt.init = parse_expression(parser);
         } else {
@@ -2076,6 +2268,10 @@ ASTNode *parse_statement(Parser *parser)
                 in_node->u.for_in.each = n->u.for_stmt.init;
                 in_node->u.for_in.source = parse_expression(parser);
             }
+            /* The init node (each) is transferred to in_node; prevent
+             * ast_free_ex(n) from freeing it (would be a use-after-free /
+             * double-free since for_in frees it again at teardown). */
+            n->u.for_stmt.init = NULL;
             expect_token(parser, TOK_RPAREN);
             in_node->u.for_in.body = parse_statement(parser);
             ast_free_ex(n, parser);
@@ -2088,6 +2284,10 @@ ASTNode *parse_statement(Parser *parser)
                 of_node->u.for_of.each = n->u.for_stmt.init;
                 of_node->u.for_of.source = parse_expression(parser);
             }
+            /* The init node (each) is transferred to of_node; prevent
+             * ast_free_ex(n) from freeing it (would be a use-after-free /
+             * double-free since for_of frees it again at teardown). */
+            n->u.for_stmt.init = NULL;
             expect_token(parser, TOK_RPAREN);
             of_node->u.for_of.body = parse_statement(parser);
             ast_free_ex(n, parser);
@@ -2491,6 +2691,7 @@ static ASTNode *parse_import_decl(Parser *parser)
         Token name = lexer_next(parser->lexer);
         ASTNode *spec = ast_alloc(AST_IMPORT_SPECIFIER);
         if (spec) {
+            spec->u.import_spec.is_default = 1;  /* default import */
             if (name.start && name.len > 0) {
                 char *sname = (char *)p_malloc(name.len + 1);
                 if (sname) { memcpy(sname, name.start, name.len); sname[name.len] = '\0'; }
@@ -2690,7 +2891,7 @@ static ASTNode *parse_export_decl(Parser *parser)
         peek_token(parser, TOK_CONST)) {
         TokenType decl_type = lexer_next(parser->lexer).type;
         n->u.export_decl.specifiers = (ASTNode **)p_malloc(sizeof(ASTNode *));
-        n->u.export_decl.specifiers[0] = parse_var_declaration(parser, decl_type);
+        n->u.export_decl.specifiers[0] = parse_var_declaration(parser, decl_type, 0);
         n->u.export_decl.nspec = 1;
         match_token(parser, TOK_SEMICOLON);
         return n;
@@ -2764,84 +2965,136 @@ static ASTNode *parse_class_decl(Parser *parser, int is_decl)
 
     int cap = 0;
     while (!parser->has_error && !peek_token(parser, TOK_RBRACE)) {
+        /* Skip stray semicolons between class members */
+        if (match_token(parser, TOK_SEMICOLON)) continue;
+
+        int is_static_m = 0;
         int is_async_method = 0;
         int is_generator_method = 0;
+        int is_getter = 0;
+        int is_setter = 0;
 
-        /* Method name */
-        ASTNode *key = NULL;
+        /* 'static' modifier (unless used as a member name) */
+        if (peek_token(parser, TOK_STATIC)) {
+            LexState st = lex_state_save(parser->lexer);
+            lexer_skip(parser->lexer);
+            if (peek_token(parser, TOK_LPAREN) || peek_token(parser, TOK_ASSIGN) ||
+                peek_token(parser, TOK_SEMICOLON)) {
+                /* 'static' is actually the member name */
+                lex_state_restore(parser->lexer, st);
+            } else {
+                is_static_m = 1;
+            }
+        }
+
+        /* Static initialization block: static { ... } */
+        if (is_static_m && peek_token(parser, TOK_LBRACE)) {
+            ASTNode *body = parse_block(parser);
+            ASTNode *func = ast_alloc(AST_FUNC_EXPR);
+            if (func) {
+                func->u.func.name = strdup("__static_block__");
+                func->u.func.params = NULL;
+                func->u.func.nparams = 0;
+                func->u.func.body = body;
+                func->u.func.is_static = 1;
+                func->u.func.class_node = cls;
+            } else if (body) {
+                ast_free_ex(body, parser);
+            }
+            if (func) {
+                if (cls->u.class_decl.nmethods >= cap) {
+                    cap = cap ? cap * 2 : 8;
+                    cls->u.class_decl.methods = (ASTNode **)p_realloc(cls->u.class_decl.methods,
+                        cap * sizeof(ASTNode *));
+                }
+                cls->u.class_decl.methods[cls->u.class_decl.nmethods++] = func;
+            }
+            continue;
+        }
+
+        /* 'async' modifier (unless used as a member name) */
+        if (peek_token(parser, TOK_ASYNC)) {
+            LexState st = lex_state_save(parser->lexer);
+            lexer_skip(parser->lexer);
+            if (peek_token(parser, TOK_LPAREN) || peek_token(parser, TOK_ASSIGN) ||
+                peek_token(parser, TOK_SEMICOLON)) {
+                lex_state_restore(parser->lexer, st);
+            } else {
+                is_async_method = 1;
+            }
+        }
+
+        /* Generator star */
+        if (match_token(parser, TOK_MUL)) is_generator_method = 1;
+
+        /* 'get' / 'set' modifier (unless used as a member name) */
+        if (peek_token(parser, TOK_GET) || peek_token(parser, TOK_SET)) {
+            int is_get_tok = peek_token(parser, TOK_GET);
+            LexState st = lex_state_save(parser->lexer);
+            lexer_skip(parser->lexer);
+            if (peek_token(parser, TOK_LPAREN) || peek_token(parser, TOK_ASSIGN) ||
+                peek_token(parser, TOK_SEMICOLON)) {
+                lex_state_restore(parser->lexer, st);
+            } else {
+                if (is_get_tok) is_getter = 1;
+                else is_setter = 1;
+            }
+        }
+
+        /* Member name */
+        ASTNode *key_expr = NULL;    /* computed key */
         char *method_name = NULL;
 
         if (match_token(parser, TOK_LBRACKET)) {
-            key = parse_expression(parser);
+            key_expr = parse_expression(parser);
             expect_token(parser, TOK_RBRACKET);
         } else if (peek_token(parser, TOK_STRING) || peek_token(parser, TOK_NUMBER)) {
             Token kt = lexer_next(parser->lexer);
             if (kt.type == TOK_STRING) {
-                key = ast_literal_string(parser,kt.str_val ? kt.str_val : "");
+                if (kt.str_val) method_name = strdup(kt.str_val);
                 token_free_data(&kt);
             } else {
-                key = ast_literal_number(parser,kt.num_val);
+                char numbuf[40];
+                snprintf(numbuf, sizeof(numbuf), "%.17g", kt.num_val);
+                method_name = strdup(numbuf);
             }
-        } else if (peek_token(parser, TOK_IDENTIFIER) || peek_token(parser, TOK_GET) ||
-                   peek_token(parser, TOK_SET) || peek_token(parser, TOK_ASYNC)) {
+        } else {
             Token kt = lexer_next(parser->lexer);
+            int name_ok = (kt.type == TOK_IDENTIFIER || kt.type == TOK_GET ||
+                           kt.type == TOK_SET || kt.type == TOK_STATIC ||
+                           kt.type == TOK_ASYNC || kt.type == TOK_PRIVATE_NAME);
+            /* Also allow keywords used as member names (e.g. delete()) */
+            if (!name_ok && kt.start && kt.len > 0) {
+                char c0 = kt.start[0];
+                if ((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') ||
+                    c0 == '_' || c0 == '$' || c0 == '#') {
+                    name_ok = 1;
+                }
+            }
+            if (!name_ok) {
+                parser_error_token(parser, kt, "expected class member name");
+                break;
+            }
             if (kt.start && kt.len > 0) {
                 method_name = (char *)p_malloc(kt.len + 1);
-                if (method_name) { memcpy(method_name, kt.start, kt.len); method_name[kt.len] = '\0'; }
-            }
-            key = ast_identifier(parser,method_name ? method_name : "");
-
-            /* Check for async or generator */
-            if (method_name && strcmp(method_name, "async") == 0) {
-                is_async_method = 1;
-                /* Re-parse the actual method name */
-                if (peek_token(parser, TOK_MUL)) {
-                    is_generator_method = 1;
-                    lexer_skip(parser->lexer);
-                }
-                if (peek_token(parser, TOK_IDENTIFIER) || peek_token(parser, TOK_GET) ||
-                    peek_token(parser, TOK_SET) || peek_token(parser, TOK_PRIVATE_NAME)) {
-                    Token kt2 = lexer_next(parser->lexer);
-                    if (kt2.start && kt2.len > 0) {
-                        if (method_name) p_free(method_name);
-                        method_name = (char *)p_malloc(kt2.len + 1);
-                        if (method_name) { memcpy(method_name, kt2.start, kt2.len); method_name[kt2.len] = '\0'; }
-                    }
-                    key = ast_identifier(parser,method_name ? method_name : "");
+                if (method_name) {
+                    memcpy(method_name, kt.start, kt.len);
+                    method_name[kt.len] = '\0';
                 }
             }
         }
 
-        if (peek_token(parser, TOK_MUL)) {
-            is_generator_method = 1;
-            lexer_skip(parser->lexer);
-            /* Re-parse method name after * */
-            if (peek_token(parser, TOK_IDENTIFIER) || peek_token(parser, TOK_GET) ||
-                peek_token(parser, TOK_SET) || peek_token(parser, TOK_PRIVATE_NAME)) {
-                Token kt2 = lexer_next(parser->lexer);
-                if (kt2.start && kt2.len > 0) {
-                    if (method_name) p_free(method_name);
-                    method_name = (char *)p_malloc(kt2.len + 1);
-                    if (method_name) { memcpy(method_name, kt2.start, kt2.len); method_name[kt2.len] = '\0'; }
-                }
-                key = ast_identifier(parser,method_name ? method_name : "");
-            }
-        }
+        ASTNode *member = NULL;
 
-        /* Parse method value */
-        ASTNode *method_val = NULL;
-        if (key) {
-            /* Parse parameters */
+        if (peek_token(parser, TOK_LPAREN)) {
+            /* Method definition */
             ASTNode **params = parse_params(parser);
             int nparams = 0;
             if (params) {
                 while (params[nparams]) nparams++;
             }
-
-            /* Parse body */
             ASTNode *body = parse_block(parser);
 
-            /* Create function expression for the method */
             ASTNode *func = ast_alloc(AST_FUNC_EXPR);
             if (func) {
                 func->u.func.name = method_name ? strdup(method_name) : NULL;
@@ -2850,17 +3103,40 @@ static ASTNode *parse_class_decl(Parser *parser, int is_decl)
                 func->u.func.body = body;
                 func->u.func.is_async = is_async_method;
                 func->u.func.is_generator = is_generator_method;
+                func->u.func.is_static = is_static_m;
+                func->u.func.is_getter = is_getter;
+                func->u.func.is_setter = is_setter;
+                func->u.func.key_expr = key_expr;
+                func->u.func.class_node = cls;
             }
-            method_val = func;
+            member = func;
+        } else {
+            /* Class field: name [= initializer] ; */
+            ASTNode *init = NULL;
+            if (match_token(parser, TOK_ASSIGN)) {
+                init = parse_assignment_expr(parser);
+            }
+            match_token(parser, TOK_SEMICOLON);
+
+            ASTNode *prop = ast_alloc(AST_PROPERTY);
+            if (prop) {
+                prop->u.property.key = key_expr ? key_expr
+                    : ast_identifier(parser, method_name ? method_name : "");
+                prop->u.property.val = init;
+                prop->u.property.computed = key_expr ? 1 : 0;
+                prop->u.property.shorthand = 0;
+                prop->u.property.is_static = is_static_m;
+            }
+            member = prop;
         }
 
-        if (key && method_val) {
+        if (member) {
             if (cls->u.class_decl.nmethods >= cap) {
                 cap = cap ? cap * 2 : 8;
                 cls->u.class_decl.methods = (ASTNode **)p_realloc(cls->u.class_decl.methods,
                     cap * sizeof(ASTNode *));
             }
-            cls->u.class_decl.methods[cls->u.class_decl.nmethods++] = method_val;
+            cls->u.class_decl.methods[cls->u.class_decl.nmethods++] = member;
         }
 
         if (method_name) p_free(method_name);
@@ -3100,6 +3376,8 @@ void ast_free_ex(ASTNode *node, Parser *parser)
             }
             p_free(node->u.func.params);
         }
+        ast_free_ex(node->u.func.key_expr, parser);
+        /* NOTE: u.func.class_node is a non-owning back-pointer, do not free */
         ast_free_ex(node->u.func.body, parser);
         break;
 
@@ -3226,7 +3504,15 @@ void ast_free_ex(ASTNode *node, Parser *parser)
 
     case AST_TEMPLATE:
     case AST_TAGGED_TEMPLATE:
-        if (node->u.template_lit.raw) p_free(node->u.template_lit.raw);
+        if (node->u.template_lit.parts) {
+            for (int i = 0; i < node->u.template_lit.nparts; i++) {
+                /* parts[i] are verbatim source fragments malloc'd by the lexer */
+                if (node->u.template_lit.parts[i]) free(node->u.template_lit.parts[i]);
+            }
+            p_free(node->u.template_lit.parts);
+        }
+        if (node->u.template_lit.tag)
+            ast_free_ex(node->u.template_lit.tag, parser);
         if (node->u.template_lit.exprs) {
             for (int i = 0; i < node->u.template_lit.nexp; i++) {
                 ast_free_ex(node->u.template_lit.exprs[i], parser);
@@ -3236,18 +3522,13 @@ void ast_free_ex(ASTNode *node, Parser *parser)
         break;
 
     case AST_PATTERN:
-        /* Handle both array and object patterns */
+        /* pattern_array/pattern_object alias the same union storage;
+         * free the item array exactly once. */
         if (node->u.pattern_array.elements) {
             for (int i = 0; i < node->u.pattern_array.nelem; i++) {
                 ast_free_ex(node->u.pattern_array.elements[i], parser);
             }
             p_free(node->u.pattern_array.elements);
-        }
-        if (node->u.pattern_object.props) {
-            for (int i = 0; i < node->u.pattern_object.nprops; i++) {
-                ast_free_ex(node->u.pattern_object.props[i], parser);
-            }
-            p_free(node->u.pattern_object.props);
         }
         break;
 
@@ -3279,7 +3560,6 @@ void ast_free_ex(ASTNode *node, Parser *parser)
         break;
 
     case AST_EXPORT:
-    case AST_EXPORT_NAMED:
         if (node->u.export_decl.specifiers) {
             for (int i = 0; i < node->u.export_decl.nspec; i++) {
                 ast_free_ex(node->u.export_decl.specifiers[i], parser);
@@ -3287,6 +3567,13 @@ void ast_free_ex(ASTNode *node, Parser *parser)
             p_free(node->u.export_decl.specifiers);
         }
         ast_free_ex(node->u.export_decl.source, parser);
+        break;
+
+    case AST_EXPORT_NAMED:
+        /* Specifier node: uses the export_spec view (name string +
+         * exported identifier), NOT the export_decl list view. */
+        if (node->u.export_spec.name) p_free(node->u.export_spec.name);
+        ast_free_ex(node->u.export_spec.exported, parser);
         break;
 
     case AST_EXPORT_DEFAULT:
@@ -3320,4 +3607,775 @@ void ast_free_ex(ASTNode *node, Parser *parser)
         node != cached_zero_node && node != cached_one_node) {
         p_free(node);
     }
+}
+
+/* ── AST Serialization (bytecode cache support) ──────────────────────────
+ * Serializes the parse tree into a flat byte buffer so it can be persisted to
+ * disk (.lrfile) and re-executed later without re-lexing/re-parsing.
+ *
+ * Design notes:
+ *  - A node is serialized as: type(u16), token(type/line/col/num_val), then
+ *    type-specific union fields (children recursively, strings, op[16]).
+ *  - NULL child pointers use the sentinel type 0xFFFF.
+ *  - Strings that the interpreter resolves by name (identifiers, literal
+ *    strings, func/class/property names) are interned on deserialize so that
+ *    ast_free_ex / parser_free clean them up exactly like a normal parse.
+ *  - Template literal part fragments are freed with free() by ast_free_ex, so
+ *    they are copied with malloc() (not interned) on deserialize.
+ *  - The func.class_node back-pointer is restored during deserialize by
+ *    pointing each class method's func node at its owning class declaration
+ *    (required at runtime for `super` in derived classes). */
+
+#define LR_AST_NULL_NODE 0xFFFF
+
+/* ── Serialize buffer ─────────────────────────────────────────────────── */
+typedef struct {
+    uint8_t *data;
+    size_t   len;
+    size_t   cap;
+    int      error;
+} SerBuf;
+
+static void ser_reserve(SerBuf *b, size_t extra)
+{
+    if (b->error) return;
+    if (b->len + extra <= b->cap) return;
+    size_t ncap = b->cap ? b->cap : 256;
+    while (ncap < b->len + extra) ncap *= 2;
+    uint8_t *nd = (uint8_t *)realloc(b->data, ncap);
+    if (!nd) { b->error = 1; return; }
+    b->data = nd;
+    b->cap = ncap;
+}
+
+static void ser_u8(SerBuf *b, uint8_t v)  { ser_reserve(b, 1); if (!b->error) b->data[b->len++] = v; }
+static void ser_u16(SerBuf *b, uint16_t v)
+{
+    ser_reserve(b, 2); if (b->error) return;
+    b->data[b->len++] = (uint8_t)(v & 0xFF);
+    b->data[b->len++] = (uint8_t)((v >> 8) & 0xFF);
+}
+static void ser_u32(SerBuf *b, uint32_t v)
+{
+    ser_reserve(b, 4); if (b->error) return;
+    b->data[b->len++] = (uint8_t)(v & 0xFF);
+    b->data[b->len++] = (uint8_t)((v >> 8) & 0xFF);
+    b->data[b->len++] = (uint8_t)((v >> 16) & 0xFF);
+    b->data[b->len++] = (uint8_t)((v >> 24) & 0xFF);
+}
+static void ser_f64(SerBuf *b, double v)
+{
+    uint64_t bits; memcpy(&bits, &v, sizeof(bits));
+    ser_u32(b, (uint32_t)(bits & 0xFFFFFFFF));
+    ser_u32(b, (uint32_t)(bits >> 32));
+}
+static void ser_str(SerBuf *b, const char *s)
+{
+    if (!s) { ser_u32(b, 0); return; }
+    size_t n = strlen(s);
+    if (n > 0xFFFFFFFF) n = 0xFFFFFFFF;
+    ser_u32(b, (uint32_t)n);
+    ser_reserve(b, n);
+    if (!b->error && n) { memcpy(b->data + b->len, s, n); b->len += n; }
+}
+/* Operators live in fixed char[16]; store the meaningful prefix (<=15 bytes). */
+static void ser_op(SerBuf *b, const char *op)
+{
+    size_t n = 0;
+    while (n < 15 && op && op[n]) n++;
+    ser_u8(b, (uint8_t)n);
+    ser_reserve(b, n);
+    if (!b->error && n) { memcpy(b->data + b->len, op, n); b->len += n; }
+}
+
+static void ser_node(SerBuf *b, ASTNode *node);
+static void ser_node_list(SerBuf *b, ASTNode **items, int count)
+{
+    ser_u32(b, (uint32_t)(count > 0 ? count : 0));
+    for (int i = 0; i < count; i++) ser_node(b, items[i]);
+}
+
+static void ser_node(SerBuf *b, ASTNode *node)
+{
+    if (!node) { ser_u16(b, LR_AST_NULL_NODE); return; }
+    ser_u16(b, (uint16_t)node->type);
+    ser_u16(b, (uint16_t)node->token.type);
+    ser_u32(b, (uint32_t)node->token.line);
+    ser_u32(b, (uint32_t)node->token.col);
+    ser_f64(b, node->token.num_val);
+
+    switch (node->type) {
+    case AST_PROGRAM:
+    case AST_BLOCK:
+        ser_node_list(b, node->u.list.items, node->u.list.count);
+        break;
+    case AST_EXPR_STMT:
+        ser_node(b, node->u.expr_stmt.expr);
+        break;
+    case AST_IF:
+    case AST_WHILE:
+    case AST_DO_WHILE:
+        ser_node(b, node->u.if_stmt.cond);
+        ser_node(b, node->u.if_stmt.body);
+        ser_node(b, node->u.if_stmt.else_body);
+        break;
+    case AST_FOR:
+        ser_node(b, node->u.for_stmt.init);
+        ser_node(b, node->u.for_stmt.test);
+        ser_node(b, node->u.for_stmt.update);
+        ser_node(b, node->u.for_stmt.body);
+        break;
+    case AST_FOR_IN:
+        ser_node(b, node->u.for_in.each);
+        ser_node(b, node->u.for_in.source);
+        ser_node(b, node->u.for_in.body);
+        break;
+    case AST_FOR_OF:
+        ser_node(b, node->u.for_of.each);
+        ser_node(b, node->u.for_of.source);
+        ser_node(b, node->u.for_of.body);
+        break;
+    case AST_SWITCH:
+        ser_node(b, node->u.switch_stmt.test);
+        ser_node_list(b, node->u.switch_stmt.cases, node->u.switch_stmt.ncases);
+        break;
+    case AST_CASE:
+    case AST_DEFAULT:
+        ser_node(b, node->u.if_stmt.cond);
+        ser_node(b, node->u.if_stmt.body);
+        break;
+    case AST_BREAK:
+        ser_node(b, node->u.break_stmt.label);
+        break;
+    case AST_CONTINUE:
+        ser_node(b, node->u.continue_stmt.label);
+        break;
+    case AST_RETURN:
+        ser_node(b, node->u.return_stmt.arg);
+        break;
+    case AST_THROW:
+        ser_node(b, node->u.throw_stmt.arg);
+        break;
+    case AST_TRY:
+        ser_node(b, node->u.try_stmt.body);
+        ser_node(b, node->u.try_stmt.catch_body);
+        ser_node(b, node->u.try_stmt.finally_body);
+        ser_str(b, node->u.try_stmt.catch_var);
+        break;
+    case AST_LABEL:
+        ser_node(b, node->u.label_stmt.label);
+        ser_node(b, node->u.label_stmt.stmt);
+        break;
+    case AST_WITH:
+        ser_node(b, node->u.with_stmt.obj);
+        ser_node(b, node->u.with_stmt.body);
+        break;
+    case AST_DEBUGGER:
+        break;
+    case AST_VAR_DECL:
+        ser_node_list(b, node->u.var_decl.vars, node->u.var_decl.nvars);
+        break;
+    case AST_VAR_DECLARATOR:
+        ser_node(b, node->u.declarator.var);
+        ser_node(b, node->u.declarator.init);
+        break;
+    case AST_FUNC_DECL:
+    case AST_FUNC_EXPR:
+        ser_str(b, node->u.func.name);
+        ser_node_list(b, node->u.func.params, node->u.func.nparams);
+        ser_node(b, node->u.func.key_expr);
+        ser_node(b, node->u.func.body);
+        ser_u8(b, (uint8_t)node->u.func.is_async);
+        ser_u8(b, (uint8_t)node->u.func.is_generator);
+        ser_u8(b, (uint8_t)node->u.func.is_static);
+        ser_u8(b, (uint8_t)node->u.func.is_getter);
+        ser_u8(b, (uint8_t)node->u.func.is_setter);
+        /* class_node is a non-owning back-pointer; restored on deserialize */
+        break;
+    case AST_ARROW:
+        ser_str(b, node->u.arrow.name);
+        ser_node_list(b, node->u.arrow.params, node->u.arrow.nparams);
+        ser_node(b, node->u.arrow.body);
+        ser_u8(b, (uint8_t)node->u.arrow.is_async);
+        break;
+    case AST_CLASS_DECL:
+        ser_str(b, node->u.class_decl.name);
+        ser_node(b, node->u.class_decl.extends);
+        ser_node_list(b, node->u.class_decl.methods, node->u.class_decl.nmethods);
+        break;
+    case AST_CLASS_BODY:
+        ser_node_list(b, node->u.class_body.methods, node->u.class_body.nmethods);
+        break;
+    case AST_LITERAL: {
+        /* Serialize an explicit type tag so the deserializer can pick the
+         * correct value reader AND restore the exact lexical token type. The
+         * node's token.type is NOT reliable on the receiving side (it is
+         * overwritten with the AST node-type enum during deserialization), so a
+         * discriminator is required. 0=bool, 1=string, 2=number, 3=null,
+         * 4=undefined. Without it a bool (ser_u32, 4 bytes) would be read back
+         * as an f64 (8 bytes), misaligning the whole stream and corrupting every
+         * following node; and null/undefined (which the parser stores as num=0
+         * / num=-1) would otherwise collapse into TOK_NUMBER and evaluate as
+         * int32(0)/int32(-1) on warm runs. */
+        uint8_t ltag;
+        switch (node->token.type) {
+            case TOK_BOOL_LIT:      ltag = 0; break;
+            case TOK_STRING:        ltag = 1; break;
+            case TOK_NULL_LIT:      ltag = 3; break;
+            case TOK_UNDEFINED_LIT: ltag = 4; break;
+            default:                ltag = 2; break; /* TOK_NUMBER + safety */
+        }
+        ser_u8(b, ltag);
+        if (ltag == 0)      ser_u32(b, (uint32_t)node->u.bool_val.val);
+        else if (ltag == 1) ser_str(b, node->u.string.str);
+        else if (ltag == 2) ser_f64(b, node->u.number.num);
+        /* ltag 3 (null) and 4 (undefined) carry no extra payload */
+        break;
+    }
+    case AST_IDENTIFIER:
+        ser_str(b, node->u.ident.name);
+        break;
+    case AST_THIS:
+    case AST_SUPER:
+        break;
+    case AST_BINARY:
+        ser_node(b, node->u.binary.left);
+        ser_node(b, node->u.binary.right);
+        ser_op(b, node->u.binary.op);
+        break;
+    case AST_UNARY:
+        ser_node(b, node->u.unary.arg);
+        ser_op(b, node->u.unary.op);
+        ser_u8(b, (uint8_t)node->u.unary.prefix);
+        break;
+    case AST_CONDITIONAL:
+        ser_node(b, node->u.conditional.cond);
+        ser_node(b, node->u.conditional.consequent);
+        ser_node(b, node->u.conditional.alternate);
+        break;
+    case AST_CALL:
+    case AST_OPTIONAL_CALL:
+        ser_node(b, node->u.call.callee);
+        ser_node_list(b, node->u.call.args, node->u.call.argc);
+        ser_u8(b, (uint8_t)node->u.call.is_optional);
+        break;
+    case AST_NEW:
+        ser_node(b, node->u.new_expr.callee);
+        ser_node_list(b, node->u.new_expr.args, node->u.new_expr.argc);
+        break;
+    case AST_MEMBER:
+    case AST_COMPUTED_MEMBER:
+    case AST_OPTIONAL_MEMBER:
+        ser_node(b, node->u.member.obj);
+        ser_node(b, node->u.member.prop);
+        ser_u8(b, (uint8_t)node->u.member.is_optional);
+        break;
+    case AST_ASSIGN:
+        ser_node(b, node->u.assign.target);
+        ser_node(b, node->u.assign.value);
+        ser_op(b, node->u.assign.op);
+        break;
+    case AST_SEQUENCE:
+        ser_node_list(b, node->u.sequence.exprs, node->u.sequence.count);
+        break;
+    case AST_ARRAY:
+        ser_node_list(b, node->u.array.elements, node->u.array.nelem);
+        break;
+    case AST_OBJECT:
+        ser_node_list(b, node->u.object.props, node->u.object.nprops);
+        break;
+    case AST_PROPERTY:
+        ser_node(b, node->u.property.key);
+        ser_node(b, node->u.property.val);
+        ser_u8(b, (uint8_t)node->u.property.computed);
+        ser_u8(b, (uint8_t)node->u.property.shorthand);
+        ser_u8(b, (uint8_t)node->u.property.is_static);
+        break;
+    case AST_SPREAD:
+    case AST_SPREAD_ELEMENT:
+        ser_node(b, node->u.spread.arg);
+        break;
+    case AST_TEMPLATE:
+    case AST_TAGGED_TEMPLATE: {
+        ser_u32(b, (uint32_t)node->u.template_lit.nparts);
+        for (int i = 0; i < node->u.template_lit.nparts; i++)
+            ser_str(b, node->u.template_lit.parts[i]);
+        ser_node(b, node->u.template_lit.tag);
+        ser_u32(b, (uint32_t)node->u.template_lit.nexp);
+        for (int i = 0; i < node->u.template_lit.nexp; i++)
+            ser_node(b, node->u.template_lit.exprs[i]);
+        break;
+    }
+    case AST_PATTERN:
+        ser_node_list(b, node->u.pattern_array.elements, node->u.pattern_array.nelem);
+        ser_u8(b, (uint8_t)node->u.pattern_array.is_object);
+        break;
+    case AST_REST:
+        ser_node(b, node->u.rest_elem.arg);
+        break;
+    case AST_DEFAULT_VALUE:
+        ser_node(b, node->u.default_val.left);
+        ser_node(b, node->u.default_val.right);
+        break;
+    case AST_AWAIT:
+        ser_node(b, node->u.await_expr.arg);
+        break;
+    case AST_YIELD:
+        ser_node(b, node->u.yield_expr.arg);
+        ser_u8(b, (uint8_t)node->u.yield_expr.is_delegate);
+        break;
+    case AST_IMPORT:
+        ser_node_list(b, node->u.import_decl.specifiers, node->u.import_decl.nspec);
+        ser_node(b, node->u.import_decl.source);
+        break;
+    case AST_EXPORT:
+        ser_node_list(b, node->u.export_decl.specifiers, node->u.export_decl.nspec);
+        ser_node(b, node->u.export_decl.source);
+        ser_u8(b, (uint8_t)node->u.export_decl.is_default);
+        break;
+    case AST_EXPORT_NAMED:
+        /* export_spec view: local name + exported alias node */
+        ser_str(b, node->u.export_spec.name);
+        ser_node(b, node->u.export_spec.exported);
+        break;
+    case AST_EXPORT_DEFAULT:
+        ser_node(b, node->u.export_default.value);
+        break;
+    case AST_EXPORT_ALL:
+        ser_node(b, node->u.export_all.source);
+        break;
+    case AST_IMPORT_SPECIFIER:
+        ser_str(b, node->u.import_spec.name);
+        ser_node(b, node->u.import_spec.local);
+        ser_u8(b, (uint8_t)node->u.import_spec.is_default);
+        break;
+    case AST_IMPORT_NAMESPACE:
+        ser_node(b, node->u.import_namespace.local);
+        break;
+    default:
+        break;
+    }
+}
+
+uint8_t *lr_ast_serialize(ASTNode *root, size_t *out_len)
+{
+    SerBuf b = {0};
+    /* Magic + format version so incompatible / stale cache files (we used to
+     * serialize a JS value, not an AST) are rejected on deserialize. */
+    ser_u8(&b, 'L');
+    ser_u8(&b, 'R');
+    ser_u8(&b, 'A');
+    ser_u8(&b, (uint8_t)3); /* format version (3: literals carry full type tag incl. null/undefined) */
+    ser_node(&b, root);
+    if (b.error) { free(b.data); if (out_len) *out_len = 0; return NULL; }
+    if (out_len) *out_len = b.len;
+    return b.data;
+}
+
+/* ── Deserialize ───────────────────────────────────────────────────────── */
+typedef struct {
+    const uint8_t *buf;
+    size_t         len;
+    size_t         pos;
+    int            error;
+} DeserState;
+
+static uint8_t  read_u8(DeserState *st)
+{
+    if (st->pos + 1 > st->len) { st->error = 1; return 0; }
+    return st->buf[st->pos++];
+}
+static uint16_t read_u16(DeserState *st)
+{
+    if (st->pos + 2 > st->len) { st->error = 1; return 0; }
+    uint16_t v = (uint16_t)st->buf[st->pos] | ((uint16_t)st->buf[st->pos + 1] << 8);
+    st->pos += 2; return v;
+}
+static uint32_t read_u32(DeserState *st)
+{
+    if (st->pos + 4 > st->len) { st->error = 1; return 0; }
+    uint32_t v = (uint32_t)st->buf[st->pos] | ((uint32_t)st->buf[st->pos + 1] << 8)
+               | ((uint32_t)st->buf[st->pos + 2] << 16) | ((uint32_t)st->buf[st->pos + 3] << 24);
+    st->pos += 4; return v;
+}
+static double read_f64(DeserState *st)
+{
+    if (st->pos + 8 > st->len) { st->error = 1; return 0.0; }
+    uint64_t bits = (uint64_t)st->buf[st->pos] | ((uint64_t)st->buf[st->pos + 1] << 8)
+                  | ((uint64_t)st->buf[st->pos + 2] << 16) | ((uint64_t)st->buf[st->pos + 3] << 24)
+                  | ((uint64_t)st->buf[st->pos + 4] << 32) | ((uint64_t)st->buf[st->pos + 5] << 40)
+                  | ((uint64_t)st->buf[st->pos + 6] << 48) | ((uint64_t)st->buf[st->pos + 7] << 56);
+    st->pos += 8; double d; memcpy(&d, &bits, sizeof(d)); return d;
+}
+/* Interned copy (freed by parser_free via the intern table). */
+static const char *deser_str(DeserState *st, Parser *intern)
+{
+    uint32_t n = read_u32(st);
+    if (st->error || n == 0) return "";
+    if (st->pos + n > st->len) { st->error = 1; return ""; }
+    const char *s = parser_intern_string(intern, (const char *)(st->buf + st->pos), n);
+    st->pos += n;
+    return s ? s : "";
+}
+/* Plain malloc'd copy (freed with free() by ast_free_ex, e.g. template parts). */
+static char *deser_str_raw(DeserState *st)
+{
+    uint32_t n = read_u32(st);
+    if (st->error || n == 0) return NULL;
+    if (st->pos + n > st->len) { st->error = 1; return NULL; }
+    char *s = (char *)malloc(n + 1);
+    if (!s) { st->error = 1; return NULL; }
+    memcpy(s, st->buf + st->pos, n); s[n] = '\0'; st->pos += n;
+    return s;
+}
+static void deser_op(char *dst, DeserState *st)
+{
+    uint8_t n = read_u8(st);
+    if (n > 15) n = 15;
+    if (st->pos + n > st->len) { st->error = 1; n = 0; }
+    for (uint8_t i = 0; i < n; i++) dst[i] = (char)st->buf[st->pos++];
+    for (int i = n; i < 16; i++) dst[i] = '\0';
+}
+
+static ASTNode *deser_node(DeserState *st, Parser *intern);
+static ASTNode **deser_node_list(DeserState *st, Parser *intern, int *out_count)
+{
+    uint32_t count = read_u32(st);
+    *out_count = (int)count;
+    if (count == 0) return NULL;
+    ASTNode **arr = (ASTNode **)p_malloc(count * sizeof(ASTNode *));
+    if (!arr) { st->error = 1; return NULL; }
+    for (uint32_t i = 0; i < count; i++) arr[i] = deser_node(st, intern);
+    return arr;
+}
+
+static ASTNode *deser_node(DeserState *st, Parser *intern)
+{
+    uint16_t t = read_u16(st);
+    if (st->error) return NULL;
+    if (t == LR_AST_NULL_NODE) return NULL;
+    ASTNode *node = ast_alloc((ASTNodeType)t);
+    if (!node) { st->error = 1; return NULL; }
+
+    node->token.type    = (TokenType)read_u16(st);
+    node->token.line    = read_u32(st);
+    node->token.col     = read_u32(st);
+    node->token.num_val = read_f64(st);
+    node->token.str_val = NULL;
+    node->token.start   = NULL;
+    node->token.len     = 0;
+
+    switch (node->type) {
+    case AST_PROGRAM:
+    case AST_BLOCK:
+        node->u.list.items = deser_node_list(st, intern, &node->u.list.count);
+        break;
+    case AST_EXPR_STMT:
+        node->u.expr_stmt.expr = deser_node(st, intern);
+        break;
+    case AST_IF:
+    case AST_WHILE:
+    case AST_DO_WHILE:
+        node->u.if_stmt.cond      = deser_node(st, intern);
+        node->u.if_stmt.body      = deser_node(st, intern);
+        node->u.if_stmt.else_body = deser_node(st, intern);
+        break;
+    case AST_FOR:
+        node->u.for_stmt.init  = deser_node(st, intern);
+        node->u.for_stmt.test  = deser_node(st, intern);
+        node->u.for_stmt.update = deser_node(st, intern);
+        node->u.for_stmt.body  = deser_node(st, intern);
+        break;
+    case AST_FOR_IN:
+        node->u.for_in.each   = deser_node(st, intern);
+        node->u.for_in.source = deser_node(st, intern);
+        node->u.for_in.body   = deser_node(st, intern);
+        break;
+    case AST_FOR_OF:
+        node->u.for_of.each   = deser_node(st, intern);
+        node->u.for_of.source = deser_node(st, intern);
+        node->u.for_of.body   = deser_node(st, intern);
+        break;
+    case AST_SWITCH:
+        node->u.switch_stmt.test  = deser_node(st, intern);
+        node->u.switch_stmt.cases = deser_node_list(st, intern, &node->u.switch_stmt.ncases);
+        break;
+    case AST_CASE:
+    case AST_DEFAULT:
+        node->u.if_stmt.cond = deser_node(st, intern);
+        node->u.if_stmt.body = deser_node(st, intern);
+        break;
+    case AST_BREAK:
+        node->u.break_stmt.label = deser_node(st, intern);
+        break;
+    case AST_CONTINUE:
+        node->u.continue_stmt.label = deser_node(st, intern);
+        break;
+    case AST_RETURN:
+        node->u.return_stmt.arg = deser_node(st, intern);
+        break;
+    case AST_THROW:
+        node->u.throw_stmt.arg = deser_node(st, intern);
+        break;
+    case AST_TRY:
+        node->u.try_stmt.body       = deser_node(st, intern);
+        node->u.try_stmt.catch_body = deser_node(st, intern);
+        node->u.try_stmt.finally_body = deser_node(st, intern);
+        /* Owned copy: ast_free_ex frees catch_var with p_free. */
+        node->u.try_stmt.catch_var  = deser_str_raw(st);
+        break;
+    case AST_LABEL:
+        node->u.label_stmt.label = deser_node(st, intern);
+        node->u.label_stmt.stmt  = deser_node(st, intern);
+        break;
+    case AST_WITH:
+        node->u.with_stmt.obj  = deser_node(st, intern);
+        node->u.with_stmt.body = deser_node(st, intern);
+        break;
+    case AST_DEBUGGER:
+        break;
+    case AST_VAR_DECL:
+        node->u.var_decl.vars = deser_node_list(st, intern, &node->u.var_decl.nvars);
+        break;
+    case AST_VAR_DECLARATOR:
+        node->u.declarator.var  = deser_node(st, intern);
+        node->u.declarator.init = deser_node(st, intern);
+        break;
+    case AST_FUNC_DECL:
+    case AST_FUNC_EXPR:
+        /* Owned copy: ast_free_ex frees func.name with p_free. */
+        node->u.func.name       = deser_str_raw(st);
+        node->u.func.params     = deser_node_list(st, intern, &node->u.func.nparams);
+        node->u.func.key_expr   = deser_node(st, intern);
+        node->u.func.body       = deser_node(st, intern);
+        node->u.func.is_async   = (int)read_u8(st);
+        node->u.func.is_generator = (int)read_u8(st);
+        node->u.func.is_static  = (int)read_u8(st);
+        node->u.func.is_getter  = (int)read_u8(st);
+        node->u.func.is_setter  = (int)read_u8(st);
+        node->u.func.class_node = NULL; /* restored by owning class below */
+        break;
+    case AST_ARROW:
+        node->u.arrow.name    = (char *)deser_str(st, intern);
+        node->u.arrow.params  = deser_node_list(st, intern, &node->u.arrow.nparams);
+        node->u.arrow.body    = deser_node(st, intern);
+        node->u.arrow.is_async = (int)read_u8(st);
+        break;
+    case AST_CLASS_DECL:
+        /* Owned copy: ast_free_ex frees class name with p_free. */
+        node->u.class_decl.name    = deser_str_raw(st);
+        node->u.class_decl.body    = NULL;
+        node->u.class_decl.extends = deser_node(st, intern);
+        node->u.class_decl.methods = deser_node_list(st, intern, &node->u.class_decl.nmethods);
+        /* Restore the func.class_node back-pointer for derivation `super`. */
+        for (int i = 0; i < node->u.class_decl.nmethods; i++) {
+            ASTNode *m = node->u.class_decl.methods ? node->u.class_decl.methods[i] : NULL;
+            if (m && (m->type == AST_FUNC_DECL || m->type == AST_FUNC_EXPR))
+                m->u.func.class_node = node;
+        }
+        break;
+    case AST_CLASS_BODY:
+        node->u.class_body.methods = deser_node_list(st, intern, &node->u.class_body.nmethods);
+        break;
+    case AST_LITERAL: {
+        /* Read the explicit type tag written by ser_node (see above). Do NOT
+         * branch on node->token.type here: it was set from the AST node-type
+         * enum during deserialization, not the original lexical token type. */
+        uint8_t ltag = read_u8(st);
+        if (ltag == 0) {
+            uint32_t bv = read_u32(st);
+            node->token.type      = TOK_BOOL_LIT;
+            /* NOTE: u.bool_val and u.number alias in the union. Set bool_val
+             * only — do NOT also write u.number.num, or the double store would
+             * clobber bool_val.val (low 4 bytes of 1.0 are zero), turning a
+             * deserialized `true` into `false`. This matches the parsed
+             * cached_true_node, which only sets bool_val.val. */
+            node->u.bool_val.val  = (int)bv;
+        } else if (ltag == 1) {
+            node->token.type      = TOK_STRING;
+            node->u.string.str    = (char *)deser_str(st, intern);
+        } else if (ltag == 2) {
+            node->token.type      = TOK_NUMBER;
+            node->u.number.num    = read_f64(st);
+        } else if (ltag == 3) {
+            node->token.type      = TOK_NULL_LIT;
+            node->u.number.num    = 0.0;
+        } else { /* ltag == 4 */
+            node->token.type      = TOK_UNDEFINED_LIT;
+            node->u.number.num    = -1.0;
+        }
+        break;
+    }
+    case AST_IDENTIFIER:
+        node->u.ident.name = (char *)deser_str(st, intern);
+        break;
+    case AST_THIS:
+    case AST_SUPER:
+        break;
+    case AST_BINARY:
+        node->u.binary.left  = deser_node(st, intern);
+        node->u.binary.right = deser_node(st, intern);
+        deser_op(node->u.binary.op, st);
+        break;
+    case AST_UNARY:
+        node->u.unary.arg    = deser_node(st, intern);
+        deser_op(node->u.unary.op, st);
+        node->u.unary.prefix = (int)read_u8(st);
+        break;
+    case AST_CONDITIONAL:
+        node->u.conditional.cond       = deser_node(st, intern);
+        node->u.conditional.consequent = deser_node(st, intern);
+        node->u.conditional.alternate  = deser_node(st, intern);
+        break;
+    case AST_CALL:
+    case AST_OPTIONAL_CALL:
+        node->u.call.callee    = deser_node(st, intern);
+        node->u.call.args       = deser_node_list(st, intern, &node->u.call.argc);
+        node->u.call.is_optional = (int)read_u8(st);
+        break;
+    case AST_NEW:
+        node->u.new_expr.callee = deser_node(st, intern);
+        node->u.new_expr.args   = deser_node_list(st, intern, &node->u.new_expr.argc);
+        break;
+    case AST_MEMBER:
+    case AST_COMPUTED_MEMBER:
+    case AST_OPTIONAL_MEMBER:
+        node->u.member.obj         = deser_node(st, intern);
+        node->u.member.prop        = deser_node(st, intern);
+        node->u.member.is_optional = (int)read_u8(st);
+        break;
+    case AST_ASSIGN:
+        node->u.assign.target = deser_node(st, intern);
+        node->u.assign.value  = deser_node(st, intern);
+        deser_op(node->u.assign.op, st);
+        break;
+    case AST_SEQUENCE:
+        node->u.sequence.exprs = deser_node_list(st, intern, &node->u.sequence.count);
+        break;
+    case AST_ARRAY:
+        node->u.array.elements = deser_node_list(st, intern, &node->u.array.nelem);
+        break;
+    case AST_OBJECT:
+        node->u.object.props = deser_node_list(st, intern, &node->u.object.nprops);
+        break;
+    case AST_PROPERTY:
+        node->u.property.key      = deser_node(st, intern);
+        node->u.property.val      = deser_node(st, intern);
+        node->u.property.computed = (int)read_u8(st);
+        node->u.property.shorthand = (int)read_u8(st);
+        node->u.property.is_static = (int)read_u8(st);
+        break;
+    case AST_SPREAD:
+    case AST_SPREAD_ELEMENT:
+        node->u.spread.arg = deser_node(st, intern);
+        break;
+    case AST_TEMPLATE:
+    case AST_TAGGED_TEMPLATE: {
+        node->u.template_lit.nparts = (int)read_u32(st);
+        if (node->u.template_lit.nparts > 0) {
+            node->u.template_lit.parts = (char **)p_malloc(node->u.template_lit.nparts * sizeof(char *));
+            for (int i = 0; i < node->u.template_lit.nparts; i++)
+                node->u.template_lit.parts[i] = deser_str_raw(st);
+        } else {
+            node->u.template_lit.parts = NULL;
+        }
+        node->u.template_lit.tag  = deser_node(st, intern);
+        node->u.template_lit.nexp = (int)read_u32(st);
+        if (node->u.template_lit.nexp > 0) {
+            node->u.template_lit.exprs = (ASTNode **)p_malloc(node->u.template_lit.nexp * sizeof(ASTNode *));
+            for (int i = 0; i < node->u.template_lit.nexp; i++)
+                node->u.template_lit.exprs[i] = deser_node(st, intern);
+        } else {
+            node->u.template_lit.exprs = NULL;
+        }
+        break;
+    }
+    case AST_PATTERN: {
+        int nelem = 0;
+        node->u.pattern_array.elements  = deser_node_list(st, intern, &nelem);
+        node->u.pattern_array.nelem    = nelem;
+        node->u.pattern_array.is_object = (int)read_u8(st);
+        /* pattern_object aliases pattern_array: keep both views consistent */
+        node->u.pattern_object.props     = node->u.pattern_array.elements;
+        node->u.pattern_object.nprops    = nelem;
+        node->u.pattern_object.is_object = node->u.pattern_array.is_object;
+        break;
+    }
+    case AST_REST:
+        node->u.rest_elem.arg = deser_node(st, intern);
+        break;
+    case AST_DEFAULT_VALUE:
+        node->u.default_val.left  = deser_node(st, intern);
+        node->u.default_val.right = deser_node(st, intern);
+        break;
+    case AST_AWAIT:
+        node->u.await_expr.arg = deser_node(st, intern);
+        break;
+    case AST_YIELD:
+        node->u.yield_expr.arg       = deser_node(st, intern);
+        node->u.yield_expr.is_delegate = (int)read_u8(st);
+        break;
+    case AST_IMPORT:
+        node->u.import_decl.specifiers = deser_node_list(st, intern, &node->u.import_decl.nspec);
+        node->u.import_decl.source     = deser_node(st, intern);
+        break;
+    case AST_EXPORT:
+        node->u.export_decl.specifiers = deser_node_list(st, intern, &node->u.export_decl.nspec);
+        node->u.export_decl.source     = deser_node(st, intern);
+        node->u.export_decl.is_default = (int)read_u8(st);
+        break;
+    case AST_EXPORT_NAMED:
+        /* export_spec view; owned copy freed with p_free by ast_free_ex. */
+        node->u.export_spec.name     = deser_str_raw(st);
+        node->u.export_spec.exported = deser_node(st, intern);
+        break;
+    case AST_EXPORT_DEFAULT:
+        node->u.export_default.value = deser_node(st, intern);
+        break;
+    case AST_EXPORT_ALL:
+        node->u.export_all.source = deser_node(st, intern);
+        break;
+    case AST_IMPORT_SPECIFIER:
+        /* Owned copy: ast_free_ex frees import spec name with p_free. */
+        node->u.import_spec.name  = deser_str_raw(st);
+        node->u.import_spec.local = deser_node(st, intern);
+        node->u.import_spec.is_default = (int)read_u8(st);
+        break;
+    case AST_IMPORT_NAMESPACE:
+        node->u.import_namespace.local = deser_node(st, intern);
+        break;
+    default:
+        break;
+    }
+
+    if (st->error) {
+        ast_free_ex(node, intern);
+        return NULL;
+    }
+    return node;
+}
+
+ASTNode *lr_ast_deserialize(const uint8_t *buf, size_t len, Parser **out_parser)
+{
+    /* Reject malformed / stale (pre-format-version) cache files up front. */
+    if (!buf || len < 5 ||
+        buf[0] != 'L' || buf[1] != 'R' || buf[2] != 'A' || buf[3] != 3) {
+        return NULL;
+    }
+
+    Parser *intern = (Parser *)calloc(1, sizeof(Parser));
+    if (!intern) return NULL;
+    parser_init(intern, NULL);
+    intern->use_pool = 0;  /* deserialized nodes are malloc'd, freed via p_free */
+
+    DeserState st = { buf + 4, len - 4, 0, 0 };
+    ASTNode *root = deser_node(&st, intern);
+    if (!root || st.error) {
+        if (root) ast_free_ex(root, intern);
+        parser_free(intern);
+        free(intern);
+        return NULL;
+    }
+    *out_parser = intern;
+    return root;
 }

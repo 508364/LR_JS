@@ -88,7 +88,12 @@ size_t lr_lz4_compress(const uint8_t *src, uint8_t *dst, size_t src_len)
                 size_t lit_len = (size_t)(ip - anchor);
                 if (op + 1 + lit_len > oend) goto fail;
 
-                /* Token: literal_length << 4 | (match_len - 4) */
+                /* Token: literal_length << 4 | (match_len - 4).
+                 * Keep a pointer to the token byte so the match length is
+                 * OR'd into its lower nibble even when literal-length
+                 * extension bytes have been emitted (op[-1] would otherwise
+                 * point at the wrong byte). */
+                uint8_t *token_ptr = op;
                 size_t token = lit_len;
                 if (token >= 15) {
                     *op++ = (uint8_t)(15 << 4);
@@ -98,17 +103,6 @@ size_t lr_lz4_compress(const uint8_t *src, uint8_t *dst, size_t src_len)
                 } else {
                     *op++ = (uint8_t)(token << 4);
                 }
-                /* Put match length in token lower nibble */
-                token = match_len - LZ4_MIN_MATCH;
-                if (token < 15) {
-                    op[-1] |= (uint8_t)token;
-                } else {
-                    op[-1] |= 15;
-                    token -= 15;
-                    while (token >= 255) { *op++ = 255; token -= 255; }
-                    *op++ = (uint8_t)token;
-                }
-
                 /* Copy literals */
                 memcpy(op, anchor, lit_len);
                 op += lit_len;
@@ -117,6 +111,18 @@ size_t lr_lz4_compress(const uint8_t *src, uint8_t *dst, size_t src_len)
                 size_t offset = (size_t)(ip - ref);
                 *op++ = (uint8_t)(offset & 0xFF);
                 *op++ = (uint8_t)((offset >> 8) & 0xFF);
+
+                /* Put match length in token lower nibble; extension bytes
+                 * (if any) go AFTER the offset, per LZ4 block format. */
+                token = match_len - LZ4_MIN_MATCH;
+                if (token < 15) {
+                    *token_ptr |= (uint8_t)token;
+                } else {
+                    *token_ptr |= 15;
+                    token -= 15;
+                    while (token >= 255) { *op++ = 255; token -= 255; }
+                    *op++ = (uint8_t)token;
+                }
 
                 /* Advance */
                 ip = match;
@@ -259,7 +265,8 @@ uint8_t *lr_compress_if_beneficial(const uint8_t *data, size_t data_len,
     }
 
     /* Store original size as 4-byte header for decompression */
-    memcpy(compressed, &data_len, 4);
+    uint32_t stored_len = (uint32_t)data_len;
+    memcpy(compressed, &stored_len, 4);
     *out_len = csize + 4;
     *was_compressed = 1;
     return compressed;
@@ -276,10 +283,11 @@ uint8_t *lr_decompress_if_needed(const uint8_t *data, size_t data_len,
         return copy;
     }
 
-    /* Read original size from first 4 bytes */
-    size_t uncompressed_len;
+    /* Read original size from first 4 bytes (32-bit LE header) */
+    uint32_t stored_len = 0;
     if (data_len < 4) return NULL;
-    memcpy(&uncompressed_len, data, 4);
+    memcpy(&stored_len, data, 4);
+    size_t uncompressed_len = stored_len;
 
     uint8_t *decompressed = malloc(uncompressed_len);
     if (!decompressed) return NULL;

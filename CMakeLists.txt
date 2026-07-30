@@ -111,7 +111,7 @@ set(LR_RUNTIME_SRCS
     src/lr_perf_opt.c
     src/lr_worker.c
     src/lr_gc.c
-    src/lr_bytecode.c
+    src/lr_iome586.c
     src/lr_compress.c
     src/lr_sandbox_log.c
     src/lr_promise.c

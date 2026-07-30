@@ -10,7 +10,7 @@
 
 #include "lr_perf_opt.h"
 #include "lr_gc.h"
-#include "lr_bytecode.h"
+#include "lr_iome586.h"
 
 /* ── Runtime structure ────────────────────────────────────────────────── */
 
@@ -38,8 +38,8 @@ struct LR_Runtime {
     /* GC context (generational + incremental) */
     LR_GCContext  gc_ctx;
 
-    /* Bytecode cache */
-    LR_BytecodeCache bytecode_cache;
+    /* IOME586 result cache */
+    LR_Iome586Cache iome586;
 
     /* I/O */
     FILE         *stdin_fp;

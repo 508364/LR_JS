@@ -85,7 +85,10 @@ struct ASTNode {
         /* Declarations */
         struct { ASTNode **vars; int nvars; } var_decl;
         struct { ASTNode *var, *init; } declarator;
-        struct { char *name; ASTNode *body, **params; int nparams; int is_async; int is_generator; } func;
+        struct { char *name; ASTNode *body, **params; int nparams; int is_async; int is_generator;
+                 int is_static; int is_getter; int is_setter;
+                 ASTNode *key_expr;    /* computed method key: [expr]() {} (owned) */
+                 ASTNode *class_node;  /* back-pointer to owning class (NOT owned) */ } func;
         struct { char *name; ASTNode *body, **params; int nparams; int is_async; } arrow;
         struct { char *name; ASTNode *body; ASTNode *extends; ASTNode **methods; int nmethods; } class_decl;
         struct { ASTNode **methods; int nmethods; } class_body;
@@ -105,21 +108,31 @@ struct ASTNode {
         /* Array/Object literals */
         struct { ASTNode **elements; int nelem; } array;
         struct { ASTNode **props; int nprops; } object;
-        struct { ASTNode *key, *val; int computed; int shorthand; } property;
+        struct { ASTNode *key, *val; int computed; int shorthand; int is_static; } property;
         struct { ASTNode *arg; } spread;
 
-        /* Patterns */
-        struct { ASTNode **elements; int nelem; } pattern_array;
-        struct { ASTNode **props; int nprops; } pattern_object;
+        /* Patterns (the two structs intentionally alias each other in the
+         * union; is_object discriminates array vs object patterns) */
+        struct { ASTNode **elements; int nelem; int is_object; } pattern_array;
+        struct { ASTNode **props; int nprops; int is_object; } pattern_object;
         struct { ASTNode *arg; } rest_elem;
         struct { ASTNode *left, *right; } default_val;
 
-        /* Template literals */
-        struct { char *raw; ASTNode **exprs; int nexp; } template_lit;
+        /* Template literals.
+         * `parts` holds the nexp+1 verbatim text fragments between interpolations.
+         * For plain templates `tag` is NULL; for tagged templates `tag` is the
+         * callee expression node. cooked text is derived by unescaping `parts`. */
+        struct {
+            char    **parts;  /* nexp+1 verbatim source fragments */
+            int       nparts;
+            ASTNode  *tag;    /* tagged template callee (NULL for plain) */
+            ASTNode **exprs;
+            int       nexp;
+        } template_lit;
 
         /* Import/Export */
         struct { ASTNode **specifiers; int nspec; ASTNode *source; } import_decl;
-        struct { char *name; ASTNode *local; } import_spec;
+        struct { char *name; ASTNode *local; int is_default; } import_spec;
         struct { ASTNode *local; } import_namespace;
         struct { ASTNode **specifiers; int nspec; ASTNode *source; int is_default; } export_decl;
         struct { ASTNode *value; } export_default;
@@ -154,7 +167,7 @@ typedef struct LRStringIntern {
 
 /* ── Parser ───────────────────────────────────────────────────────────── */
 
-typedef struct {
+typedef struct Parser {
     Lexer *lexer;
     int has_error;
     char error_msg[256];
@@ -202,6 +215,12 @@ ASTNode *ast_literal_bool(Parser *parser, int val);
 ASTNode *ast_identifier(Parser *parser, const char *name);
 ASTNode *ast_binary(ASTNode *left, ASTNode *right, const char *op);
 ASTNode *ast_unary(ASTNode *arg, const char *op, int prefix);
+
+/* ── AST Serialization (bytecode cache) ─────────────────────────────────
+ * Serialize the parse tree to a flat byte buffer so it can be persisted to
+ * disk (.lrfile) and re-executed later without re-lexing/re-parsing. */
+uint8_t *lr_ast_serialize(ASTNode *root, size_t *out_len);
+ASTNode *lr_ast_deserialize(const uint8_t *buf, size_t len, Parser **out_parser);
 
 #ifdef __cplusplus
 }

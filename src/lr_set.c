@@ -454,7 +454,14 @@ static LRValue js_set_constructor(JSContext *ctx, JSValueConst this_val,
         }
     }
 
+    lr_set_property_str(ctx, set, "size", lr_new_int32(ctx, sd->count));
     return set;
+}
+
+/* Keep the instance "size" data property in sync with the hash table */
+static void set_sync_size(JSContext *ctx, JSValueConst set_obj, LRSetData *sd)
+{
+    lr_set_property_str(ctx, set_obj, "size", lr_new_int32(ctx, sd->count));
 }
 
 /* ── Set.prototype.add ─────────────────────────────────────────────────── */
@@ -473,6 +480,7 @@ static LRValue js_set_add(JSContext *ctx, JSValueConst this_val,
 
     LRValue value = (argc > 0) ? argv[0] : LR_VALUE_UNDEFINED;
     set_data_add(ctx, sd, value);
+    set_sync_size(ctx, this_val, sd);
 
     return lr_dup_value(ctx, this_val);
 }
@@ -530,6 +538,7 @@ static LRValue js_set_delete(JSContext *ctx, JSValueConst this_val,
             sd->entries[idx].alive = 0;
             sd->count--;
             sd->iter_count++;
+            set_sync_size(ctx, this_val, sd);
             return LR_VALUE_TRUE;
         }
         idx = (idx + 1) & (sd->capacity - 1);
@@ -562,6 +571,7 @@ static LRValue js_set_clear(JSContext *ctx, JSValueConst this_val,
     }
     sd->count = 0;
     sd->iter_count++;
+    set_sync_size(ctx, this_val, sd);
 
     return LR_VALUE_UNDEFINED;
 }

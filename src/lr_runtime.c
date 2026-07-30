@@ -4,6 +4,8 @@
  */
 #include "lr_platform.h"
 
+#include <math.h>
+
 #include "lr_runtime.h"
 #include "lr_renderer.h"
 
@@ -180,6 +182,78 @@ int lr_check_system_memory(size_t min_bytes)
 
 /* ── File loading ─────────────────────────────────────────────────────── */
 
+/* Convert a UTF-16 buffer (without BOM) to a NUL-terminated UTF-8 buffer.
+ * Handles surrogate pairs. Returns malloc'd buffer, sets *out_len. */
+static uint8_t *lr_utf16_to_utf8(const uint8_t *data, size_t len, int big_endian,
+                                 size_t *out_len)
+{
+    size_t units = len / 2;
+    /* Worst case: every unit becomes 3 bytes (pairs become 4 from 2 units). */
+    uint8_t *out = malloc(units * 3 + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (size_t i = 0; i < units; i++) {
+        uint32_t cp = big_endian
+            ? ((uint32_t)data[i * 2] << 8) | data[i * 2 + 1]
+            : ((uint32_t)data[i * 2 + 1] << 8) | data[i * 2];
+        /* Surrogate pair */
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < units) {
+            uint32_t lo = big_endian
+                ? ((uint32_t)data[(i + 1) * 2] << 8) | data[(i + 1) * 2 + 1]
+                : ((uint32_t)data[(i + 1) * 2 + 1] << 8) | data[(i + 1) * 2];
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                i++;
+            }
+        }
+        if (cp < 0x80) {
+            out[o++] = (uint8_t)cp;
+        } else if (cp < 0x800) {
+            out[o++] = (uint8_t)(0xC0 | (cp >> 6));
+            out[o++] = (uint8_t)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out[o++] = (uint8_t)(0xE0 | (cp >> 12));
+            out[o++] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+            out[o++] = (uint8_t)(0x80 | (cp & 0x3F));
+        } else {
+            out[o++] = (uint8_t)(0xF0 | (cp >> 18));
+            out[o++] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+            out[o++] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+            out[o++] = (uint8_t)(0x80 | (cp & 0x3F));
+        }
+    }
+    out[o] = '\0';
+    *out_len = o;
+    return out;
+}
+
+/* BOM support: strip a UTF-8 BOM in place, or transcode UTF-16 LE/BE input
+ * to UTF-8. The returned buffer replaces *pbuf (freeing the old one). */
+static void lr_apply_bom(uint8_t **pbuf, size_t *plen)
+{
+    uint8_t *buf = *pbuf;
+    size_t len = *plen;
+    if (len >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF) {
+        /* UTF-8 BOM: skip */
+        memmove(buf, buf + 3, len - 3);
+        len -= 3;
+        buf[len] = '\0';
+        *plen = len;
+        return;
+    }
+    if (len >= 2 && ((buf[0] == 0xFF && buf[1] == 0xFE) ||
+                     (buf[0] == 0xFE && buf[1] == 0xFF))) {
+        int be = (buf[0] == 0xFE);
+        size_t new_len = 0;
+        uint8_t *utf8 = lr_utf16_to_utf8(buf + 2, len - 2, be, &new_len);
+        if (utf8) {
+            free(buf);
+            *pbuf = utf8;
+            *plen = new_len;
+        }
+    }
+}
+
 uint8_t *lr_load_file(LR_Runtime *rt, const char *filename, size_t *out_len)
 {
     FILE *f = fopen(filename, "rb");
@@ -215,6 +289,9 @@ uint8_t *lr_load_file(LR_Runtime *rt, const char *filename, size_t *out_len)
 
     buf[size] = '\0';
     *out_len = size;
+
+    /* BOM handling: UTF-8 BOM strip, UTF-16 LE/BE transcode to UTF-8. */
+    lr_apply_bom(&buf, out_len);
     return buf;
 }
 
@@ -269,11 +346,52 @@ static char *lr_module_normalize(JSContext *ctx, const char *base_name,
     return result;
 }
 
+/* ── Module registry helpers (per context) ─────────────────────────────── */
+
+static char *lr_str_dup2(const char *s)
+{
+    if (!s) s = "";
+    char *r = (char *)malloc(strlen(s) + 1);
+    if (r) strcpy(r, s);
+    return r;
+}
+
+static LRModuleCacheEntry *lr_module_find(LRContext *ctx, const char *name)
+{
+    LRModuleCacheEntry *e = (LRModuleCacheEntry *)ctx->module_registry;
+    for (; e; e = e->next)
+        if (e->name && strcmp(e->name, name) == 0) return e;
+    return NULL;
+}
+
+static JSModuleDef *lr_module_register(LRContext *ctx, const char *name, LRValue ns)
+{
+    LRModuleCacheEntry *entry = (LRModuleCacheEntry *)calloc(1, sizeof(*entry));
+    if (!entry) return NULL;
+    LRModuleDef *def = (LRModuleDef *)calloc(1, sizeof(*def));
+    if (!def) { free(entry); return NULL; }
+    entry->name = lr_str_dup2(name);
+    def->name = lr_str_dup2(name);
+    def->obj = (ns.tag == LR_TYPE_OBJECT) ? (LRObject *)ns.u.ptr : NULL;
+    if (def->obj) def->obj->ref_count++;   /* registry owns a reference */
+    def->evaluated = 1;
+    def->ctx = ctx;
+    entry->def = def;
+    entry->next = (LRModuleCacheEntry *)ctx->module_registry;
+    ctx->module_registry = entry;
+    return def;
+}
+
 static JSModuleDef *lr_module_loader(JSContext *ctx, const char *name, void *opaque)
 {
     LR_Runtime *rt = (LR_Runtime *)opaque;
 
-    size_t buf_len;
+    /* Already resolved and evaluated? Return the cached definition. */
+    LRModuleCacheEntry *existing = lr_module_find(ctx, name);
+    if (existing && existing->def && existing->def->evaluated)
+        return existing->def;
+
+    size_t buf_len = 0;
     uint8_t *buf = lr_load_file(rt, name, &buf_len);
     if (!buf) {
         JS_ThrowReferenceError(ctx, "Cannot load module '%s': %s", name,
@@ -281,37 +399,21 @@ static JSModuleDef *lr_module_loader(JSContext *ctx, const char *name, void *opa
         return NULL;
     }
 
-    /* Determine if it's a module */
-    int is_module = JS_DetectModule((const char *)buf, buf_len);
-    int eval_flags = JS_EVAL_TYPE_MODULE;
-    if (!is_module) {
-        /* Treat as module anyway for .mjs, or if forced */
-        eval_flags = JS_EVAL_TYPE_MODULE;
-    }
-
-    JSValue func_val = JS_Eval(ctx, (const char *)buf, buf_len, name,
-                                eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
+    /* Parse + execute the module and obtain its populated namespace object. */
+    LRValue ns = LR_VALUE_UNDEFINED;
+    LRValue ret = lr_engine_run_module(ctx, (const char *)buf, buf_len, name, &ns);
     free(buf);
 
-    if (JS_IsException(func_val)) {
-        lr_check_exception(rt);
-        return NULL;
-    }
-
-    /* Set import.meta */
-    js_module_set_import_meta(ctx, func_val, TRUE, TRUE);
-
-    JSValue ret = JS_EvalFunction(ctx, func_val);
     if (JS_IsException(ret)) {
-        JS_FreeValue(ctx, ret);
+        lr_free_value(ctx, ns);
         lr_check_exception(rt);
         return NULL;
     }
-    JS_FreeValue(ctx, ret);
+    lr_free_value(ctx, ret);
 
-    /* Return the module from the function */
-    JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(func_val);
-    return m;
+    JSModuleDef *def = lr_module_register(ctx, name, ns);
+    lr_free_value(ctx, ns);   /* registration holds its own reference */
+    return def;
 }
 
 /* ── Runtime lifecycle ────────────────────────────────────────────────── */
@@ -393,9 +495,8 @@ LR_Runtime *lr_runtime_new(const LR_Config *cfg)
     /* Initialize GC context */
     lr_gc_init(&rt->gc_ctx, rt);
 
-    /* Initialize bytecode cache */
-    lr_bytecode_cache_init(&rt->bytecode_cache, rt,
-                           cfg->bytecode_cache_dir);
+    /* Initialize IOME586 result cache */
+    lr_iome586_init(&rt->iome586, rt, cfg->bytecode_cache_dir);
 
     /* Apply GC configuration */
     {
@@ -461,8 +562,8 @@ void lr_runtime_free(LR_Runtime *rt)
     /* Cleanup GC context */
     lr_gc_destroy(&rt->gc_ctx);
 
-    /* Cleanup bytecode cache */
-    lr_bytecode_cache_destroy(&rt->bytecode_cache);
+    /* Cleanup IOME586 result cache */
+    lr_iome586_destroy(&rt->iome586);
 
     /* Cleanup renderer bridge */
     if (g_lr_renderer_bridge) {
@@ -552,75 +653,111 @@ int lr_eval(LR_Runtime *rt, const char *source, size_t source_len,
     return 0;
 }
 
+/* Shared cached executor for both plain scripts (is_module=0) and ES modules
+ * (is_module=1). This is what makes the cache ES2022-complete: modules used to
+ * bypass the cache entirely (lr_eval_module went straight to JS_Eval).
+ *
+ * Warm path (archive hit):
+ *   - deserialize the archived AST (skip lex+parse),
+ *   - STATIC restore: rebind the archived global-variable snapshot so primitive
+ *     globals are present immediately,
+ *   - DYNAMIC re-run: re-execute the deserialized AST. The interpreter
+ *     re-establishes function/class bindings (needed for them to stay callable),
+ *     re-runs I/O and any side effects, and recomputes primitives, so the result
+ *     is always correct regardless of how "dynamic" the script is. The module
+ *     flag is read from the archive so a cached module is re-executed as a module.
+ *
+ * Cold path: parse + execute + archive (the 15% rule may discard it). */
+static int lr_exec_file_cached(LR_Runtime *rt, const char *filename,
+                                uint8_t *buf, size_t buf_len, int is_module)
+{
+    LRContext *ctx = rt->lr_ctx;
+    int ret = -1;
+
+    /* Warm path: IOME586 archive hit. */
+    LR_Iome586Manifest mf;
+    if (lr_iome586_load(&rt->iome586, filename, buf, buf_len, &mf) == 0) {
+        Parser *dparser = NULL;
+        ASTNode *ast = lr_ast_deserialize(mf.ast, mf.ast_len, &dparser);
+        if (ast) {
+            int warm_module = (mf.flags & LR_IOME586_FLAG_MODULE) ? 1 : 0;
+            /* static restore: rebind the archived global-variable snapshot */
+            lr_iome586_restore_globals(ctx, &mf);
+            /* dynamic re-run: re-execute the deserialized AST */
+            LRValue result = lr_engine_eval_ast(ctx, ast, dparser,
+                                                warm_module, filename);
+            if (lr_is_exception(result)) {
+                lr_check_exception(rt);
+                lr_free_value(ctx, result);
+                /* fall through and recompile from source */
+            } else {
+                lr_free_value(ctx, result);
+                ret = 0;
+            }
+        }
+        lr_iome586_manifest_free(&mf);
+    }
+
+    if (ret != 0) {
+        /* Cold path (cache-while-running):
+         *   1. parse the source (timed),
+         *   2. open a WRITING archive on disk before execution starts,
+         *   3. execute,
+         *   4. commit the archive with the interpreter results (globals,
+         *      per-node results, run state). The 15% rule may discard it. */
+        int want_cache = rt->iome586.enabled;
+        uint8_t *bc = NULL;
+        size_t bc_len = 0;
+
+        int64_t t0 = lr_get_time_us();
+        void *unit = lr_engine_parse_unit(ctx, (const char *)buf, buf_len,
+                                          is_module, filename,
+                                          want_cache ? &bc : NULL,
+                                          want_cache ? &bc_len : NULL);
+        if (!unit) {
+            lr_check_exception(rt);
+            free(bc);
+            return -1;
+        }
+        int64_t parse_us = lr_get_time_us() - t0;
+
+        LR_Iome586Writer w;
+        int writing = 0;
+        if (bc) {
+            uint32_t flags = (rt->config.strict_mode ? LR_IOME586_FLAG_STRICT : 0)
+                           | (is_module ? LR_IOME586_FLAG_MODULE : 0);
+            if (lr_iome586_begin(&rt->iome586, filename, buf, buf_len,
+                                 bc, bc_len, flags, parse_us, &w) == 0)
+                writing = 1;   /* begin took ownership of bc */
+        }
+
+        const ASTNode *prog = lr_engine_unit_ast_handle(unit);
+        int64_t t1 = lr_get_time_us();
+        LRValue result = lr_engine_exec_unit_handle(ctx, unit, is_module, filename);
+        int64_t exec_us = lr_get_time_us() - t1;
+
+        if (lr_is_exception(result)) {
+            lr_check_exception(rt);
+            lr_free_value(ctx, result);
+            if (writing)
+                lr_iome586_abort(&rt->iome586, &w);  /* rollback to .bak */
+            return -1;
+        }
+        lr_free_value(ctx, result);
+        if (writing)
+            lr_iome586_commit(&rt->iome586, &w, ctx, prog, exec_us);
+        ret = 0;
+    }
+
+    return ret;
+}
+
 int lr_eval_file(LR_Runtime *rt, const char *filename)
 {
     size_t buf_len;
     uint8_t *buf = lr_load_file(rt, filename, &buf_len);
     if (!buf) return -1;
-
-    /* Try bytecode cache first */
-    size_t bc_len = 0;
-    uint8_t *bc = lr_bytecode_cache_load(&rt->bytecode_cache, filename,
-                                         buf, buf_len, &bc_len);
-    int ret;
-    if (bc) {
-        /* Cache hit: execute from bytecode */
-        JSValue obj = JS_ReadObject(rt->lr_ctx, bc, bc_len,
-                                     JS_READ_OBJ_BYTECODE);
-        free(bc);
-        if (JS_IsException(obj)) {
-            lr_check_exception(rt);
-            JS_FreeValue(rt->lr_ctx, obj);
-            free(buf);
-            return -1;
-        }
-        /* obj is a function, execute it */
-        JSValue result = JS_EvalFunction(rt->lr_ctx, obj);
-        if (JS_IsException(result)) {
-            lr_check_exception(rt);
-            JS_FreeValue(rt->lr_ctx, result);
-            free(buf);
-            return -1;
-        }
-        JS_FreeValue(rt->lr_ctx, result);
-        ret = 0;
-    } else {
-        /* Cache miss: compile normally */
-        int eval_flags = JS_EVAL_TYPE_GLOBAL;
-        if (rt->config.strict_mode) eval_flags |= JS_EVAL_FLAG_STRICT;
-
-        JSValue val = JS_Eval(rt->lr_ctx, (const char *)buf, buf_len,
-                              filename, eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
-        if (JS_IsException(val)) {
-            lr_check_exception(rt);
-            JS_FreeValue(rt->lr_ctx, val);
-            free(buf);
-            return -1;
-        }
-
-        /* Serialize bytecode for cache */
-        uint8_t *bc_out;
-        size_t bc_out_len;
-        bc_out = JS_WriteObject(rt->lr_ctx, &bc_out_len, val,
-                                 JS_WRITE_OBJ_BYTECODE);
-        if (bc_out) {
-            lr_bytecode_cache_store(&rt->bytecode_cache, filename,
-                                    buf, buf_len, bc_out, bc_out_len,
-                                    rt->config.strict_mode ? LR_BYTECODE_FLAG_STRICT : 0);
-            free(bc_out);
-        }
-
-        JSValue result = JS_EvalFunction(rt->lr_ctx, val);
-        if (JS_IsException(result)) {
-            lr_check_exception(rt);
-            JS_FreeValue(rt->lr_ctx, result);
-            free(buf);
-            return -1;
-        }
-        JS_FreeValue(rt->lr_ctx, result);
-        ret = 0;
-    }
-
+    int r = lr_exec_file_cached(rt, filename, buf, buf_len, 0);
     free(buf);
 
     /* Simplified GC check */
@@ -629,33 +766,16 @@ int lr_eval_file(LR_Runtime *rt, const char *filename)
         lr_gc_before_alloc(&rt->gc_ctx);
     }
 
-    return ret;
+    return r;
 }
 
 int lr_eval_module(LR_Runtime *rt, const char *source, size_t source_len,
                    const char *filename)
 {
-    int eval_flags = JS_EVAL_TYPE_MODULE;
-
-    JSValue val = JS_Eval(rt->lr_ctx, source, source_len, filename,
-                           eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
-    if (JS_IsException(val)) {
-        lr_check_exception(rt);
-        return -1;
-    }
-
-    js_module_set_import_meta(rt->lr_ctx, val, TRUE, TRUE);
-    JSValue ret = JS_EvalFunction(rt->lr_ctx, val);
-    JS_FreeValue(rt->lr_ctx, val);
-
-    if (JS_IsException(ret)) {
-        lr_check_exception(rt);
-        JS_FreeValue(rt->lr_ctx, ret);
-        return -1;
-    }
-
-    JS_FreeValue(rt->lr_ctx, ret);
-    return 0;
+    /* Cache-aware module execution. import.meta is a no-op stub in this
+     * engine, so routing through the shared cached executor is equivalent to
+     * the previous JS_Eval(COMPILE_ONLY)+EvalFunction path. */
+    return lr_exec_file_cached(rt, filename, (uint8_t *)source, source_len, 1);
 }
 
 /* ── Event loop ───────────────────────────────────────────────────────── */
@@ -778,16 +898,16 @@ void lr_gc_reset_stats(LR_Runtime *rt)
     lr_gc_ctx_reset_stats(&rt->gc_ctx);
 }
 
-/* ── Bytecode cache ───────────────────────────────────────────────────── */
+/* ── IOME586 result cache (public API keeps the historical names) ──────── */
 
 void lr_bytecode_cache_stats(LR_Runtime *rt, FILE *fp)
 {
-    lr_bytecode_cache_stats_ctx(&rt->bytecode_cache, fp);
+    lr_iome586_stats(&rt->iome586, fp);
 }
 
 void lr_bytecode_cache_clear(LR_Runtime *rt)
 {
-    lr_bytecode_cache_clear_ctx(&rt->bytecode_cache);
+    lr_iome586_clear(&rt->iome586);
 }
 
 /* ── Memory usage ─────────────────────────────────────────────────────── */
@@ -935,6 +1055,10 @@ void lr_register_builtins(LR_Runtime *rt)
 
     /* ES2020 globalThis */
     JS_SetPropertyStr(ctx, global, "globalThis", JS_DupValue(ctx, global));
+
+    /* Global numeric constants */
+    JS_SetPropertyStr(ctx, global, "NaN",      JS_NewFloat64(ctx, NAN));
+    JS_SetPropertyStr(ctx, global, "Infinity", JS_NewFloat64(ctx, INFINITY));
 
     JS_FreeValue(ctx, global);
 

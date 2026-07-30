@@ -1,0 +1,27 @@
+========================================
+  L/R_JS v0.1.0 Build Script
+========================================
+
+[1/3] Building for Windows x64...
+build\x64\bin\Release - The process cannot access the file because it is being used by another process.
+A subdirectory or file build\x64 already exists.
+x64 build completed!
+x64 package created!
+
+[2/3] Building for Windows x86 (Win32)...
+x86 build completed!
+x86 package created!
+
+[3/3] Building for Windows ARM64...
+ARM64 build completed!
+ARM64 package created!
+
+========================================
+  All builds completed successfully!
+========================================
+
+Packages:
+  - releases\LR_JS-0.1.0-windows-x64.zip
+  - releases\LR_JS-0.1.0-windows-x86.zip
+  - releases\LR_JS-0.1.0-windows-arm64.zip
+

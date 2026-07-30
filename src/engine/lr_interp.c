@@ -66,6 +66,14 @@ static LRValue eval_export(Interpreter *interp, ASTNode *node);
 static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
                                      LRValue this_val, int argc, LRValue *argv);
 
+/* Call a class "constructor" (field init + explicit/implicit constructor) */
+static LRValue interp_call_class_function(Interpreter *interp, ASTNode *class_node,
+                                          LRValue this_val, int argc, LRValue *argv);
+
+/* Dispatch any callable AST node (function, arrow, or class) */
+static LRValue interp_invoke_function_ast(Interpreter *interp, ASTNode *ast,
+                                          LRValue this_val, int argc, LRValue *argv);
+
 /* ── Scope Management ──────────────────────────────────────────────────── */
 
 static InterpScope *scope_new(InterpScope *parent, int is_function, int is_global)
@@ -73,6 +81,8 @@ static InterpScope *scope_new(InterpScope *parent, int is_function, int is_globa
     InterpScope *s = (InterpScope *)calloc(1, sizeof(InterpScope));
     if (!s) return NULL;
     s->parent = parent;
+    if (parent) parent->refcount++;   /* child keeps its parent chain alive */
+    s->refcount = 1;
     s->is_function_scope = is_function;
     s->is_global_scope = is_global;
     s->capacity = SCOPE_INIT_CAP;
@@ -82,17 +92,39 @@ static InterpScope *scope_new(InterpScope *parent, int is_function, int is_globa
     return s;
 }
 
-static void scope_free(InterpScope *scope, LRContext *ctx)
+/* Drop one reference; frees the scope (and cascades up the parent chain)
+ * when the count reaches zero. */
+static void scope_release(InterpScope *scope, LRContext *ctx)
 {
-    if (!scope) return;
-    for (int i = 0; i < scope->count; i++) {
-        if (scope->names[i]) free(scope->names[i]);
-        lr_free_value(ctx, scope->values[i]);
+    while (scope) {
+        if (--scope->refcount > 0) return;
+        InterpScope *parent = scope->parent;
+        for (int i = 0; i < scope->count; i++) {
+            if (scope->names[i]) free(scope->names[i]);
+            lr_free_value(ctx, scope->values[i]);
+        }
+        free(scope->names);
+        free(scope->values);
+        free(scope->is_const);
+        free(scope);
+        scope = parent;   /* release the reference this child held */
     }
-    free(scope->names);
-    free(scope->values);
-    free(scope->is_const);
-    free(scope);
+}
+
+/* Hook target for lr_engine: release a function object's captured scope */
+static void interp_closure_release_hook(void *scope, LRContext *ctx)
+{
+    scope_release((InterpScope *)scope, ctx);
+}
+
+/* Capture the current scope into a function object for lexical closures */
+static void interp_capture_closure(Interpreter *interp, LRValue fn_obj)
+{
+    if (fn_obj.tag != LR_TYPE_OBJECT || !interp->current_scope) return;
+    LRObject *o = (LRObject *)fn_obj.u.ptr;
+    if (o->def_scope) return;
+    interp->current_scope->refcount++;
+    o->def_scope = interp->current_scope;
 }
 
 static void interp_push_scope(Interpreter *interp, int is_function_scope)
@@ -109,8 +141,7 @@ static void interp_pop_scope(Interpreter *interp)
     if (!interp->current_scope) return;
     InterpScope *old = interp->current_scope;
     interp->current_scope = old->parent;
-    old->parent = NULL; /* prevent freeing parent chain */
-    scope_free(old, interp->ctx);
+    scope_release(old, interp->ctx);
 }
 
 /* Find the nearest function scope (or global) - for var hoisting */
@@ -575,9 +606,7 @@ static LRValue eval_binary(Interpreter *interp, ASTNode *node)
         }
         const char *prop = lr_to_cstring(interp->ctx, left);
         LRString *atom = lr_new_atom(interp->ctx, prop);
-        LRValue pv = lr_get_property(interp->ctx, right, atom);
-        result = lr_new_bool(interp->ctx, !lr_is_undefined(pv));
-        lr_free_value(interp->ctx, pv);
+        result = lr_new_bool(interp->ctx, lr_has_property(interp->ctx, right, atom));
         lr_free_cstring(interp->ctx, prop);
     } else if (strcmp(op, "instanceof") == 0) {
         /* obj instanceof Func - check right.prototype in left's prototype chain */
@@ -1222,8 +1251,62 @@ static LRValue eval_call(Interpreter *interp, ASTNode *node)
     LRValue this_val = LR_VALUE_UNDEFINED;
     LRValue callee;
 
+    /* super(...) call inside a derived class constructor */
+    if (callee_node->type == AST_SUPER) {
+        LRValue sup = LR_VALUE_UNDEFINED;
+        if (!scope_lookup_internal(interp->current_scope, "%superctor%", &sup)) {
+            if (argv) { for (int i = 0; i < argc; i++) lr_free_value(interp->ctx, argv[i]); free(argv); }
+            snprintf(interp->error_message, sizeof(interp->error_message),
+                     "'super' keyword unexpected here");
+            interp->error_flag = 1;
+            return LR_VALUE_UNDEFINED;
+        }
+        if (!scope_lookup_internal(interp->current_scope, "this", &this_val)) {
+            this_val = LR_VALUE_UNDEFINED;
+        }
+        LRValue result_sup = LR_VALUE_UNDEFINED;
+        if (sup.tag == LR_TYPE_OBJECT) {
+            LRObject *so = (LRObject *)sup.u.ptr;
+            if (so->type == LR_OBJ_FUNCTION && so->extra) {
+                interp->pending_closure = so->def_scope;
+                result_sup = interp_invoke_function_ast(interp, (ASTNode *)so->extra,
+                                                        this_val, argc, argv);
+            } else {
+                /* C-function base class (e.g. Error): call on this */
+                lr_push_call_frame(interp->ctx, "super", NULL, 0);
+                result_sup = lr_call(interp->ctx, sup, this_val, argc, argv);
+                lr_pop_call_frame(interp->ctx);
+            }
+        }
+        if (argv) { for (int i = 0; i < argc; i++) lr_free_value(interp->ctx, argv[i]); free(argv); }
+        lr_free_value(interp->ctx, this_val);
+        lr_free_value(interp->ctx, sup);
+        return result_sup;
+    }
+
+    /* super.method(...) call: look up on parent prototype, this = current this */
+    if ((callee_node->type == AST_MEMBER || callee_node->type == AST_COMPUTED_MEMBER) &&
+        callee_node->u.member.obj && callee_node->u.member.obj->type == AST_SUPER) {
+        LRValue sproto = LR_VALUE_UNDEFINED;
+        scope_lookup_internal(interp->current_scope, "%superproto%", &sproto);
+        if (callee_node->type == AST_MEMBER &&
+            callee_node->u.member.prop &&
+            callee_node->u.member.prop->type == AST_IDENTIFIER) {
+            callee = lr_get_property_str(interp->ctx, sproto,
+                                         callee_node->u.member.prop->u.ident.name);
+        } else {
+            LRValue pk = interp_eval_node(interp, callee_node->u.member.prop);
+            LRString *atom = lr_to_atom(interp->ctx, pk);
+            callee = lr_get_property(interp->ctx, sproto, atom);
+            lr_free_value(interp->ctx, pk);
+        }
+        lr_free_value(interp->ctx, sproto);
+        if (!scope_lookup_internal(interp->current_scope, "this", &this_val)) {
+            this_val = LR_VALUE_UNDEFINED;
+        }
+    }
     /* Check if this is a method call (member expression as callee) */
-    if (callee_node->type == AST_MEMBER) {
+    else if (callee_node->type == AST_MEMBER) {
         this_val = interp_eval_node(interp, callee_node->u.member.obj);
         if (interp->error_flag) {
             if (argv) { for (int i = 0; i < argc; i++) lr_free_value(interp->ctx, argv[i]); free(argv); }
@@ -1338,7 +1421,8 @@ static LRValue eval_call(Interpreter *interp, ASTNode *node)
             /* Interpreted function object - try to get the AST from extra */
             if (obj->extra) {
                 ASTNode *func_ast = (ASTNode *)obj->extra;
-                result = interp_call_function(interp, func_ast, this_val, argc, argv);
+                interp->pending_closure = obj->def_scope;
+                result = interp_invoke_function_ast(interp, func_ast, this_val, argc, argv);
                 goto call_done;
             }
         }
@@ -1463,44 +1547,105 @@ static LRValue eval_conditional(Interpreter *interp, ASTNode *node)
     }
 }
 
+static LRValue call_value_with_args(Interpreter *interp, ASTNode *callee_node,
+                                    LRValue callee, LRValue this_val,
+                                    int argc, LRValue *argv);
+
+/* Spread `src` into array `arr` starting at *out_idx. Supports arrays,
+ * strings, and iterables (Symbol.iterator, e.g. generator objects).
+ * Returns 0 on success, -1 on error (error_flag set). */
+static int spread_into_array(Interpreter *interp, LRValue arr, LRValue src, uint32_t *out_idx)
+{
+    LRContext *ctx = interp->ctx;
+    if (lr_is_array(ctx, src)) {
+        int32_t len = 0;
+        LRValue len_val = lr_get_property_str(ctx, src, "length");
+        lr_to_int32(ctx, &len, len_val);
+        lr_free_value(ctx, len_val);
+        for (int32_t j = 0; j < len; j++) {
+            LRValue item = lr_get_property_uint32(ctx, src, (uint32_t)j);
+            lr_set_property_uint32(ctx, arr, (*out_idx)++, item);
+        }
+        return 0;
+    }
+    if (lr_is_string(src)) {
+        const char *s = lr_to_cstring(ctx, src);
+        size_t slen = s ? strlen(s) : 0;
+        char buf[2];
+        for (size_t j = 0; j < slen; j++) {
+            buf[0] = s[j]; buf[1] = '\0';
+            lr_set_property_uint32(ctx, arr, (*out_idx)++, lr_new_string(ctx, buf));
+        }
+        lr_free_cstring(ctx, s);
+        return 0;
+    }
+    if (lr_is_object(src)) {
+        LRValue iter_fn = lr_get_property_str(ctx, src, "Symbol.iterator");
+        if (lr_is_function(ctx, iter_fn)) {
+            LRValue iter = call_value_with_args(interp, NULL, iter_fn, src, 0, NULL);
+            lr_free_value(ctx, iter_fn);
+            if (interp->error_flag) { lr_free_value(ctx, iter); return -1; }
+            if (lr_is_object(iter)) {
+                LRValue next_fn = lr_get_property_str(ctx, iter, "next");
+                while (!interp->error_flag) {
+                    LRValue nr = call_value_with_args(interp, NULL, next_fn, iter, 0, NULL);
+                    if (interp->error_flag) { lr_free_value(ctx, nr); break; }
+                    LRValue done = lr_get_property_str(ctx, nr, "done");
+                    int is_done = lr_to_bool(ctx, done);
+                    lr_free_value(ctx, done);
+                    if (is_done) { lr_free_value(ctx, nr); break; }
+                    LRValue value = lr_get_property_str(ctx, nr, "value");
+                    lr_set_property_uint32(ctx, arr, (*out_idx)++, value);
+                    lr_free_value(ctx, nr);
+                }
+                lr_free_value(ctx, next_fn);
+            }
+            lr_free_value(ctx, iter);
+            return interp->error_flag ? -1 : 0;
+        }
+        lr_free_value(ctx, iter_fn);
+    }
+    snprintf(interp->error_message, sizeof(interp->error_message),
+             "value is not iterable (cannot spread)");
+    interp->exception_value = LR_VALUE_UNDEFINED;
+    interp->error_flag = 1;
+    return -1;
+}
+
 static LRValue eval_array(Interpreter *interp, ASTNode *node)
 {
     LRValue arr = lr_new_array(interp->ctx);
     int nelem = node->u.array.nelem;
     ASTNode **elements = node->u.array.elements;
+    uint32_t out = 0;
 
     for (int i = 0; i < nelem; i++) {
         ASTNode *elem = elements[i];
         if (elem == NULL) {
             /* Array hole - skip (remains undefined) */
+            out++;
             continue;
         }
         if (elem->type == AST_SPREAD_ELEMENT) {
             /* Spread element */
             LRValue spread_val = interp_eval_node(interp, elem->u.spread.arg);
             if (interp->error_flag) { lr_free_value(interp->ctx, arr); lr_free_value(interp->ctx, spread_val); return LR_VALUE_UNDEFINED; }
-            if (lr_is_array(interp->ctx, spread_val)) {
-                int32_t len = 0;
-                LRValue len_val = lr_get_property_str(interp->ctx, spread_val, "length");
-                lr_to_int32(interp->ctx, &len, len_val);
-                lr_free_value(interp->ctx, len_val);
-                for (int32_t j = 0; j < len; j++) {
-                    LRValue item = lr_get_property_uint32(interp->ctx, spread_val, j);
-                    /* lr_set_property_uint32 takes ownership of item */
-                    lr_set_property_uint32(interp->ctx, arr, i, item);
-                }
+            if (spread_into_array(interp, arr, spread_val, &out) != 0) {
+                lr_free_value(interp->ctx, spread_val);
+                lr_free_value(interp->ctx, arr);
+                return LR_VALUE_UNDEFINED;
             }
             lr_free_value(interp->ctx, spread_val);
         } else {
             LRValue val = interp_eval_node(interp, elem);
             if (interp->error_flag) { lr_free_value(interp->ctx, arr); lr_free_value(interp->ctx, val); return LR_VALUE_UNDEFINED; }
             /* lr_set_property_uint32 takes ownership of val, do NOT free it */
-            lr_set_property_uint32(interp->ctx, arr, i, val);
+            lr_set_property_uint32(interp->ctx, arr, out++, val);
         }
     }
 
     /* Set length */
-    lr_set_property_str(interp->ctx, arr, "length", lr_new_int32(interp->ctx, nelem));
+    lr_set_property_str(interp->ctx, arr, "length", lr_new_int32(interp->ctx, (int32_t)out));
     return arr;
 }
 
@@ -1534,16 +1679,25 @@ static LRValue eval_object(Interpreter *interp, ASTNode *node)
             ASTNode *val_node = prop->u.property.val;
             int shorthand = prop->u.property.shorthand;
 
+            /* Accessor property: { get x() {...} } / { set x(v) {...} } */
+            int is_accessor = (val_node && val_node->type == AST_FUNC_EXPR &&
+                               (val_node->u.func.is_getter || val_node->u.func.is_setter));
+
             LRValue key_val;
             if (key_node->type == AST_IDENTIFIER) {
                 const char *kname = key_node->u.ident.name;
-                if (shorthand) {
-                    /* { x } is shorthand for { x: x } */
-                    LRValue val = interp_eval_node(interp, val_node);
-                    if (interp->error_flag) { lr_free_value(interp->ctx, obj); lr_free_value(interp->ctx, val); return LR_VALUE_UNDEFINED; }
-                    /* lr_set_property_str takes ownership of val */
-                    lr_set_property_str(interp->ctx, obj, kname, val);
+                if (is_accessor) {
+                    LRValue fn = eval_func_expr(interp, val_node);
+                    if (val_node->u.func.is_getter) {
+                        lr_set_accessor_property_str(interp->ctx, obj, kname,
+                                                     fn, LR_VALUE_UNDEFINED);
+                    } else {
+                        lr_set_accessor_property_str(interp->ctx, obj, kname,
+                                                     LR_VALUE_UNDEFINED, fn);
+                    }
                 } else {
+                    /* Regular or shorthand property: { x: v } / { x } */
+                    (void)shorthand;
                     LRValue val = interp_eval_node(interp, val_node);
                     if (interp->error_flag) { lr_free_value(interp->ctx, obj); lr_free_value(interp->ctx, val); return LR_VALUE_UNDEFINED; }
                     /* lr_set_property_str takes ownership of val */
@@ -1553,11 +1707,22 @@ static LRValue eval_object(Interpreter *interp, ASTNode *node)
                 /* Computed or literal key */
                 key_val = interp_eval_node(interp, key_node);
                 if (interp->error_flag) { lr_free_value(interp->ctx, obj); lr_free_value(interp->ctx, key_val); return LR_VALUE_UNDEFINED; }
-                LRValue val = interp_eval_node(interp, val_node);
-                if (interp->error_flag) { lr_free_value(interp->ctx, obj); lr_free_value(interp->ctx, key_val); lr_free_value(interp->ctx, val); return LR_VALUE_UNDEFINED; }
                 LRString *atom = lr_to_atom(interp->ctx, key_val);
-                /* lr_set_property takes ownership of val */
-                lr_set_property(interp->ctx, obj, atom, val);
+                if (is_accessor) {
+                    LRValue fn = eval_func_expr(interp, val_node);
+                    if (val_node->u.func.is_getter) {
+                        lr_set_accessor_property(interp->ctx, obj, atom,
+                                                 fn, LR_VALUE_UNDEFINED);
+                    } else {
+                        lr_set_accessor_property(interp->ctx, obj, atom,
+                                                 LR_VALUE_UNDEFINED, fn);
+                    }
+                } else {
+                    LRValue val = interp_eval_node(interp, val_node);
+                    if (interp->error_flag) { lr_free_value(interp->ctx, obj); lr_free_value(interp->ctx, key_val); lr_free_value(interp->ctx, val); return LR_VALUE_UNDEFINED; }
+                    /* lr_set_property takes ownership of val */
+                    lr_set_property(interp->ctx, obj, atom, val);
+                }
                 lr_free_value(interp->ctx, key_val);
             }
         }
@@ -1575,6 +1740,8 @@ static LRValue eval_func_expr(Interpreter *interp, ASTNode *node)
         o->type = LR_OBJ_FUNCTION;
         /* Store the AST node as extra data so we can find it later */
         o->extra = (void *)node;
+        /* Capture the defining scope for lexical closures */
+        interp_capture_closure(interp, obj);
     }
     return obj;
 }
@@ -1587,25 +1754,163 @@ static LRValue eval_arrow(Interpreter *interp, ASTNode *node)
         LRObject *o = (LRObject *)obj.u.ptr;
         o->type = LR_OBJ_FUNCTION;
         o->extra = (void *)node;
+        interp_capture_closure(interp, obj);
     }
     return obj;
+}
+
+/* Unescape a template literal *cooked* text fragment into a freshly malloc'd
+ * string (caller must free). Handles the common escape sequences. */
+static char *template_unescape(const char *s)
+{
+    if (!s) { char *e = (char *)malloc(1); if (e) e[0] = '\0'; return e; }
+    size_t len = strlen(s);
+    char *out = (char *)malloc(len + 1);
+    if (!out) return NULL;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (c == '\\' && i + 1 < len) {
+            char n = s[i + 1];
+            switch (n) {
+            case 'n': out[j++] = '\n'; i++; break;
+            case 't': out[j++] = '\t'; i++; break;
+            case 'r': out[j++] = '\r'; i++; break;
+            case 'b': out[j++] = '\b'; i++; break;
+            case 'f': out[j++] = '\f'; i++; break;
+            case 'v': out[j++] = '\v'; i++; break;
+            case '0':
+                if (i + 2 >= len || !isdigit((unsigned char)s[i + 2])) { out[j++] = '\0'; i++; }
+                else out[j++] = c;
+                break;
+            case 'x':
+                if (i + 3 < len) {
+                    unsigned v = 0; int ok = 1;
+                    for (int k = 0; k < 2; k++) {
+                        char h = s[i + 2 + k];
+                        int d = (h >= '0' && h <= '9') ? h - '0'
+                              : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+                              : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+                        if (d < 0) { ok = 0; break; }
+                        v = (v << 4) | d;
+                    }
+                    if (ok) { out[j++] = (char)v; i += 3; break; }
+                }
+                out[j++] = c; break;
+            case 'u':
+                if (i + 2 < len && s[i + 2] == '{') {
+                    unsigned v = 0; int ok = 1; size_t k = i + 3;
+                    while (k < len && s[k] != '}') {
+                        char h = s[k];
+                        int d = (h >= '0' && h <= '9') ? h - '0'
+                              : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+                              : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+                        if (d < 0) { ok = 0; break; }
+                        v = (v << 4) | d; k++;
+                    }
+                    if (ok && k < len) { out[j++] = (char)v; i = k; break; }
+                    out[j++] = c; break;
+                }
+                if (i + 5 < len) {
+                    unsigned v = 0; int ok = 1;
+                    for (int k = 0; k < 4; k++) {
+                        char h = s[i + 2 + k];
+                        int d = (h >= '0' && h <= '9') ? h - '0'
+                              : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+                              : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+                        if (d < 0) { ok = 0; break; }
+                        v = (v << 4) | d;
+                    }
+                    if (ok) { out[j++] = (char)v; i += 5; break; }
+                }
+                out[j++] = c; break;
+            case '\n': i++; break;                       /* line continuation */
+            case '\r': i++; if (i + 1 < len && s[i + 1] == '\n') i++; break;
+            case '\\': case '\'': case '"': case '`':
+                out[j++] = n; i++; break;
+            default: out[j++] = n; i++; break;          /* unknown escape: keep char */
+            }
+        } else {
+            out[j++] = c;
+        }
+    }
+    out[j] = '\0';
+    return out;
+}
+
+/* Invoke a callable value (function object or AST function) with already
+ * evaluated arguments. Mirrors the tail of eval_call(). */
+static LRValue call_value_with_args(Interpreter *interp, ASTNode *callee_node,
+                                    LRValue callee, LRValue this_val,
+                                    int argc, LRValue *argv)
+{
+    LRContext *ctx = interp->ctx;
+    LRValue result;
+
+    if (lr_is_function(ctx, callee) && callee.tag == LR_TYPE_OBJECT) {
+        LRObject *obj = (LRObject *)callee.u.ptr;
+        if (obj->type == LR_OBJ_CFUNCTION) {
+            LRCFunction *cf = (LRCFunction *)obj->extra;
+            const char *cname = cf && cf->name ? cf->name : "";
+            lr_push_call_frame(ctx, cname, NULL, 0);
+            result = lr_call(ctx, callee, this_val, argc, argv);
+            lr_pop_call_frame(ctx);
+            if (lr_is_exception(result)) {
+                interp->exception_pending = 1;
+                interp->exception_value = lr_dup_value(ctx, result);
+                snprintf(interp->error_message, sizeof(interp->error_message),
+                         "%s", lr_get_exception_str(ctx));
+                interp->error_flag = 1;
+            }
+            return result;
+        }
+        if (obj->type == LR_OBJ_FUNCTION && obj->extra) {
+            interp->pending_closure = obj->def_scope;
+            return interp_invoke_function_ast(interp, (ASTNode *)obj->extra,
+                                              this_val, argc, argv);
+        }
+        if (obj->type == LR_OBJ_BYTECODE_FUNC) {
+            lr_push_call_frame(ctx, "", NULL, 0);
+            result = lr_call(ctx, callee, this_val, argc, argv);
+            lr_pop_call_frame(ctx);
+            return result;
+        }
+    }
+
+    if (callee_node && (callee_node->type == AST_FUNC_EXPR ||
+                        callee_node->type == AST_ARROW ||
+                        callee_node->type == AST_FUNC_DECL)) {
+        return interp_call_function(interp, callee_node, this_val, argc, argv);
+    }
+
+    lr_push_call_frame(ctx, "", NULL, 0);
+    result = lr_call(ctx, callee, this_val, argc, argv);
+    lr_pop_call_frame(ctx);
+    if (lr_is_exception(result)) {
+        interp->exception_pending = 1;
+        interp->exception_value = lr_dup_value(ctx, result);
+        snprintf(interp->error_message, sizeof(interp->error_message),
+                 "%s", lr_get_exception_str(ctx));
+        interp->error_flag = 1;
+    }
+    return result;
 }
 
 static LRValue eval_template(Interpreter *interp, ASTNode *node)
 {
     /* Template literal: `text ${expr} text` */
-    const char *raw = node->u.template_lit.raw;
-    int nexp = node->u.template_lit.nexp;
+    int nparts = node->u.template_lit.nparts;
+    int nexp   = node->u.template_lit.nexp;
     ASTNode **exprs = node->u.template_lit.exprs;
 
-    if (!raw) return lr_new_string(interp->ctx, "");
+    /* Estimate total length using cooked (unescaped) fragments. */
+    size_t total_len = 0;
+    for (int i = 0; i < nparts; i++) {
+        char *cooked = template_unescape(node->u.template_lit.parts[i]);
+        total_len += strlen(cooked ? cooked : "");
+        if (cooked) free(cooked);
+    }
 
-    /* Concatenate parts */
-    /* The raw string contains all the static text parts joined together.
-     * We need to interleave the expressions. */
-    size_t total_len = strlen(raw);
-
-    /* Evaluate all expressions and sum their string lengths */
     LRValue *expr_vals = NULL;
     if (nexp > 0) {
         expr_vals = (LRValue *)calloc(nexp, sizeof(LRValue));
@@ -1622,7 +1927,6 @@ static LRValue eval_template(Interpreter *interp, ASTNode *node)
         }
     }
 
-    /* Build the result string */
     char *buf = (char *)malloc(total_len + 1);
     if (!buf) {
         if (expr_vals) {
@@ -1633,35 +1937,18 @@ static LRValue eval_template(Interpreter *interp, ASTNode *node)
     }
 
     size_t pos = 0;
-    const char *raw_ptr = raw;
-    /* The raw string contains ${} markers where expressions go.
-     * We need to parse the raw string, splitting at ${...} boundaries. */
-    for (int i = 0; i < nexp; i++) {
-        /* Find the next ${ in the raw string */
-        const char *dollar_brace = strstr(raw_ptr, "${");
-        if (dollar_brace) {
-            size_t copy_len = dollar_brace - raw_ptr;
-            memcpy(buf + pos, raw_ptr, copy_len);
-            pos += copy_len;
-            raw_ptr = dollar_brace + 2; /* skip ${ */
+    for (int i = 0; i < nparts; i++) {
+        char *cooked = template_unescape(node->u.template_lit.parts[i]);
+        const char *p = cooked ? cooked : "";
+        size_t plen = strlen(p);
+        if (plen) { memcpy(buf + pos, p, plen); pos += plen; }
+        if (cooked) free(cooked);
+        if (i < nexp) {
+            const char *s = lr_to_cstring(interp->ctx, expr_vals[i]);
+            size_t slen = strlen(s);
+            if (slen) { memcpy(buf + pos, s, slen); pos += slen; }
+            lr_free_cstring(interp->ctx, s);
         }
-        /* Insert expression value */
-        const char *s = lr_to_cstring(interp->ctx, expr_vals[i]);
-        size_t slen = strlen(s);
-        memcpy(buf + pos, s, slen);
-        pos += slen;
-        lr_free_cstring(interp->ctx, s);
-        /* Skip past the } in the raw string */
-        const char *brace = strchr(raw_ptr, '}');
-        if (brace) {
-            raw_ptr = brace + 1;
-        }
-    }
-    /* Copy remaining text */
-    if (raw_ptr) {
-        size_t remaining = strlen(raw_ptr);
-        memcpy(buf + pos, raw_ptr, remaining);
-        pos += remaining;
     }
     buf[pos] = '\0';
 
@@ -1672,7 +1959,6 @@ static LRValue eval_template(Interpreter *interp, ASTNode *node)
         for (int i = 0; i < nexp; i++) lr_free_value(interp->ctx, expr_vals[i]);
         free(expr_vals);
     }
-
     return result;
 }
 
@@ -1705,9 +1991,30 @@ static LRValue eval_await(Interpreter *interp, ASTNode *node)
     LRValue arg = interp_eval_node(interp, node->u.await_expr.arg);
     if (interp->error_flag) return arg;
 
-    /* If the result is a Promise, try to get its [[PromiseResult]] */
+    /* If the result is a Promise, settle it (draining microtasks if
+     * needed), then unwrap: fulfilled -> value, rejected -> throw */
     if (lr_is_promise(interp->ctx, arg)) {
-        LRValue result = lr_promise_get_result(arg);
+        LRPromiseData *pd = (LRPromiseData *)lr_get_opaque(arg);
+        if (pd && pd->state == LR_PROMISE_PENDING) {
+            LRContext *jctx = NULL;
+            int guard = 100000;
+            while (pd->state == LR_PROMISE_PENDING && guard-- > 0) {
+                if (lr_execute_pending_job(interp->ctx->rt, &jctx) <= 0) break;
+            }
+        }
+        if (pd && pd->state == LR_PROMISE_REJECTED) {
+            interp->exception_pending = 1;
+            interp->exception_value = lr_dup_value(interp->ctx, pd->result);
+            const char *s = lr_to_cstring(interp->ctx, pd->result);
+            snprintf(interp->error_message, sizeof(interp->error_message),
+                     "%s", s ? s : "Promise rejected");
+            lr_free_cstring(interp->ctx, s);
+            interp->error_flag = 1;
+            lr_free_value(interp->ctx, arg);
+            return LR_VALUE_UNDEFINED;
+        }
+        LRValue result = pd ? lr_dup_value(interp->ctx, pd->result)
+                            : LR_VALUE_UNDEFINED;
         lr_free_value(interp->ctx, arg);
         return result;
     }
@@ -1732,74 +2039,162 @@ static LRValue eval_await(Interpreter *interp, ASTNode *node)
 
 static LRValue eval_class_expr(Interpreter *interp, ASTNode *node)
 {
-    /* Create a class - simplified implementation */
-    LRValue proto = lr_new_object(interp->ctx);
-    LRValue ctor = lr_new_object(interp->ctx);
-    if (ctor.tag == LR_TYPE_OBJECT) {
-        LRObject *o = (LRObject *)ctor.u.ptr;
-        o->type = LR_OBJ_FUNCTION;
-    }
+    LRContext *ctx = interp->ctx;
 
-    /* Set prototype.constructor = ctor */
-    const char *class_name = node->u.class_decl.name;
-    if (class_name) {
-        lr_set_property_str(interp->ctx, ctor, "name", lr_new_string(interp->ctx, class_name));
-    }
-
-    /* Set up prototype chain */
-    LRValue extends = LR_VALUE_UNDEFINED;
+    /* Evaluate 'extends' clause */
+    LRValue parent = LR_VALUE_UNDEFINED;
     if (node->u.class_decl.extends) {
-        extends = interp_eval_node(interp, node->u.class_decl.extends);
+        parent = interp_eval_node(interp, node->u.class_decl.extends);
         if (interp->error_flag) {
-            lr_free_value(interp->ctx, proto);
-            lr_free_value(interp->ctx, ctor);
-            lr_free_value(interp->ctx, extends);
+            lr_free_value(ctx, parent);
             return LR_VALUE_UNDEFINED;
         }
     }
 
-    /* Add methods */
+    /* Create the prototype object (inherits from parent.prototype) */
+    LRValue proto;
+    if (lr_is_object(parent)) {
+        LRValue pproto = lr_get_property_str(ctx, parent, "prototype");
+        if (lr_is_object(pproto)) {
+            proto = lr_new_object_proto(ctx, pproto);
+        } else {
+            proto = lr_new_object(ctx);
+        }
+        lr_free_value(ctx, pproto);
+    } else {
+        proto = lr_new_object(ctx);
+    }
+
+    /* Create the constructor function object.
+     * Its extra points at the class AST node so calls/new dispatch through
+     * interp_call_class_function (field init + ctor body + implicit super).
+     * Static members are inherited from the parent class object. */
+    LRValue ctor;
+    if (lr_is_object(parent)) {
+        ctor = lr_new_object_proto(ctx, parent);
+    } else {
+        ctor = lr_new_object_proto(ctx, ctx->function_proto);
+    }
+    if (ctor.tag == LR_TYPE_OBJECT) {
+        LRObject *o = (LRObject *)ctor.u.ptr;
+        o->type = LR_OBJ_FUNCTION;
+        o->extra = (void *)node;
+        interp_capture_closure(interp, ctor);
+    }
+
+    const char *class_name = node->u.class_decl.name;
+    if (class_name) {
+        lr_set_property_str(ctx, ctor, "name", lr_new_string(ctx, class_name));
+    }
+
+    /* Wire prototype <-> constructor */
+    lr_set_property_str(ctx, ctor, "prototype", lr_dup_value(ctx, proto));
+    lr_set_property_str(ctx, proto, "constructor", lr_dup_value(ctx, ctor));
+
+    /* Install methods, accessors, and static fields.
+     * An inner scope binds the class name so static fields/blocks can
+     * reference the class being defined (e.g. static { C.v = 42; }). */
+    interp_push_scope(interp, 0);
+    if (class_name) {
+        scope_declare_name(interp, class_name, lr_dup_value(ctx, ctor), 1);
+    }
     int nmethods = node->u.class_decl.nmethods;
     ASTNode **methods = node->u.class_decl.methods;
     for (int i = 0; i < nmethods; i++) {
-        ASTNode *method = methods[i];
-        if (method && method->type == AST_FUNC_EXPR) {
-            const char *mname = method->u.func.name;
-            /* Check if it's the constructor */
-            if (mname && strcmp(mname, "constructor") == 0) {
-                /* Assign to constructor */
-                LRValue func_obj = eval_func_expr(interp, method);
-                lr_set_property_str(interp->ctx, ctor, "prototype", lr_dup_value(interp->ctx, proto));
-                /* Copy function properties */
-                lr_free_value(interp->ctx, ctor);
-                ctor = func_obj;
-                lr_set_property_str(interp->ctx, proto, "constructor", lr_dup_value(interp->ctx, ctor));
+        ASTNode *m = methods[i];
+        if (!m) continue;
+
+        if (m->type == AST_FUNC_EXPR) {
+            const char *mname = m->u.func.name;
+
+            /* The constructor body is invoked via the class node itself */
+            if (!m->u.func.is_static && !m->u.func.is_getter && !m->u.func.is_setter &&
+                mname && strcmp(mname, "constructor") == 0) {
+                continue;
+            }
+
+            /* Static initialization block: run now with this = class */
+            if (m->u.func.is_static && mname &&
+                strcmp(mname, "__static_block__") == 0) {
+                LRValue fn = eval_func_expr(interp, m);
+                LRValue r = call_value_with_args(interp, m, fn, ctor, 0, NULL);
+                lr_free_value(ctx, r);
+                lr_free_value(ctx, fn);
+                if (interp->error_flag) break;
+                continue;
+            }
+
+            LRValue target = m->u.func.is_static ? ctor : proto;
+            LRValue fn = eval_func_expr(interp, m);
+
+            if (m->u.func.key_expr) {
+                /* Computed method name: [expr]() {} */
+                LRValue kv = interp_eval_node(interp, m->u.func.key_expr);
+                if (interp->error_flag) {
+                    lr_free_value(ctx, fn);
+                    lr_free_value(ctx, kv);
+                    continue;
+                }
+                LRString *atom = lr_to_atom(ctx, kv);
+                if (m->u.func.is_getter) {
+                    lr_set_accessor_property(ctx, target, atom, fn, LR_VALUE_UNDEFINED);
+                } else if (m->u.func.is_setter) {
+                    lr_set_accessor_property(ctx, target, atom, LR_VALUE_UNDEFINED, fn);
+                } else {
+                    lr_set_property(ctx, target, atom, fn);
+                }
+                lr_free_value(ctx, kv);
             } else {
-                LRValue func_obj = eval_func_expr(interp, method);
-                lr_set_property_str(interp->ctx, proto, mname ? mname : "", func_obj);
-                lr_free_value(interp->ctx, func_obj);
+                const char *key = mname ? mname : "";
+                if (m->u.func.is_getter) {
+                    lr_set_accessor_property_str(ctx, target, key, fn, LR_VALUE_UNDEFINED);
+                } else if (m->u.func.is_setter) {
+                    lr_set_accessor_property_str(ctx, target, key, LR_VALUE_UNDEFINED, fn);
+                } else {
+                    lr_set_property_str(ctx, target, key, fn);
+                }
+            }
+        } else if (m->type == AST_PROPERTY && m->u.property.is_static) {
+            /* Static class field: evaluated once at class definition */
+            LRValue v = m->u.property.val
+                ? interp_eval_node(interp, m->u.property.val)
+                : LR_VALUE_UNDEFINED;
+            if (interp->error_flag) {
+                lr_free_value(ctx, v);
+                continue;
+            }
+            if (m->u.property.key && m->u.property.key->type == AST_IDENTIFIER) {
+                lr_set_property_str(ctx, ctor, m->u.property.key->u.ident.name, v);
+            } else if (m->u.property.key) {
+                LRValue kv = interp_eval_node(interp, m->u.property.key);
+                LRString *atom = lr_to_atom(ctx, kv);
+                lr_set_property(ctx, ctor, atom, v);
+                lr_free_value(ctx, kv);
+            } else {
+                lr_free_value(ctx, v);
             }
         }
+        /* Instance fields (AST_PROPERTY, !is_static) are initialized in
+         * interp_call_class_function at construction time. */
     }
+    interp_pop_scope(interp);
 
-    /* Set prototype */
-    LRValue result = lr_new_object(interp->ctx);
-    lr_set_property_str(interp->ctx, result, "prototype", lr_dup_value(interp->ctx, proto));
-    if (class_name) {
-        lr_set_property_str(interp->ctx, result, "name", lr_new_string(interp->ctx, class_name));
-    }
-
-    lr_free_value(interp->ctx, proto);
-    lr_free_value(interp->ctx, extends);
-    return result;
+    lr_free_value(ctx, proto);
+    lr_free_value(ctx, parent);
+    return ctor;
 }
 
 /* ── Destructuring ─────────────────────────────────────────────────────── */
 
 static LRValue eval_pattern(Interpreter *interp, ASTNode *node, LRValue value)
 {
+    /* Discriminate array vs object patterns: AST_ARRAY/AST_OBJECT literals
+     * used as assignment targets, or AST_PATTERN with is_object flag. */
+    int is_obj_pattern = (node->type == AST_OBJECT) ||
+        (node->type == AST_PATTERN && node->u.pattern_object.is_object);
+
     /* Handle array destructuring: [a, b] = arr */
-    if (node->u.pattern_array.elements != NULL || node->type == AST_PATTERN) {
+    if (!is_obj_pattern) {
         /* Array destructuring */
         int nelem = node->u.pattern_array.nelem;
         ASTNode **elements = node->u.pattern_array.elements;
@@ -1808,9 +2203,10 @@ static LRValue eval_pattern(Interpreter *interp, ASTNode *node, LRValue value)
             ASTNode *elem = elements[i];
             if (elem == NULL) continue; /* hole */
 
-            if (elem->type == AST_REST) {
+            if (elem->type == AST_REST || elem->type == AST_SPREAD_ELEMENT) {
                 /* Rest element: ...rest */
-                ASTNode *rest_target = elem->u.rest_elem.arg;
+                ASTNode *rest_target = elem->type == AST_REST ? elem->u.rest_elem.arg
+                                                              : elem->u.spread.arg;
                 if (rest_target && rest_target->type == AST_IDENTIFIER) {
                     const char *name = rest_target->u.ident.name;
                     /* Create a new array with remaining elements */
@@ -1848,10 +2244,22 @@ static LRValue eval_pattern(Interpreter *interp, ASTNode *node, LRValue value)
                 LRValue item_val = lr_get_property_uint32(interp->ctx, value, i);
                 scope_declare_name(interp, elem->u.ident.name, item_val, 0);
                 lr_free_value(interp->ctx, item_val);
-            } else if (elem->type == AST_PATTERN) {
+            } else if (elem->type == AST_PATTERN || elem->type == AST_ARRAY ||
+                       elem->type == AST_OBJECT) {
                 /* Nested destructuring */
                 LRValue item_val = lr_get_property_uint32(interp->ctx, value, i);
                 eval_pattern(interp, elem, item_val);
+                lr_free_value(interp->ctx, item_val);
+            } else if (elem->type == AST_ASSIGN &&
+                       elem->u.assign.target &&
+                       elem->u.assign.target->type == AST_IDENTIFIER) {
+                /* Default from expression form: [a = 1] = ... */
+                LRValue item_val = lr_get_property_uint32(interp->ctx, value, i);
+                if (lr_is_undefined(item_val)) {
+                    lr_free_value(interp->ctx, item_val);
+                    item_val = interp_eval_node(interp, elem->u.assign.value);
+                }
+                scope_declare_name(interp, elem->u.assign.target->u.ident.name, item_val, 0);
                 lr_free_value(interp->ctx, item_val);
             }
         }
@@ -1859,25 +2267,41 @@ static LRValue eval_pattern(Interpreter *interp, ASTNode *node, LRValue value)
     }
 
     /* Object destructuring: {a, b} = obj */
-    if (node->u.pattern_object.props != NULL) {
+    {
         int nprops = node->u.pattern_object.nprops;
         ASTNode **props = node->u.pattern_object.props;
 
         for (int i = 0; i < nprops; i++) {
             ASTNode *prop = props[i];
-            if (prop->type == AST_REST) {
+            if (prop->type == AST_REST || prop->type == AST_SPREAD ||
+                prop->type == AST_SPREAD_ELEMENT) {
                 /* Rest in object pattern */
-                ASTNode *rest_target = prop->u.rest_elem.arg;
+                ASTNode *rest_target = prop->type == AST_REST ? prop->u.rest_elem.arg
+                                                              : prop->u.spread.arg;
                 if (rest_target && rest_target->type == AST_IDENTIFIER) {
                     LRValue rest_obj = lr_new_object(interp->ctx);
-                    /* Copy all own properties */
+                    /* Copy own properties, excluding keys consumed by the
+                     * preceding pattern properties. */
                     LRPropertyEnum *pe = NULL;
                     uint32_t npe = 0;
                     lr_get_own_property_names(interp->ctx, &pe, &npe, value, 0);
                     for (uint32_t j = 0; j < npe; j++) {
-                        LRValue v = lr_get_property(interp->ctx, value, pe[j].atom);
-                        lr_set_property(interp->ctx, rest_obj, pe[j].atom, v);
-                        lr_free_value(interp->ctx, v);
+                        const char *kname = lr_atom_to_cstring(interp->ctx, pe[j].atom);
+                        int consumed = 0;
+                        for (int k = 0; k < i && !consumed; k++) {
+                            ASTNode *pp = props[k];
+                            if (pp && pp->type == AST_PROPERTY && pp->u.property.key &&
+                                pp->u.property.key->type == AST_IDENTIFIER &&
+                                kname &&
+                                strcmp(pp->u.property.key->u.ident.name, kname) == 0) {
+                                consumed = 1;
+                            }
+                        }
+                        if (!consumed) {
+                            LRValue v = lr_get_property(interp->ctx, value, pe[j].atom);
+                            lr_set_property(interp->ctx, rest_obj, pe[j].atom, v);
+                            lr_free_value(interp->ctx, v);
+                        }
                     }
                     lr_free_property_enum(interp->ctx, pe, npe);
                     scope_declare_name(interp, rest_target->u.ident.name, rest_obj, 0);
@@ -1916,7 +2340,19 @@ static LRValue eval_pattern(Interpreter *interp, ASTNode *node, LRValue value)
                         }
                         scope_declare_name(interp, target_name, prop_val, 0);
                         lr_free_value(interp->ctx, prop_val);
-                    } else if (val_node->type == AST_PATTERN) {
+                    } else if (val_node->type == AST_ASSIGN &&
+                               val_node->u.assign.target &&
+                               val_node->u.assign.target->type == AST_IDENTIFIER) {
+                        /* Shorthand default from object literal: { a = 1 } */
+                        if (lr_is_undefined(prop_val)) {
+                            lr_free_value(interp->ctx, prop_val);
+                            prop_val = interp_eval_node(interp, val_node->u.assign.value);
+                        }
+                        scope_declare_name(interp, val_node->u.assign.target->u.ident.name,
+                                           prop_val, 0);
+                        lr_free_value(interp->ctx, prop_val);
+                    } else if (val_node->type == AST_PATTERN || val_node->type == AST_ARRAY ||
+                               val_node->type == AST_OBJECT) {
                         eval_pattern(interp, val_node, prop_val);
                         lr_free_value(interp->ctx, prop_val);
                     } else {
@@ -1931,11 +2367,176 @@ static LRValue eval_pattern(Interpreter *interp, ASTNode *node, LRValue value)
     return LR_VALUE_UNDEFINED;
 }
 
+/* ── Generator Support (eager evaluation) ──────────────────────────────
+ * Generator bodies run eagerly at call time; yields are buffered into a
+ * JS array. The returned generator object steps through the buffer via
+ * next()/return() and is iterable (Symbol.iterator returns itself).
+ * A yield cap guards against unbounded/infinite generators. */
+
+#define GEN_MAX_YIELDS 65536
+#define GEN_ITEMS_PROP "__gen_items"
+#define GEN_INDEX_PROP "__gen_i"
+#define GEN_DONE_PROP  "__gen_done"
+#define GEN_RET_PROP   "__gen_ret"
+
+/* Build a { value, done } iterator result (takes ownership of value) */
+static LRValue gen_make_result(LRContext *ctx, LRValue value, int done)
+{
+    LRValue res = lr_new_object(ctx);
+    lr_set_property_str(ctx, res, "value", value);
+    lr_set_property_str(ctx, res, "done", done ? LR_VALUE_TRUE : LR_VALUE_FALSE);
+    return res;
+}
+
+static LRValue gen_next_cfunc(LRContext *ctx, LRValue this_val,
+                              int argc, LRValue *argv)
+{
+    (void)argc; (void)argv;
+    LRValue done_v = lr_get_property_str(ctx, this_val, GEN_DONE_PROP);
+    int done = lr_to_bool(ctx, done_v);
+    lr_free_value(ctx, done_v);
+    if (done) return gen_make_result(ctx, LR_VALUE_UNDEFINED, 1);
+
+    LRValue items = lr_get_property_str(ctx, this_val, GEN_ITEMS_PROP);
+    LRValue iv = lr_get_property_str(ctx, this_val, GEN_INDEX_PROP);
+    int32_t i = 0; lr_to_int32(ctx, &i, iv);
+    lr_free_value(ctx, iv);
+    LRValue lv = lr_get_property_str(ctx, items, "length");
+    int32_t len = 0; lr_to_int32(ctx, &len, lv);
+    lr_free_value(ctx, lv);
+
+    if (i >= len) {
+        lr_free_value(ctx, items);
+        lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
+        LRValue ret = lr_get_property_str(ctx, this_val, GEN_RET_PROP);
+        return gen_make_result(ctx, ret, 1);
+    }
+    LRValue item = lr_get_property_uint32(ctx, items, (uint32_t)i);
+    lr_free_value(ctx, items);
+    lr_set_property_str(ctx, this_val, GEN_INDEX_PROP, lr_new_int32(ctx, i + 1));
+    return gen_make_result(ctx, item, 0);
+}
+
+static LRValue gen_return_cfunc(LRContext *ctx, LRValue this_val,
+                                int argc, LRValue *argv)
+{
+    lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
+    LRValue v = (argc > 0) ? lr_dup_value(ctx, argv[0]) : LR_VALUE_UNDEFINED;
+    return gen_make_result(ctx, v, 1);
+}
+
+static LRValue gen_self_cfunc(LRContext *ctx, LRValue this_val,
+                              int argc, LRValue *argv)
+{
+    (void)argc; (void)argv;
+    return lr_dup_value(ctx, this_val);
+}
+
+/* Build the generator object (takes ownership of items and ret_val) */
+static LRValue gen_build_object(Interpreter *interp, LRValue items, LRValue ret_val)
+{
+    LRContext *ctx = interp->ctx;
+    LRValue gen = lr_new_object(ctx);
+    lr_set_property_str(ctx, gen, GEN_ITEMS_PROP, items);
+    lr_set_property_str(ctx, gen, GEN_INDEX_PROP, lr_new_int32(ctx, 0));
+    lr_set_property_str(ctx, gen, GEN_DONE_PROP, LR_VALUE_FALSE);
+    lr_set_property_str(ctx, gen, GEN_RET_PROP, ret_val);
+    lr_set_property_str(ctx, gen, "next",
+        lr_new_cfunction(ctx, gen_next_cfunc, "next", 0));
+    lr_set_property_str(ctx, gen, "return",
+        lr_new_cfunction(ctx, gen_return_cfunc, "return", 1));
+    lr_set_property_str(ctx, gen, "Symbol.iterator",
+        lr_new_cfunction(ctx, gen_self_cfunc, "[Symbol.iterator]", 0));
+    return gen;
+}
+
+/* Append one yielded value to the active generator buffer (dups v) */
+static void gen_append(Interpreter *interp, LRValue v)
+{
+    if (interp->gen_count >= GEN_MAX_YIELDS) {
+        snprintf(interp->error_message, sizeof(interp->error_message),
+                 "generator yield limit exceeded (%d); lazy/infinite "
+                 "generators are not supported", GEN_MAX_YIELDS);
+        interp->exception_value = LR_VALUE_UNDEFINED;
+        interp->error_flag = 1;
+        return;
+    }
+    lr_set_property_uint32(interp->ctx, interp->gen_items,
+                           (uint32_t)interp->gen_count++,
+                           lr_dup_value(interp->ctx, v));
+}
+
+/* yield* delegation: append every element of an iterable */
+static void gen_delegate(Interpreter *interp, LRValue src)
+{
+    LRContext *ctx = interp->ctx;
+    if (lr_is_string(src)) {
+        const char *s = lr_to_cstring(ctx, src);
+        size_t slen = s ? strlen(s) : 0;
+        char buf[2] = {0, 0};
+        for (size_t i = 0; i < slen && !interp->error_flag; i++) {
+            buf[0] = s[i];
+            LRValue item = lr_new_string(ctx, buf);
+            gen_append(interp, item);
+            lr_free_value(ctx, item);
+        }
+        lr_free_cstring(ctx, s);
+        return;
+    }
+    if (lr_is_array(ctx, src)) {
+        int32_t len = 0;
+        LRValue len_val = lr_get_property_str(ctx, src, "length");
+        lr_to_int32(ctx, &len, len_val);
+        lr_free_value(ctx, len_val);
+        for (int32_t i = 0; i < len && !interp->error_flag; i++) {
+            LRValue item = lr_get_property_uint32(ctx, src, (uint32_t)i);
+            gen_append(interp, item);
+            lr_free_value(ctx, item);
+        }
+        return;
+    }
+    if (lr_is_object(src)) {
+        LRValue iter_fn = lr_get_property_str(ctx, src, "Symbol.iterator");
+        if (lr_is_function(ctx, iter_fn)) {
+            LRValue iter = call_value_with_args(interp, NULL, iter_fn, src, 0, NULL);
+            lr_free_value(ctx, iter_fn);
+            if (interp->error_flag) { lr_free_value(ctx, iter); return; }
+            if (lr_is_object(iter)) {
+                LRValue next_fn = lr_get_property_str(ctx, iter, "next");
+                while (!interp->error_flag) {
+                    LRValue nr = call_value_with_args(interp, NULL, next_fn, iter, 0, NULL);
+                    if (interp->error_flag) { lr_free_value(ctx, nr); break; }
+                    LRValue done = lr_get_property_str(ctx, nr, "done");
+                    int is_done = lr_to_bool(ctx, done);
+                    lr_free_value(ctx, done);
+                    if (is_done) { lr_free_value(ctx, nr); break; }
+                    LRValue value = lr_get_property_str(ctx, nr, "value");
+                    gen_append(interp, value);
+                    lr_free_value(ctx, value);
+                    lr_free_value(ctx, nr);
+                }
+                lr_free_value(ctx, next_fn);
+            }
+            lr_free_value(ctx, iter);
+            return;
+        }
+        lr_free_value(ctx, iter_fn);
+    }
+    snprintf(interp->error_message, sizeof(interp->error_message),
+             "yield* operand is not iterable");
+    interp->exception_value = LR_VALUE_UNDEFINED;
+    interp->error_flag = 1;
+}
+
 /* ── Function Call Support ─────────────────────────────────────────────── */
 
 static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
                                      LRValue this_val, int argc, LRValue *argv)
 {
+    /* Consume the closure scope handed off by the caller (if any) */
+    InterpScope *closure_scope = (InterpScope *)interp->pending_closure;
+    interp->pending_closure = NULL;
+
     if (interp->depth >= MAX_CALL_DEPTH) {
         snprintf(interp->error_message, sizeof(interp->error_message),
                  "Maximum call stack size exceeded");
@@ -1979,30 +2580,75 @@ static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
 
     interp->break_target = 0;
     interp->continue_target = 0;
+    interp->break_label[0] = '\0';
+    interp->continue_label[0] = '\0';
+    const char *saved_pending_label = interp->pending_label;
+    interp->pending_label = NULL;
     interp->return_target = 0;
     interp->has_returned = 0;
     interp->return_value = LR_VALUE_UNDEFINED;
     interp->error_flag = 0;
 
-    /* Create a new function scope */
-    interp_push_scope(interp, 1);
+    /* Create a new function scope. Its parent is the function's captured
+     * (lexical) defining scope when available, otherwise the call-time
+     * scope (legacy dynamic behavior for direct AST invocations). */
+    InterpScope *saved_scope = interp->current_scope;
+    InterpScope *func_scope = scope_new(
+        closure_scope ? closure_scope : interp->current_scope, 1, 0);
+    interp->current_scope = func_scope;
 
     /* Bind 'this' */
     scope_declare_name(interp, "this", this_val, 1); /* const-like */
+
+    /* Bind super references for class methods (derived classes) */
+    if ((func_node->type == AST_FUNC_EXPR || func_node->type == AST_FUNC_DECL) &&
+        func_node->u.func.class_node &&
+        func_node->u.func.class_node->u.class_decl.extends) {
+        LRValue parent = interp_eval_node(interp,
+            func_node->u.func.class_node->u.class_decl.extends);
+        if (interp->error_flag) {
+            /* Parent class not resolvable at call time: ignore, super unusable */
+            interp->error_flag = 0;
+            lr_free_value(interp->ctx, parent);
+        } else if (lr_is_object(parent)) {
+            scope_declare_name(interp, "%superctor%", parent, 1);
+            LRValue sproto = lr_get_property_str(interp->ctx, parent, "prototype");
+            scope_declare_name(interp, "%superproto%", sproto, 1);
+            lr_free_value(interp->ctx, sproto);
+            lr_free_value(interp->ctx, parent);
+        } else {
+            lr_free_value(interp->ctx, parent);
+        }
+    }
 
     /* Bind arguments */
     int nparams = 0;
     ASTNode **params = NULL;
     int is_arrow = 0;
+    int is_async = 0;
+    int is_generator = 0;
 
     if (func_node->type == AST_FUNC_EXPR || func_node->type == AST_FUNC_DECL) {
         nparams = func_node->u.func.nparams;
         params = func_node->u.func.params;
+        is_async = func_node->u.func.is_async;
+        is_generator = func_node->u.func.is_generator;
     } else if (func_node->type == AST_ARROW) {
         nparams = func_node->u.arrow.nparams;
         params = func_node->u.arrow.params;
         is_arrow = 1;
+        is_async = func_node->u.arrow.is_async;
     }
+
+    /* Generator: buffer yields into a fresh array while the body runs.
+     * Nested calls save/restore so each generator gets its own buffer,
+     * and yield inside a nested plain function stays an error. */
+    int saved_gen_active = interp->gen_active;
+    LRValue saved_gen_items = interp->gen_items;
+    int saved_gen_count = interp->gen_count;
+    interp->gen_active = is_generator;
+    interp->gen_items = is_generator ? lr_new_array(interp->ctx) : LR_VALUE_UNDEFINED;
+    interp->gen_count = 0;
 
     /* Bind 'arguments' object (not for arrow functions) */
     if (!is_arrow) {
@@ -2027,9 +2673,11 @@ static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
             } else {
                 scope_declare_name(interp, pname, LR_VALUE_UNDEFINED, 0);
             }
-        } else if (param->type == AST_REST) {
-            /* Rest parameter */
-            ASTNode *rest_target = param->u.rest_elem.arg;
+        } else if (param->type == AST_REST || param->type == AST_SPREAD_ELEMENT) {
+            /* Rest parameter (AST_SPREAD_ELEMENT when the arrow params were
+             * reconstructed from a parenthesized expression) */
+            ASTNode *rest_target = param->type == AST_REST ? param->u.rest_elem.arg
+                                                           : param->u.spread.arg;
             if (rest_target && rest_target->type == AST_IDENTIFIER) {
                 LRValue rest_arr = lr_new_array(interp->ctx);
                 int idx = 0;
@@ -2054,10 +2702,22 @@ static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
                     lr_free_value(interp->ctx, def_val);
                 }
             }
-        } else if (param->type == AST_PATTERN) {
-            /* Destructuring parameter */
-            if (i < argc) {
-                eval_pattern(interp, param, argv[i]);
+        } else if (param->type == AST_PATTERN || param->type == AST_ARRAY ||
+                   param->type == AST_OBJECT) {
+            /* Destructuring parameter (array/object literal nodes appear when
+             * arrow params were reconstructed from an expression) */
+            eval_pattern(interp, param, i < argc ? argv[i] : LR_VALUE_UNDEFINED);
+        } else if (param->type == AST_ASSIGN &&
+                   param->u.assign.target &&
+                   param->u.assign.target->type == AST_IDENTIFIER) {
+            /* Default parameter reconstructed from expression: (a = 1) => */
+            const char *pname = param->u.assign.target->u.ident.name;
+            if (i < argc && !lr_is_undefined(argv[i])) {
+                scope_declare_name(interp, pname, argv[i], 0);
+            } else {
+                LRValue def_val = interp_eval_node(interp, param->u.assign.value);
+                scope_declare_name(interp, pname, def_val, 0);
+                lr_free_value(interp->ctx, def_val);
             }
         }
     }
@@ -2100,13 +2760,79 @@ static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
         result = lr_dup_value(interp->ctx, interp->return_value);
     }
 
-    /* Pop scope */
-    interp_pop_scope(interp);
+    /* Generator: wrap the buffered yields into a generator object */
+    if (is_generator) {
+        LRValue items = interp->gen_items;
+        lr_set_property_str(interp->ctx, items, "length",
+                            lr_new_int32(interp->ctx, interp->gen_count));
+        if (interp->error_flag) {
+            lr_free_value(interp->ctx, items);
+            lr_free_value(interp->ctx, result);
+            result = LR_VALUE_UNDEFINED;
+        } else {
+            /* result (the generator's return value) becomes the final
+             * done:true value; ownership transfers to the object */
+            result = gen_build_object(interp, items, result);
+        }
+    }
+    interp->gen_active = saved_gen_active;
+    interp->gen_items = saved_gen_items;
+    interp->gen_count = saved_gen_count;
+
+    /* Async: wrap the outcome in a Promise. Throws become rejections. */
+    if (is_async && !is_generator) {
+        LRValue p = lr_new_promise(interp->ctx);
+        /* Give the bare promise its prototype so .then/.catch work */
+        {
+            LRValue g = lr_get_global_object(interp->ctx);
+            LRValue ctor = lr_get_property_str(interp->ctx, g, "Promise");
+            if (lr_is_object(ctor)) {
+                LRValue proto = lr_get_property_str(interp->ctx, ctor, "prototype");
+                if (lr_is_object(proto)) lr_set_prototype(interp->ctx, p, proto);
+                lr_free_value(interp->ctx, proto);
+            }
+            lr_free_value(interp->ctx, ctor);
+            lr_free_value(interp->ctx, g);
+        }
+        if (interp->error_flag) {
+            LRValue reason;
+            if (interp->exception_pending &&
+                interp->exception_value.tag != LR_TYPE_EXCEPTION &&
+                interp->exception_value.tag != LR_TYPE_UNDEFINED) {
+                reason = lr_dup_value(interp->ctx, interp->exception_value);
+            } else {
+                reason = lr_new_string(interp->ctx, interp->error_message);
+            }
+            lr_promise_reject_internal(interp->ctx, p, reason);
+            lr_free_value(interp->ctx, reason);
+            /* The async function absorbs the throw into the rejection */
+            interp->error_flag = 0;
+            if (interp->exception_pending) {
+                lr_free_value(interp->ctx, interp->exception_value);
+                interp->exception_value = LR_VALUE_UNDEFINED;
+                interp->exception_pending = 0;
+            }
+            interp->error_message[0] = '\0';
+        } else {
+            lr_promise_resolve_internal(interp->ctx, p, result);
+        }
+        lr_free_value(interp->ctx, result);
+        result = p;
+    }
+
+    /* Pop any scopes left by early exits, then the function scope itself,
+     * and restore the caller's scope (may differ from func_scope->parent
+     * when a closure scope was used) */
+    while (interp->current_scope && interp->current_scope != func_scope)
+        interp_pop_scope(interp);
+    interp->current_scope = saved_scope;
+    scope_release(func_scope, interp->ctx);
 
     /* Restore interpreter state */
     interp->depth--;
     interp->break_target = saved_break;
     interp->continue_target = saved_continue;
+    interp->pending_label = saved_pending_label;
     interp->return_target = saved_return;
     interp->has_returned = saved_has_returned;
     /* Don't restore return_value if we're inside a return (it propagates) */
@@ -2115,15 +2841,126 @@ static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
         interp->return_value = LR_VALUE_UNDEFINED;
     }
     interp->return_value = saved_return_val;
-    interp->error_flag = saved_error;
-    if (!saved_error) {
-        memcpy(interp->error_message, saved_err_msg, 512);
+    /* Errors raised inside the function propagate to the caller;
+     * otherwise restore the caller's error state */
+    if (!interp->error_flag) {
+        interp->error_flag = saved_error;
+        if (!saved_error) {
+            memcpy(interp->error_message, saved_err_msg, 512);
+        }
     }
 
     /* Pop call frame */
     lr_pop_call_frame(interp->ctx);
 
     return result;
+}
+
+/* Call a class as a constructor body:
+ * 1. implicit super(...) when derived and no explicit constructor
+ * 2. instance field initialization
+ * 3. explicit constructor body (if any) */
+static LRValue interp_call_class_function(Interpreter *interp, ASTNode *class_node,
+                                          LRValue this_val, int argc, LRValue *argv)
+{
+    /* Take the class's closure scope; re-injected for the ctor body below */
+    InterpScope *cls_closure = (InterpScope *)interp->pending_closure;
+    interp->pending_closure = NULL;
+
+    LRContext *ctx = interp->ctx;
+    int nmethods = class_node->u.class_decl.nmethods;
+    ASTNode **methods = class_node->u.class_decl.methods;
+
+    /* Find explicit constructor */
+    ASTNode *ctor_ast = NULL;
+    int has_fields = 0;
+    for (int i = 0; i < nmethods; i++) {
+        ASTNode *m = methods[i];
+        if (!m) continue;
+        if (m->type == AST_FUNC_EXPR && !m->u.func.is_static &&
+            !m->u.func.is_getter && !m->u.func.is_setter &&
+            m->u.func.name && strcmp(m->u.func.name, "constructor") == 0) {
+            ctor_ast = m;
+        } else if (m->type == AST_PROPERTY && !m->u.property.is_static) {
+            has_fields = 1;
+        }
+    }
+
+    /* Implicit super(...args) for derived classes without explicit ctor */
+    if (!ctor_ast && class_node->u.class_decl.extends) {
+        LRValue parent = interp_eval_node(interp, class_node->u.class_decl.extends);
+        if (interp->error_flag) {
+            lr_free_value(ctx, parent);
+            return LR_VALUE_UNDEFINED;
+        }
+        if (lr_is_object(parent)) {
+            LRObject *po = (LRObject *)parent.u.ptr;
+            LRValue r = LR_VALUE_UNDEFINED;
+            if (po->type == LR_OBJ_FUNCTION && po->extra) {
+                interp->pending_closure = po->def_scope;
+                r = interp_invoke_function_ast(interp, (ASTNode *)po->extra,
+                                               this_val, argc, argv);
+            } else if (po->type == LR_OBJ_CFUNCTION) {
+                r = lr_call(ctx, parent, this_val, argc, argv);
+            }
+            lr_free_value(ctx, r);
+        }
+        lr_free_value(ctx, parent);
+        if (interp->error_flag) return LR_VALUE_UNDEFINED;
+    }
+
+    /* Initialize instance fields (evaluated with 'this' bound) */
+    if (has_fields) {
+        interp_push_scope(interp, 1);
+        scope_declare_name(interp, "this", this_val, 1);
+        for (int i = 0; i < nmethods; i++) {
+            ASTNode *m = methods[i];
+            if (!m || m->type != AST_PROPERTY || m->u.property.is_static) continue;
+            LRValue v = m->u.property.val
+                ? interp_eval_node(interp, m->u.property.val)
+                : LR_VALUE_UNDEFINED;
+            if (interp->error_flag) {
+                lr_free_value(ctx, v);
+                break;
+            }
+            if (m->u.property.key && m->u.property.key->type == AST_IDENTIFIER) {
+                lr_set_property_str(ctx, this_val,
+                                    m->u.property.key->u.ident.name, v);
+            } else if (m->u.property.key) {
+                LRValue kv = interp_eval_node(interp, m->u.property.key);
+                LRString *atom = lr_to_atom(ctx, kv);
+                lr_set_property(ctx, this_val, atom, v);
+                lr_free_value(ctx, kv);
+            } else {
+                lr_free_value(ctx, v);
+            }
+        }
+        interp_pop_scope(interp);
+        if (interp->error_flag) return LR_VALUE_UNDEFINED;
+    }
+
+    /* Run the explicit constructor body (with the class's lexical scope) */
+    if (ctor_ast) {
+        interp->pending_closure = cls_closure;
+        return interp_call_function(interp, ctor_ast, this_val, argc, argv);
+    }
+    return LR_VALUE_UNDEFINED;
+}
+
+/* Dispatch any callable AST node: function/arrow or class */
+static LRValue interp_invoke_function_ast(Interpreter *interp, ASTNode *ast,
+                                          LRValue this_val, int argc, LRValue *argv)
+{
+    if (!ast) { interp->pending_closure = NULL; return LR_VALUE_UNDEFINED; }
+    if (ast->type == AST_CLASS_DECL) {
+        return interp_call_class_function(interp, ast, this_val, argc, argv);
+    }
+    if (ast->type == AST_FUNC_EXPR || ast->type == AST_FUNC_DECL ||
+        ast->type == AST_ARROW) {
+        return interp_call_function(interp, ast, this_val, argc, argv);
+    }
+    interp->pending_closure = NULL;
+    return LR_VALUE_UNDEFINED;
 }
 
 /* ── Statement Evaluators ──────────────────────────────────────────────── */
@@ -2172,8 +3009,43 @@ static LRValue eval_if(Interpreter *interp, ASTNode *node)
     return LR_VALUE_UNDEFINED;
 }
 
+/* ── Labeled break/continue helpers ────────────────────────────────────
+ * A pending break/continue with an empty label targets the innermost
+ * loop; with a label it targets the loop tagged with that label (via
+ * interp->pending_label, set by the AST_LABEL handler). Non-matching
+ * flags propagate outward through enclosing loops. */
+
+static int break_is_mine(Interpreter *interp, const char *label)
+{
+    if (!interp->break_target) return 0;
+    if (interp->break_label[0] == '\0') return 1;
+    return label && strcmp(interp->break_label, label) == 0;
+}
+
+static int continue_is_mine(Interpreter *interp, const char *label)
+{
+    if (!interp->continue_target) return 0;
+    if (interp->continue_label[0] == '\0') return 1;
+    return label && strcmp(interp->continue_label, label) == 0;
+}
+
+static void consume_break(Interpreter *interp)
+{
+    interp->break_target = 0;
+    interp->break_label[0] = '\0';
+}
+
+static void consume_continue(Interpreter *interp)
+{
+    interp->continue_target = 0;
+    interp->continue_label[0] = '\0';
+}
+
 static LRValue eval_for(Interpreter *interp, ASTNode *node)
 {
+    const char *my_label = interp->pending_label;
+    interp->pending_label = NULL;
+
     /* Create a scope for the loop variable */
     interp_push_scope(interp, 0);
 
@@ -2200,8 +3072,15 @@ static LRValue eval_for(Interpreter *interp, ASTNode *node)
             lr_free_value(interp->ctx, result);
         }
         result = interp_eval_node(interp, node->u.for_stmt.body);
-        if (interp->break_target) { interp->break_target = 0; break; }
+        if (interp->break_target) {
+            if (break_is_mine(interp, my_label)) consume_break(interp);
+            break;   /* consumed here, or propagates to an outer loop */
+        }
         if (interp->has_returned || interp->error_flag) break;
+        if (interp->continue_target) {
+            if (continue_is_mine(interp, my_label)) consume_continue(interp);
+            else break;   /* labeled continue for an outer loop */
+        }
 
         /* Update */
         if (node->u.for_stmt.update) {
@@ -2209,16 +3088,7 @@ static LRValue eval_for(Interpreter *interp, ASTNode *node)
             lr_free_value(interp->ctx, update);
             if (interp->error_flag) break;
         }
-
-        /* Handle continue */
-        if (interp->continue_target) {
-            interp->continue_target = 0;
-        }
     }
-
-    /* Clear continue if set */
-    if (interp->continue_target) interp->continue_target = 0;
-    /* Don't clear break - it's consumed by the loop */
 
     interp_pop_scope(interp);
     return result;
@@ -2226,6 +3096,9 @@ static LRValue eval_for(Interpreter *interp, ASTNode *node)
 
 static LRValue eval_for_in(Interpreter *interp, ASTNode *node)
 {
+    const char *my_label = interp->pending_label;
+    interp->pending_label = NULL;
+
     /* Evaluate the source collection */
     LRValue source = interp_eval_node(interp, node->u.for_in.source);
     if (interp->error_flag) return source;
@@ -2278,12 +3151,12 @@ static LRValue eval_for_in(Interpreter *interp, ASTNode *node)
         }
         result = interp_eval_node(interp, node->u.for_in.body);
         if (interp->continue_target) {
-            interp->continue_target = 0;
+            if (continue_is_mine(interp, my_label)) consume_continue(interp);
+            else break;   /* labeled continue for an outer loop */
         }
     }
 
-    if (interp->break_target) interp->break_target = 0;
-    if (interp->continue_target) interp->continue_target = 0;
+    if (break_is_mine(interp, my_label)) consume_break(interp);
 
     lr_free_property_enum(interp->ctx, props, nprops);
     lr_free_value(interp->ctx, source);
@@ -2292,8 +3165,59 @@ static LRValue eval_for_in(Interpreter *interp, ASTNode *node)
     return result;
 }
 
+static void for_of_assign_var(Interpreter *interp, ASTNode *each, LRValue item)
+{
+    if (!each) return;
+    if (each->type == AST_VAR_DECL) {
+        if (each->u.var_decl.nvars > 0) {
+            ASTNode *decl = each->u.var_decl.vars[0];
+            if (decl && decl->type == AST_VAR_DECLARATOR) {
+                ASTNode *var = decl->u.declarator.var;
+                if (var && var->type == AST_IDENTIFIER)
+                    scope_declare_name(interp, var->u.ident.name, item, 0);
+                else if (var && (var->type == AST_PATTERN || var->type == AST_ARRAY ||
+                                 var->type == AST_OBJECT))
+                    eval_pattern(interp, var, item);
+            }
+        }
+    } else if (each->type == AST_IDENTIFIER) {
+        scope_set_name(interp, each->u.ident.name, item);
+    } else if (each->type == AST_PATTERN || each->type == AST_ARRAY ||
+               each->type == AST_OBJECT) {
+        eval_pattern(interp, each, item);
+    } else if (each->type == AST_ASSIGN) {
+        ASTNode *target = each->u.assign.target;
+        if (target->type == AST_IDENTIFIER) {
+            scope_set_name(interp, target->u.ident.name, item);
+        } else if (target->type == AST_MEMBER) {
+            LRValue obj = interp_eval_node(interp, target->u.member.obj);
+            if (!interp->error_flag) {
+                const char *prop = target->u.member.prop->u.ident.name;
+                lr_set_property_str(interp->ctx, obj, prop, lr_dup_value(interp->ctx, item));
+            }
+            lr_free_value(interp->ctx, obj);
+        } else if (target->type == AST_COMPUTED_MEMBER) {
+            LRValue obj = interp_eval_node(interp, target->u.member.obj);
+            if (!interp->error_flag) {
+                LRValue prop = interp_eval_node(interp, target->u.member.prop);
+                if (!interp->error_flag) {
+                    LRString *atom = lr_to_atom(interp->ctx, prop);
+                    lr_set_property(interp->ctx, obj, atom, lr_dup_value(interp->ctx, item));
+                }
+                lr_free_value(interp->ctx, prop);
+            }
+            lr_free_value(interp->ctx, obj);
+        } else {
+            eval_pattern(interp, target, item);
+        }
+    }
+}
+
 static LRValue eval_for_of(Interpreter *interp, ASTNode *node)
 {
+    const char *my_label = interp->pending_label;
+    interp->pending_label = NULL;
+
     /* Evaluate the source iterable */
     LRValue source = interp_eval_node(interp, node->u.for_of.source);
     if (interp->error_flag) return source;
@@ -2302,8 +3226,29 @@ static LRValue eval_for_of(Interpreter *interp, ASTNode *node)
     interp_push_scope(interp, 0);
 
     LRValue result = LR_VALUE_UNDEFINED;
+    ASTNode *each = node->u.for_of.each;
 
-    if (lr_is_array(interp->ctx, source)) {
+    if (lr_is_string(source)) {
+        const char *s = lr_to_cstring(interp->ctx, source);
+        size_t slen = s ? strlen(s) : 0;
+        char buf[8];
+        for (size_t i = 0; i < slen; i++) {
+            if (interp->break_target || interp->has_returned || interp->error_flag) break;
+            /* UTF-8 best-effort: emit one byte as a string (ASCII-safe). */
+            buf[0] = s[i]; buf[1] = '\0';
+            LRValue item = lr_new_string(interp->ctx, buf);
+            for_of_assign_var(interp, each, item);
+            lr_free_value(interp->ctx, item);
+
+            if (result.tag != LR_TYPE_UNDEFINED) lr_free_value(interp->ctx, result);
+            result = interp_eval_node(interp, node->u.for_of.body);
+            if (interp->continue_target) {
+                if (continue_is_mine(interp, my_label)) consume_continue(interp);
+                else break;
+            }
+        }
+        lr_free_cstring(interp->ctx, s);
+    } else if (lr_is_array(interp->ctx, source)) {
         int32_t len = 0;
         LRValue len_val = lr_get_property_str(interp->ctx, source, "length");
         lr_to_int32(interp->ctx, &len, len_val);
@@ -2313,38 +3258,68 @@ static LRValue eval_for_of(Interpreter *interp, ASTNode *node)
             if (interp->break_target || interp->has_returned || interp->error_flag) break;
 
             LRValue item = lr_get_property_uint32(interp->ctx, source, i);
-
-            ASTNode *each = node->u.for_of.each;
-            if (each) {
-                if (each->type == AST_VAR_DECL) {
-                    if (each->u.var_decl.nvars > 0) {
-                        ASTNode *declarator = each->u.var_decl.vars[0];
-                        if (declarator && declarator->type == AST_VAR_DECLARATOR) {
-                            ASTNode *var = declarator->u.declarator.var;
-                            if (var && var->type == AST_IDENTIFIER) {
-                                scope_declare_name(interp, var->u.ident.name, item, 0);
-                            }
-                        }
-                    }
-                } else if (each->type == AST_IDENTIFIER) {
-                    scope_set_name(interp, each->u.ident.name, item);
-                }
-            }
-
+            for_of_assign_var(interp, each, item);
             lr_free_value(interp->ctx, item);
 
-            if (result.tag != LR_TYPE_UNDEFINED) {
-                lr_free_value(interp->ctx, result);
-            }
+            if (result.tag != LR_TYPE_UNDEFINED) lr_free_value(interp->ctx, result);
             result = interp_eval_node(interp, node->u.for_of.body);
             if (interp->continue_target) {
-                interp->continue_target = 0;
+                if (continue_is_mine(interp, my_label)) consume_continue(interp);
+                else break;
             }
         }
+    } else if (lr_is_object(source)) {
+        /* Iterable protocol: const iter = source[Symbol.iterator](); then iter.next() */
+        LRValue iter_fn = lr_get_property_str(interp->ctx, source, "Symbol.iterator");
+        if (lr_is_function(interp->ctx, iter_fn) && iter_fn.tag == LR_TYPE_OBJECT) {
+            LRValue iter_argv[1] = { source };
+            LRValue iter = call_value_with_args(interp, NULL, iter_fn, source, 1, iter_argv);
+            lr_free_value(interp->ctx, iter_fn);
+            if (interp->error_flag) {
+                lr_free_value(interp->ctx, iter);
+                lr_free_value(interp->ctx, source);
+                interp_pop_scope(interp);
+                return result;
+            }
+            if (lr_is_object(iter)) {
+                LRValue next_fn = lr_get_property_str(interp->ctx, iter, "next");
+                while (!interp->break_target && !interp->has_returned && !interp->error_flag) {
+                    LRValue nr = call_value_with_args(interp, NULL, next_fn, iter, 0, NULL);
+                    if (interp->error_flag) { lr_free_value(interp->ctx, nr); break; }
+                    LRValue done = lr_get_property_str(interp->ctx, nr, "done");
+                    int is_done = lr_to_bool(interp->ctx, done);
+                    lr_free_value(interp->ctx, done);
+                    if (is_done) { lr_free_value(interp->ctx, nr); break; }
+                    LRValue value = lr_get_property_str(interp->ctx, nr, "value");
+                    for_of_assign_var(interp, each, value);
+                    lr_free_value(interp->ctx, value);
+                    lr_free_value(interp->ctx, nr);
+
+                    if (result.tag != LR_TYPE_UNDEFINED) lr_free_value(interp->ctx, result);
+                    result = interp_eval_node(interp, node->u.for_of.body);
+                    if (interp->continue_target) {
+                        if (continue_is_mine(interp, my_label)) consume_continue(interp);
+                        else break;
+                    }
+                }
+                lr_free_value(interp->ctx, next_fn);
+            }
+            lr_free_value(interp->ctx, iter);
+        } else {
+            lr_free_value(interp->ctx, iter_fn);
+            snprintf(interp->error_message, sizeof(interp->error_message),
+                     "%s is not iterable", "value");
+            interp->exception_value = LR_VALUE_UNDEFINED;
+            interp->error_flag = 1;
+        }
+    } else {
+        snprintf(interp->error_message, sizeof(interp->error_message),
+                 "%s is not iterable", "value");
+        interp->exception_value = LR_VALUE_UNDEFINED;
+        interp->error_flag = 1;
     }
 
-    if (interp->break_target) interp->break_target = 0;
-    if (interp->continue_target) interp->continue_target = 0;
+    if (break_is_mine(interp, my_label)) consume_break(interp);
 
     lr_free_value(interp->ctx, source);
 
@@ -2354,6 +3329,9 @@ static LRValue eval_for_of(Interpreter *interp, ASTNode *node)
 
 static LRValue eval_while(Interpreter *interp, ASTNode *node)
 {
+    const char *my_label = interp->pending_label;
+    interp->pending_label = NULL;
+
     LRValue result = LR_VALUE_UNDEFINED;
 
     while (!interp->break_target && !interp->has_returned && !interp->error_flag) {
@@ -2367,17 +3345,25 @@ static LRValue eval_while(Interpreter *interp, ASTNode *node)
             lr_free_value(interp->ctx, result);
         }
         result = interp_eval_node(interp, node->u.if_stmt.body);
-        if (interp->break_target) { interp->break_target = 0; break; }
+        if (interp->break_target) {
+            if (break_is_mine(interp, my_label)) consume_break(interp);
+            break;
+        }
         if (interp->has_returned || interp->error_flag) break;
-        if (interp->continue_target) interp->continue_target = 0;
+        if (interp->continue_target) {
+            if (continue_is_mine(interp, my_label)) consume_continue(interp);
+            else break;
+        }
     }
 
-    if (interp->continue_target) interp->continue_target = 0;
     return result;
 }
 
 static LRValue eval_do_while(Interpreter *interp, ASTNode *node)
 {
+    const char *my_label = interp->pending_label;
+    interp->pending_label = NULL;
+
     LRValue result = LR_VALUE_UNDEFINED;
 
     do {
@@ -2385,9 +3371,15 @@ static LRValue eval_do_while(Interpreter *interp, ASTNode *node)
             lr_free_value(interp->ctx, result);
         }
         result = interp_eval_node(interp, node->u.if_stmt.body);
-        if (interp->break_target) { interp->break_target = 0; break; }
+        if (interp->break_target) {
+            if (break_is_mine(interp, my_label)) consume_break(interp);
+            break;
+        }
         if (interp->has_returned || interp->error_flag) break;
-        if (interp->continue_target) { interp->continue_target = 0; }
+        if (interp->continue_target) {
+            if (continue_is_mine(interp, my_label)) consume_continue(interp);
+            else break;
+        }
 
         LRValue cond = interp_eval_node(interp, node->u.if_stmt.cond);
         int truthy = lr_to_bool(interp->ctx, cond);
@@ -2395,12 +3387,14 @@ static LRValue eval_do_while(Interpreter *interp, ASTNode *node)
         if (!truthy) break;
     } while (!interp->break_target && !interp->has_returned && !interp->error_flag);
 
-    if (interp->continue_target) interp->continue_target = 0;
     return result;
 }
 
 static LRValue eval_switch(Interpreter *interp, ASTNode *node)
 {
+    const char *my_label = interp->pending_label;
+    interp->pending_label = NULL;
+
     LRValue test = interp_eval_node(interp, node->u.switch_stmt.test);
     if (interp->error_flag) return test;
 
@@ -2435,7 +3429,7 @@ static LRValue eval_switch(Interpreter *interp, ASTNode *node)
                 }
             }
             if (interp->break_target) {
-                interp->break_target = 0;
+                if (break_is_mine(interp, my_label)) consume_break(interp);
                 break;
             }
             if (interp->has_returned || interp->error_flag) break;
@@ -2448,14 +3442,28 @@ static LRValue eval_switch(Interpreter *interp, ASTNode *node)
 
 static LRValue eval_break(Interpreter *interp, ASTNode *node)
 {
-    (void)node;
+    interp->break_label[0] = '\0';
+    if (node && node->u.break_stmt.label &&
+        node->u.break_stmt.label->type == AST_IDENTIFIER &&
+        node->u.break_stmt.label->u.ident.name &&
+        node->u.break_stmt.label->u.ident.name[0]) {
+        snprintf(interp->break_label, sizeof(interp->break_label), "%s",
+                 node->u.break_stmt.label->u.ident.name);
+    }
     interp->break_target = 1;
     return LR_VALUE_UNDEFINED;
 }
 
 static LRValue eval_continue(Interpreter *interp, ASTNode *node)
 {
-    (void)node;
+    interp->continue_label[0] = '\0';
+    if (node && node->u.continue_stmt.label &&
+        node->u.continue_stmt.label->type == AST_IDENTIFIER &&
+        node->u.continue_stmt.label->u.ident.name &&
+        node->u.continue_stmt.label->u.ident.name[0]) {
+        snprintf(interp->continue_label, sizeof(interp->continue_label), "%s",
+                 node->u.continue_stmt.label->u.ident.name);
+    }
     interp->continue_target = 1;
     return LR_VALUE_UNDEFINED;
 }
@@ -2689,75 +3697,246 @@ static LRValue eval_class_decl(Interpreter *interp, ASTNode *node)
     if (name) {
         scope_declare_name(interp, name, class_obj, 1); /* let-like */
     }
-    lr_free_value(interp->ctx, class_obj);
-    return LR_VALUE_UNDEFINED;
+    /* Return the class object so class *expressions*
+     * (var X = class {...}) evaluate to the constructor. */
+    return class_obj;
+}
+
+/* Collect bound identifier names from a binding pattern node (used by
+ * `export var/let/const <pattern>` to learn which names to export).
+ * Appends borrowed char* pointers (owned by the AST, not copied) into the
+ * supplied growable array. */
+static void collect_export_names(ASTNode *binding, char ***pnames, int *pn, int *pcap)
+{
+    if (!binding) return;
+    switch (binding->type) {
+    case AST_IDENTIFIER:
+        if (binding->u.ident.name) {
+            if (*pn >= *pcap) {
+                *pcap = *pcap ? *pcap * 2 : 4;
+                *pnames = (char **)realloc(*pnames, *pcap * sizeof(char *));
+            }
+            (*pnames)[(*pn)++] = binding->u.ident.name;
+        }
+        break;
+    case AST_REST:
+        collect_export_names(binding->u.rest_elem.arg, pnames, pn, pcap);
+        break;
+    case AST_DEFAULT_VALUE:
+        collect_export_names(binding->u.default_val.left, pnames, pn, pcap);
+        break;
+    case AST_PATTERN:
+        if (binding->u.pattern_array.is_object) {
+            for (int i = 0; i < binding->u.pattern_object.nprops; i++) {
+                ASTNode *p = binding->u.pattern_object.props[i];
+                if (!p) continue;
+                ASTNode *target = (p->type == AST_PROPERTY && p->u.property.val)
+                                    ? p->u.property.val : p;
+                collect_export_names(target, pnames, pn, pcap);
+            }
+        } else {
+            for (int i = 0; i < binding->u.pattern_array.nelem; i++)
+                collect_export_names(binding->u.pattern_array.elements[i], pnames, pn, pcap);
+        }
+        break;
+    case AST_PROPERTY:
+        collect_export_names(binding->u.property.val ? binding->u.property.val
+                                                       : binding->u.property.key,
+                             pnames, pn, pcap);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Resolve a module specifier to its namespace object via the runtime's module
+ * loader. Returns an LRValue wrapping the namespace (borrowed reference) and,
+ * on success, sets *out_mod to the module definition. On failure it records an
+ * exception on the interpreter and returns an undefined value with *out_mod
+ * left NULL. */
+static LRValue eval_resolve_module(Interpreter *interp, const char *spec,
+                                   JSModuleDef **out_mod)
+{
+    *out_mod = NULL;
+    if (!spec) return LR_VALUE_UNDEFINED;
+
+    char *normalized = NULL;
+    if (interp->ctx->rt->module_normalize_func)
+        normalized = interp->ctx->rt->module_normalize_func(interp->ctx, NULL, spec, NULL);
+    const char *load_name = normalized ? normalized : spec;
+
+    JSModuleDef *mod = NULL;
+    if (interp->ctx->rt->module_loader_func)
+        mod = interp->ctx->rt->module_loader_func(interp->ctx, load_name, NULL);
+    if (normalized) free(normalized);
+
+    if (!mod || !mod->obj) {
+        LRValue err = JS_ThrowReferenceError(interp->ctx, "Cannot load module '%s'", spec);
+        interp->error_flag = 1;
+        interp->exception_pending = 1;
+        interp->exception_value = lr_dup_value(interp->ctx, err);
+        lr_free_value(interp->ctx, err);
+        return LR_VALUE_UNDEFINED;
+    }
+
+    *out_mod = mod;
+    LRValue ns;
+    ns.tag = LR_TYPE_OBJECT;
+    ns.u.ptr = mod->obj;
+    return ns;
 }
 
 static LRValue eval_import(Interpreter *interp, ASTNode *node)
 {
-    /* Import declaration - simplified stub */
-    /* In a real implementation, this would load modules */
+    ASTNode *src_node = node->u.import_decl.source;
+    if (!src_node || src_node->type != AST_LITERAL) {
+        /* import with no source, or a bare specifier */
+        return LR_VALUE_UNDEFINED;
+    }
+    const char *spec = src_node->u.string.str;
+
+    JSModuleDef *mod = NULL;
+    LRValue ns = eval_resolve_module(interp, spec, &mod);
+    if (!mod) return LR_VALUE_UNDEFINED;
+
     int nspec = node->u.import_decl.nspec;
     ASTNode **specifiers = node->u.import_decl.specifiers;
-
     for (int i = 0; i < nspec; i++) {
-        ASTNode *spec = specifiers[i];
-        if (spec->type == AST_IMPORT_SPECIFIER) {
-            const char *name = spec->u.import_spec.name;
-            ASTNode *local = spec->u.import_spec.local;
-            if (local && local->type == AST_IDENTIFIER) {
-                const char *local_name = local->u.ident.name;
-                /* Create a placeholder value */
-                LRValue val = LR_VALUE_UNDEFINED;
-                scope_declare_name(interp, local_name ? local_name : name, val, 1);
-            }
-        } else if (spec->type == AST_IMPORT_NAMESPACE) {
-            ASTNode *local = spec->u.import_namespace.local;
-            if (local && local->type == AST_IDENTIFIER) {
-                LRValue ns = lr_new_object(interp->ctx);
-                scope_declare_name(interp, local->u.ident.name, ns, 1);
-                lr_free_value(interp->ctx, ns);
-            }
+        ASTNode *spec_node = specifiers[i];
+        if (!spec_node) continue;
+        if (spec_node->type == AST_IMPORT_SPECIFIER) {
+            const char *local_name =
+                (spec_node->u.import_spec.local
+                 && spec_node->u.import_spec.local->type == AST_IDENTIFIER)
+                    ? spec_node->u.import_spec.local->u.ident.name : NULL;
+            const char *export_name = spec_node->u.import_spec.is_default
+                ? "default" : spec_node->u.import_spec.name;
+            if (!local_name) local_name = export_name;
+            if (!export_name) continue;
+            /* Read the binding from the module namespace and bind it locally.
+             * lr_get_property_str returns a caller-owned value; scope_declare_name
+             * takes its own copy, so we free our copy afterwards. */
+            LRValue val = lr_get_property_str(interp->ctx, ns, export_name);
+            scope_declare_name(interp, local_name, val, 1);
+            lr_free_value(interp->ctx, val);
+        } else if (spec_node->type == AST_IMPORT_NAMESPACE) {
+            ASTNode *local = spec_node->u.import_namespace.local;
+            const char *local_name = (local && local->type == AST_IDENTIFIER)
+                ? local->u.ident.name : NULL;
+            if (local_name)
+                scope_declare_name(interp, local_name, ns, 1);
         }
     }
-
     return LR_VALUE_UNDEFINED;
 }
 
 static LRValue eval_export(Interpreter *interp, ASTNode *node)
 {
-    /* Export declaration - simplified stub */
-    /* In a real module system, this would register exports */
+    LRObject *ns = interp->module_ns;
     int nspec = node->u.export_decl.nspec;
     ASTNode **specifiers = node->u.export_decl.specifiers;
+    ASTNode *src_node = node->u.export_decl.source;
+
+    /* Re-export from another module? */
+    JSModuleDef *re_mod = NULL;
+    LRValue re_ns = LR_VALUE_UNDEFINED;
+    if (src_node && src_node->type == AST_LITERAL) {
+        re_ns = eval_resolve_module(interp, src_node->u.string.str, &re_mod);
+        if (!re_mod) return LR_VALUE_UNDEFINED; /* exception already recorded */
+    }
+
+    LRValue ns_val;
+    ns_val.tag = (ns ? LR_TYPE_OBJECT : LR_TYPE_UNDEFINED);
+    ns_val.u.ptr = ns;
 
     for (int i = 0; i < nspec; i++) {
         ASTNode *spec = specifiers[i];
+        if (!spec) continue;
+
         if (spec->type == AST_EXPORT_DEFAULT) {
-            /* export default ... */
-            if (spec->u.export_default.value) {
-                LRValue val = interp_eval_node(interp, spec->u.export_default.value);
+            /* export default <expr> */
+            LRValue val = interp_eval_node(interp, spec->u.export_default.value);
+            if (ns) lr_set_property_str(interp->ctx, ns_val, "default", val); /* takes ownership */
+            else lr_free_value(interp->ctx, val);
+        } else if (spec->type == AST_EXPORT_NAMED) {
+            /* export { local } or export { local as alias } [from "mod"] */
+            const char *local_name = spec->u.export_spec.name;
+            const char *exported_name =
+                (spec->u.export_spec.exported
+                 && spec->u.export_spec.exported->type == AST_IDENTIFIER)
+                    ? spec->u.export_spec.exported->u.ident.name : local_name;
+            if (!exported_name) exported_name = local_name;
+            if (!exported_name) continue;
+
+            LRValue val;
+            if (re_mod) {
+                val = lr_get_property_str(interp->ctx, re_ns, local_name ? local_name : "");
+            } else {
+                val = LR_VALUE_UNDEFINED;
+                scope_lookup_internal(interp->current_scope, local_name, &val);
+            }
+            if (ns) lr_set_property_str(interp->ctx, ns_val, exported_name, val); /* takes ownership */
+            else lr_free_value(interp->ctx, val);
+        } else if (spec->type == AST_EXPORT_ALL) {
+            /* export * from "module" */
+            if (re_mod) {
+                LRPropertyEnum *tab = NULL;
+                uint32_t plen = 0;
+                lr_get_own_property_names(interp->ctx, &tab, &plen, re_ns, JS_GPN_STRING_MASK);
+                for (uint32_t k = 0; k < plen; k++) {
+                    const char *pname = lr_atom_to_cstring(interp->ctx, tab[k].atom);
+                    if (pname && strcmp(pname, "default") != 0) {
+                        LRValue val = lr_get_property_str(interp->ctx, re_ns, pname);
+                        if (ns) lr_set_property_str(interp->ctx, ns_val, pname, val); /* takes ownership */
+                        else lr_free_value(interp->ctx, val);
+                    }
+                    lr_free_cstring(interp->ctx, pname);
+                }
+                lr_free_property_enum(interp->ctx, tab, plen);
+            }
+        } else if (spec->type == AST_VAR_DECL) {
+            /* export var/let/const ... : evaluate (binds names), then export them */
+            LRValue val = interp_eval_node(interp, spec);
+            lr_free_value(interp->ctx, val);
+            char **names = NULL;
+            int n = 0, cap = 0;
+            for (int v = 0; v < spec->u.var_decl.nvars; v++) {
+                ASTNode *decl = spec->u.var_decl.vars[v];
+                if (decl && decl->type == AST_VAR_DECLARATOR)
+                    collect_export_names(decl->u.declarator.var, &names, &n, &cap);
+            }
+            for (int v = 0; v < n; v++) {
+                LRValue bval = LR_VALUE_UNDEFINED;
+                scope_lookup_internal(interp->current_scope, names[v], &bval);
+                if (ns) lr_set_property_str(interp->ctx, ns_val, names[v], bval); /* takes ownership */
+                else lr_free_value(interp->ctx, bval);
+            }
+            free(names);
+        } else if (spec->type == AST_FUNC_DECL) {
+            /* export function name() {} — eval_func_decl only declares the
+             * name and returns UNDEFINED, so read the function object back
+             * from the scope to export it. */
+            const char *fname = spec->u.func.name;
+            LRValue decl = interp_eval_node(interp, spec);
+            lr_free_value(interp->ctx, decl);
+            if (fname) {
+                LRValue bval = LR_VALUE_UNDEFINED;
+                scope_lookup_internal(interp->current_scope, fname, &bval);
+                if (ns) lr_set_property_str(interp->ctx, ns_val, fname, bval); /* takes ownership */
+                else lr_free_value(interp->ctx, bval);
+            }
+        } else if (spec->type == AST_CLASS_DECL) {
+            /* export class Name {} */
+            const char *cname = spec->u.class_decl.name;
+            LRValue val = interp_eval_node(interp, spec);
+            if (cname) {
+                if (ns) lr_set_property_str(interp->ctx, ns_val, cname, val); /* takes ownership */
+                else lr_free_value(interp->ctx, val);
+            } else {
                 lr_free_value(interp->ctx, val);
             }
-        } else if (spec->type == AST_EXPORT_NAMED) {
-            /* export { name } */
-            const char *name = spec->u.export_spec.name;
-            (void)name;
-        } else if (spec->type == AST_VAR_DECL) {
-            /* export var/let/const ... */
-            LRValue val = interp_eval_node(interp, spec);
-            lr_free_value(interp->ctx, val);
-        } else if (spec->type == AST_FUNC_DECL) {
-            /* export function ... */
-            LRValue val = interp_eval_node(interp, spec);
-            lr_free_value(interp->ctx, val);
-        } else if (spec->type == AST_CLASS_DECL) {
-            /* export class ... */
-            LRValue val = interp_eval_node(interp, spec);
-            lr_free_value(interp->ctx, val);
         }
     }
-
     return LR_VALUE_UNDEFINED;
 }
 
@@ -2794,8 +3973,27 @@ static LRValue interp_eval_stmt(Interpreter *interp, ASTNode *node)
     case AST_IMPORT:      return eval_import(interp, node);
     case AST_EXPORT:      return eval_export(interp, node);
     case AST_LABEL: {
-        /* Labeled statement - just execute the inner statement */
-        return interp_eval_node(interp, node->u.label_stmt.stmt);
+        ASTNode *stmt = node->u.label_stmt.stmt;
+        const char *lname = (node->u.label_stmt.label &&
+                             node->u.label_stmt.label->type == AST_IDENTIFIER)
+                            ? node->u.label_stmt.label->u.ident.name : NULL;
+        /* Hand the label to a directly-following loop/switch */
+        const char *saved_pending = interp->pending_label;
+        int is_breakable = stmt &&
+            (stmt->type == AST_FOR || stmt->type == AST_WHILE ||
+             stmt->type == AST_DO_WHILE || stmt->type == AST_FOR_IN ||
+             stmt->type == AST_FOR_OF || stmt->type == AST_SWITCH);
+        if (is_breakable) interp->pending_label = lname;
+        LRValue r = interp_eval_node(interp, stmt);
+        if (is_breakable) interp->pending_label = saved_pending;
+        /* Labeled non-loop statement (labeled block): 'break lbl' exits here.
+         * Also catches a propagating labeled break for a nested label. */
+        if (interp->break_target && lname && interp->break_label[0] &&
+            strcmp(interp->break_label, lname) == 0) {
+            interp->break_target = 0;
+            interp->break_label[0] = '\0';
+        }
+        return r;
     }
     case AST_DEBUGGER:
         /* Debugger statement - no-op */
@@ -2888,19 +4086,91 @@ static LRValue eval_this_expr(Interpreter *interp, ASTNode *node)
 
 static LRValue eval_super_expr(Interpreter *interp, ASTNode *node)
 {
-    (void)interp; (void)node;
+    (void)node;
+    /* 'super.prop' reads resolve against the parent prototype */
+    LRValue sproto;
+    if (scope_lookup_internal(interp->current_scope, "%superproto%", &sproto)) {
+        return sproto;
+    }
     return LR_VALUE_UNDEFINED;
 }
 
 static LRValue eval_tagged_template(Interpreter *interp, ASTNode *node)
 {
-    (void)interp; (void)node;
-    return LR_VALUE_UNDEFINED;
+    ASTNode *tag_node = node->u.template_lit.tag;
+    if (!tag_node) return LR_VALUE_UNDEFINED;
+    LRContext *ctx = interp->ctx;
+
+    LRValue tag = interp_eval_node(interp, tag_node);
+    if (interp->error_flag) {
+        lr_free_value(ctx, tag);
+        return LR_VALUE_UNDEFINED;
+    }
+
+    int nparts = node->u.template_lit.nparts;
+    int nexp   = node->u.template_lit.nexp;
+    ASTNode **exprs = node->u.template_lit.exprs;
+
+    /* Build the 'strings' array (cooked) and its '.raw' array (verbatim). */
+    LRValue strings = lr_new_array(ctx);
+    LRValue raw_arr = lr_new_array(ctx);
+    for (int i = 0; i < nparts; i++) {
+        const char *verbatim = node->u.template_lit.parts[i]
+                                 ? node->u.template_lit.parts[i] : "";
+        char *cooked = template_unescape(verbatim);
+        lr_set_property_uint32(ctx, strings, i,
+                               lr_new_string(ctx, cooked ? cooked : ""));
+        lr_set_property_uint32(ctx, raw_arr, i, lr_new_string(ctx, verbatim));
+        if (cooked) free(cooked);
+    }
+    lr_set_property_str(ctx, strings, "length", lr_new_int32(ctx, nparts));
+    lr_set_property_str(ctx, raw_arr, "length", lr_new_int32(ctx, nparts));
+    lr_set_property_str(ctx, strings, "raw", raw_arr); /* raw_arr ownership -> strings */
+
+    /* Build arguments: [strings, ...exprValues] */
+    int argc = nexp + 1;
+    LRValue *argv = (LRValue *)calloc(argc, sizeof(LRValue));
+    argv[0] = strings; /* strings is consumed via argv[0] below */
+    for (int i = 0; i < nexp; i++) {
+        argv[i + 1] = interp_eval_node(interp, exprs[i]);
+        if (interp->error_flag) {
+            for (int j = 0; j <= i; j++) lr_free_value(ctx, argv[j]);
+            free(argv);
+            lr_free_value(ctx, tag);
+            return LR_VALUE_UNDEFINED;
+        }
+    }
+
+    LRValue result = call_value_with_args(interp, tag_node, tag,
+                                          LR_VALUE_UNDEFINED, argc, argv);
+
+    for (int i = 0; i < argc; i++) lr_free_value(ctx, argv[i]);
+    free(argv);
+    lr_free_value(ctx, tag);
+    return result;
 }
 
 static LRValue eval_yield_expr(Interpreter *interp, ASTNode *node)
 {
-    (void)interp; (void)node;
+    if (!interp->gen_active) {
+        snprintf(interp->error_message, sizeof(interp->error_message),
+                 "yield is only valid inside a generator function");
+        interp->exception_value = LR_VALUE_UNDEFINED;
+        interp->error_flag = 1;
+        return LR_VALUE_UNDEFINED;
+    }
+    LRValue arg = node->u.yield_expr.arg
+        ? interp_eval_node(interp, node->u.yield_expr.arg)
+        : LR_VALUE_UNDEFINED;
+    if (interp->error_flag) return arg;
+
+    if (node->u.yield_expr.is_delegate) {
+        gen_delegate(interp, arg);
+    } else {
+        gen_append(interp, arg);
+    }
+    lr_free_value(interp->ctx, arg);
+    /* Eager generators cannot receive values from next(v): yield -> undefined */
     return LR_VALUE_UNDEFINED;
 }
 
@@ -2980,13 +4250,9 @@ static LRValue interp_callback_call(LRContext *ctx, LRValue func,
     LRObject *obj = (LRObject *)func.u.ptr;
     if (obj->type == LR_OBJ_FUNCTION && obj->extra) {
         ASTNode *func_ast = (ASTNode *)obj->extra;
-        /* Call the function's body */
-        if (func_ast->type == AST_FUNC_EXPR || func_ast->type == AST_FUNC_DECL) {
-            return interp_call_function(interp, func_ast, this_val, argc, argv);
-        }
-        if (func_ast->type == AST_ARROW) {
-            return interp_call_function(interp, func_ast, this_val, argc, argv);
-        }
+        /* Call the function/class body with its captured closure scope */
+        interp->pending_closure = obj->def_scope;
+        return interp_invoke_function_ast(interp, func_ast, this_val, argc, argv);
     }
     return LR_VALUE_UNDEFINED;
 }
@@ -3009,6 +4275,10 @@ void interp_init(Interpreter *interp, LRContext *ctx, int is_module)
     }
     ctx->opaque_interp = interp;
 
+    /* Install the closure-scope release hook so lr_free_object can drop
+     * captured scopes when function objects die */
+    lr_closure_scope_release = interp_closure_release_hook;
+
     /* Create global scope */
     InterpScope *global = scope_new(NULL, 1, 1);
     interp->global_scope = global;
@@ -3025,13 +4295,17 @@ void interp_free(Interpreter *interp)
 {
     if (!interp) return;
 
-    /* Free all scopes */
-    while (interp->current_scope) {
+    /* Release all scopes on the current chain (each drops its own ref;
+     * scopes still captured by live closures survive until object free) */
+    {
         InterpScope *s = interp->current_scope;
-        interp->current_scope = s->parent;
-        s->parent = NULL;
-        scope_free(s, interp->ctx);
+        while (s) {
+            InterpScope *p = s->parent;
+            scope_release(s, interp->ctx);
+            s = p;
+        }
     }
+    interp->current_scope = NULL;
     interp->global_scope = NULL;
 
     /* Free exception value */

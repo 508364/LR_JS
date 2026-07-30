@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "../src/lr_platform.h"
 #include "../src/lr_runtime.h"
 
@@ -45,13 +48,19 @@ static void print_usage(const char *prog)
     printf("  --gc-manual              Disable automatic GC\n");
     printf("  --gc-nursery-size <mb>   Set nursery size in MB\n");
     printf("  --gc-pause-target <ms>   Set target max GC pause in ms\n");
+    printf("  --gc-threshold <bytes>   Set GC threshold in bytes\n");
     printf("  --gc-stats               Print GC statistics on exit\n");
-    printf("  --bytecode-cache <dir>   Enable .lrfile bytecode cache (set cache dir)\n");
-    printf("  --bytecode-stats         Print bytecode cache statistics on exit\n");
+    printf("  --iome586 <dir>          Enable IOME586 result cache (.lrfile.lz4)\n");
+    printf("  --iome586-stats          Print IOME586 cache statistics on exit\n");
+    printf("  --iome586-revert <js>    Roll back the last archived cache for a script\n");
+    printf("  --bytecode-cache <dir>   Alias of --iome586\n");
+    printf("  --bytecode-stats         Alias of --iome586-stats\n");
     printf("  --sandbox-log <dir>      Enable per-sandbox log files (set log dir)\n");
     printf("  --dump-bytecode          Dump compiled bytecode\n");
     printf("  --strip-debug           Strip debug info\n");
     printf("  --timeout <ms>          Set execution timeout in ms\n");
+    printf("  --debug                Enable debug mode\n");
+    printf("  --stack-size <bytes>   Set max stack size in bytes\n");
     printf("  -h, --help               Show this help\n");
     printf("  -v, --version            Show version\n");
     printf("\n");
@@ -143,6 +152,12 @@ static void repl_run(LR_Runtime *rt)
 
 int main(int argc, char *argv[])
 {
+#ifdef _WIN32
+    /* Engine strings are UTF-8; switch the console code page so that
+     * non-ASCII output (e.g. Chinese) renders correctly instead of mojibake. */
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
     lr_socket_init();
 
     /* Parse arguments */
@@ -152,7 +167,9 @@ int main(int argc, char *argv[])
     int interactive = 0;
     int print_gc_stats = 0;
     int print_bytecode_stats = 0;
+    int print_debug_info = 0;
     const char *bytecode_cache_dir = NULL;
+    const char *iome586_revert_script = NULL;
     const char *sandbox_log_dir = NULL;
     LR_Config cfg;
 
@@ -212,14 +229,27 @@ int main(int argc, char *argv[])
             if (i + 1 < argc) {
                 cfg.gc_pause_target_ns = (int64_t)atoi(argv[++i]) * 1000000LL;
             }
+        } else if (strcmp(argv[i], "--gc-threshold") == 0) {
+            if (i + 1 < argc) {
+                cfg.gc_threshold = (size_t)atoll(argv[++i]);
+            }
         } else if (strcmp(argv[i], "--gc-stats") == 0) {
             print_gc_stats = 1;
-        } else if (strcmp(argv[i], "--bytecode-cache") == 0) {
+        } else if (strcmp(argv[i], "--iome586") == 0 ||
+                   strcmp(argv[i], "--bytecode-cache") == 0) {
             if (i + 1 < argc) {
                 bytecode_cache_dir = argv[++i];
             }
-        } else if (strcmp(argv[i], "--bytecode-stats") == 0) {
+        } else if (strcmp(argv[i], "--iome586-stats") == 0 ||
+                   strcmp(argv[i], "--bytecode-stats") == 0) {
             print_bytecode_stats = 1;
+        } else if (strcmp(argv[i], "--iome586-revert") == 0) {
+            if (i + 1 < argc) {
+                iome586_revert_script = argv[++i];
+            } else {
+                fprintf(stderr, "Error: --iome586-revert requires a script path\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--sandbox-log") == 0) {
             if (i + 1 < argc) {
                 sandbox_log_dir = argv[++i];
@@ -230,6 +260,13 @@ int main(int argc, char *argv[])
             cfg.strip_debug_info = 1;
         } else if (strcmp(argv[i], "--timeout") == 0) {
             if (i + 1 < argc) cfg.timeout_ms = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--debug") == 0) {
+            cfg.log_level = LR_LOG_DEBUG;
+            print_debug_info = 1;
+        } else if (strcmp(argv[i], "--stack-size") == 0) {
+            if (i + 1 < argc) {
+                cfg.max_stack_size = (size_t)atoll(argv[++i]);
+            }
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -255,10 +292,36 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* Debug info dump (--debug) */
+    if (print_debug_info) {
+        printf("[debug] version=%s\n", LR_JS_VERSION_STRING);
+        printf("[debug] memory_limit=%zu\n", cfg.memory_limit);
+        printf("[debug] gc_mode=%d generational=%d incremental=%d\n",
+               cfg.gc_mode, cfg.gc_generational, cfg.gc_incremental);
+        printf("[debug] iome586_dir=%s\n",
+               cfg.bytecode_cache_dir ? cfg.bytecode_cache_dir : "(none)");
+    }
+
     /* Set signal handler */
     signal(SIGINT, sigint_handler);
 
     int exit_code = 0;
+
+    /* IOME586 rollback: restore the previous (.bak) archive for a script. */
+    if (iome586_revert_script) {
+        int rc = lr_iome586_revert(&g_rt->iome586, iome586_revert_script);
+        if (rc == 0)
+            printf("IOME586: archive reverted for %s\n", iome586_revert_script);
+        else
+            fprintf(stderr, "IOME586: no backup archive for %s\n",
+                    iome586_revert_script);
+        if (!eval_code && !script_file && !interactive) {
+            lr_runtime_free(g_rt);
+            g_rt = NULL;
+            lr_socket_cleanup();
+            return rc == 0 ? 0 : 1;
+        }
+    }
 
     if (eval_code) {
         /* Evaluate inline code */

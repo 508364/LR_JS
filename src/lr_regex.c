@@ -386,12 +386,29 @@ static Node *parse_atom(PCtx *c)
                 capturing = 0;
                 c->p += 2;
             } else {
-                /* (?<name>...), (?=...), (?!...), (?<=...), (?<!...) etc.
-                 * We treat these as non-capturing (POSIX has no lookaround). */
-                capturing = 0;
                 c->p++;  /* skip '?' */
-                while (c->p < c->end && *c->p != ':' && *c->p != ')') c->p++;
-                if (c->p < c->end && *c->p == ':') c->p++;
+                if (c->p < c->end && *c->p == '<' &&
+                    c->p + 1 < c->end && c->p[1] != '=' && c->p[1] != '!') {
+                    /* Named capturing group (?<name>...): skip the name,
+                     * keep it capturing (name->index mapping is resolved
+                     * by the caller from the pattern text). */
+                    c->p++;  /* skip '<' */
+                    while (c->p < c->end && *c->p != '>') c->p++;
+                    if (c->p < c->end) c->p++;  /* skip '>' */
+                    capturing = 1;
+                } else if (c->p < c->end && *c->p == '<' &&
+                           c->p + 1 < c->end && (c->p[1] == '=' || c->p[1] == '!')) {
+                    /* Lookbehind (?<=...) / (?<!...): no true support; parse
+                     * the body as a non-capturing group (approximation). */
+                    capturing = 0;
+                    c->p += 2;
+                } else if (c->p < c->end && (*c->p == '=' || *c->p == '!')) {
+                    /* Lookahead (?=...) / (?!...): same approximation. */
+                    capturing = 0;
+                    c->p++;
+                } else {
+                    capturing = 0;
+                }
             }
         }
         if (capturing) {
@@ -439,16 +456,14 @@ static Node *parse_rep(PCtx *c)
         int ch = (unsigned char)*c->p;
         int min = 0, max = 0, greedy = 1, isrep = 0;
 
-        if (ch == '*')      { min = 0; max = -1; isrep = 1; }
-        else if (ch == '+') { min = 1; max = -1; isrep = 1; }
-        else if (ch == '?') { min = 0; max = 1;  isrep = 1; }
+        if (ch == '*')      { min = 0; max = -1; isrep = 1; c->p++; }
+        else if (ch == '+') { min = 1; max = -1; isrep = 1; c->p++; }
+        else if (ch == '?') { min = 0; max = 1;  isrep = 1; c->p++; }
         else if (ch == '{') {
             if (!parse_brace(c, &min, &max, &greedy)) break;  /* literal '{' */
-            isrep = 1;
+            isrep = 1;  /* parse_brace already advanced past '}' */
         }
         if (!isrep) break;
-
-        c->p++;  /* consume the quantifier character */
         if (c->p < c->end && *c->p == '?') { greedy = 0; c->p++; }
 
         Node *rep = new_node(T_REP);

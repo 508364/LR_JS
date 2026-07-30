@@ -81,6 +81,7 @@ typedef struct {
     Token peek;
     int has_peek;
     int allow_regexp;   /* context flag: 1 = next / starts regexp, 0 = division */
+    int in_template;    /* template nesting depth flag (1 while inside `...`) */
 } Lexer;
 
 /* ── Functions ────────────────────────────────────────────────────────── */
@@ -89,6 +90,11 @@ void lexer_init(Lexer *lex, const char *src, size_t len);
 Token lexer_next(Lexer *lex);
 Token lexer_peek(Lexer *lex);
 void lexer_skip(Lexer *lex);
+
+/* Lex the next template-literal segment (text fragment / interpolation
+ * boundary). Used by the parser to read continuation segments of a template
+ * that is already known to be in progress (lex->in_template == 1). */
+Token lexer_template_next(Lexer *lex);
 
 /* Utility: get string representation of a token type */
 const char *token_type_name(TokenType type);

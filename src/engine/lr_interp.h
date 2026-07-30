@@ -26,6 +26,8 @@ typedef struct InterpScope {
     int                capacity;
     int                is_function_scope;
     int                is_global_scope;
+    int                refcount;      /* scopes are refcounted so closures can
+                                       * keep their defining chain alive */
 } InterpScope;
 
 /* ── Inline Cache for Property Access ──────────────────────────────────── */
@@ -47,12 +49,19 @@ typedef struct {
     InterpScope *current_scope;
     int          break_target;      /* non-zero during break */
     int          continue_target;   /* non-zero during continue */
+    char         break_label[64];   /* target label of pending break ("" = innermost) */
+    char         continue_label[64];/* target label of pending continue */
+    const char  *pending_label;     /* label to attach to the next loop statement */
     int          return_target;     /* non-zero during return */
     LRValue      return_value;
     int          has_returned;
     int          error_flag;
     char         error_message[512];
     int          is_module;
+    LRObject    *module_ns;         /* current module namespace object; set while
+                                     * a module is being evaluated so that
+                                     * eval_export can populate it and eval_import
+                                     * can read other modules' namespaces */
     int          depth;             /* call depth for stack limit */
     /* For try/catch: exception state */
     int          exception_pending;
@@ -60,6 +69,14 @@ typedef struct {
     /* Inline cache for property access (direct threading optimization) */
     LRInlineCache member_cache[LR_IC_SIZE];
     int           cache_index;      /* round-robin index for cache replacement */
+    /* Closure scope handoff: set right before invoking an interpreted
+     * function object; consumed by interp_call_function */
+    void         *pending_closure;
+    /* Generator support (eager evaluation): while a generator body runs,
+     * yields append to gen_items */
+    int           gen_active;
+    LRValue       gen_items;    /* JS array of yielded values */
+    int           gen_count;
 } Interpreter;
 
 /* ── API ───────────────────────────────────────────────────────────────── */

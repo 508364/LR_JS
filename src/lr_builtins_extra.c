@@ -1315,6 +1315,7 @@ typedef struct {
     int       dotAll : 1;
     int       sticky : 1;
     int       unicode : 1;
+    int       hasIndices : 1;
 } RegExpData;
 
 static void regexp_data_free(RegExpData *rd)
@@ -1362,7 +1363,7 @@ static LRValue js_regexp_constructor(LRContext *ctx, LRValue this_val, int argc,
 
     int cflags = REG_EXTENDED;
     int global = 0, ignoreCase = 0, multiline = 0;
-    int dotAll = 0, sticky = 0, unicode = 0;
+    int dotAll = 0, sticky = 0, unicode = 0, hasIndices = 0;
 
     if (argc >= 2) {
         const char *f = JS_ToCString(ctx, argv[1]);
@@ -1376,6 +1377,8 @@ static LRValue js_regexp_constructor(LRContext *ctx, LRValue this_val, int argc,
                 case 's': dotAll = 1; break;
                 case 'y': sticky = 1; break;
                 case 'u': unicode = 1; break;
+                case 'd': hasIndices = 1; break;
+                case 'v': unicode = 1; break; /* unicodeSets: treat as u */
                 default:
                     JS_FreeCString(ctx, f);
                     const char *pat = pattern_str;
@@ -1421,6 +1424,7 @@ static LRValue js_regexp_constructor(LRContext *ctx, LRValue this_val, int argc,
     rd->dotAll = dotAll;
     rd->sticky = sticky;
     rd->unicode = unicode;
+    rd->hasIndices = hasIndices;
 
     if (argc >= 1 && !JS_IsObject(argv[0])) JS_FreeCString(ctx, pattern_str);
 
@@ -1473,11 +1477,17 @@ static LRValue js_regexp_exec(LRContext *ctx, LRValue this_val, int argc, LRValu
         return JS_NULL;
     }
 
-    /* Build result array */
+    /* Build result array: group 0 + all capture groups (undefined if
+     * the group did not participate in the match). */
     JSValue arr = JS_NewArray(ctx);
-    uint32_t idx = 0;
+    int ncap = rd->re ? (int)rd->re->re_nsub : 0;
+    if (ncap > 31) ncap = 31;
 
-    for (int i = 0; i < 32 && pmatch[i].rm_so >= 0; i++) {
+    for (int i = 0; i <= ncap && i < 32; i++) {
+        if (pmatch[i].rm_so < 0) {
+            JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_UNDEFINED);
+            continue;
+        }
         size_t start = (size_t)pmatch[i].rm_so + (size_t)lastIndex;
         size_t end = (size_t)pmatch[i].rm_eo + (size_t)lastIndex;
         size_t match_len = end - start;
@@ -1485,14 +1495,140 @@ static LRValue js_regexp_exec(LRContext *ctx, LRValue this_val, int argc, LRValu
         if (match_str) {
             memcpy(match_str, str + start, match_len);
             match_str[match_len] = '\0';
-            JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, match_str));
+            JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewString(ctx, match_str));
             free(match_str);
         }
     }
+    JS_SetPropertyStr(ctx, arr, "length", JS_NewInt32(ctx, ncap + 1));
 
     /* Set index and input properties */
     JS_SetPropertyStr(ctx, arr, "index", JS_NewInt32(ctx, (int32_t)lastIndex + pmatch[0].rm_so));
     JS_SetPropertyStr(ctx, arr, "input", JS_NewString(ctx, str));
+
+    /* Named capture groups: scan the pattern text for (?<name>...) and map
+     * each name to its capture index. */
+    {
+        JSValue groups = JS_UNDEFINED;
+        const char *p = rd->pattern ? rd->pattern : "";
+        int cap_idx = 0;
+        int in_class = 0;
+        while (*p) {
+            if (*p == '\\' && p[1]) { p += 2; continue; }
+            if (*p == '[') in_class = 1;
+            else if (*p == ']') in_class = 0;
+            else if (*p == '(' && !in_class) {
+                if (p[1] == '?') {
+                    if (p[2] == '<' && p[3] != '=' && p[3] != '!') {
+                        /* named group */
+                        cap_idx++;
+                        const char *ns = p + 3;
+                        const char *ne = ns;
+                        while (*ne && *ne != '>') ne++;
+                        if (*ne == '>' && ne > ns) {
+                            size_t nlen = (size_t)(ne - ns);
+                            char nbuf[128];
+                            if (nlen < sizeof(nbuf)) {
+                                memcpy(nbuf, ns, nlen);
+                                nbuf[nlen] = '\0';
+                                if (JS_IsUndefined(groups)) groups = JS_NewObject(ctx);
+                                if (cap_idx <= ncap && pmatch[cap_idx].rm_so >= 0) {
+                                    size_t gs = (size_t)pmatch[cap_idx].rm_so + (size_t)lastIndex;
+                                    size_t ge = (size_t)pmatch[cap_idx].rm_eo + (size_t)lastIndex;
+                                    char *gv = (char *)malloc(ge - gs + 1);
+                                    if (gv) {
+                                        memcpy(gv, str + gs, ge - gs);
+                                        gv[ge - gs] = '\0';
+                                        JS_SetPropertyStr(ctx, groups, nbuf, JS_NewString(ctx, gv));
+                                        free(gv);
+                                    }
+                                } else {
+                                    JS_SetPropertyStr(ctx, groups, nbuf, JS_UNDEFINED);
+                                }
+                            }
+                            p = ne;
+                        }
+                    } else if (p[2] != ':' && !(p[2] == '<' && (p[3] == '=' || p[3] == '!')) &&
+                               p[2] != '=' && p[2] != '!') {
+                        /* unknown (?x - not a capture */
+                    }
+                    /* (?: (?= (?! (?<= (?<! are non-capturing */
+                } else {
+                    cap_idx++; /* plain capturing group */
+                }
+            }
+            p++;
+        }
+        JS_SetPropertyStr(ctx, arr, "groups", groups);
+    }
+
+    /* ES2022 'd' flag: materialize match indices ([start, end] pairs) */
+    if (rd->hasIndices) {
+        JSValue indices = JS_NewArray(ctx);
+        for (int i = 0; i <= ncap && i < 32; i++) {
+            if (pmatch[i].rm_so < 0) {
+                JS_SetPropertyUint32(ctx, indices, (uint32_t)i, JS_UNDEFINED);
+                continue;
+            }
+            JSValue pair = JS_NewArray(ctx);
+            JS_SetPropertyUint32(ctx, pair, 0,
+                JS_NewInt32(ctx, (int32_t)(pmatch[i].rm_so + lastIndex)));
+            JS_SetPropertyUint32(ctx, pair, 1,
+                JS_NewInt32(ctx, (int32_t)(pmatch[i].rm_eo + lastIndex)));
+            JS_SetPropertyStr(ctx, pair, "length", JS_NewInt32(ctx, 2));
+            JS_SetPropertyUint32(ctx, indices, (uint32_t)i, pair);
+        }
+        JS_SetPropertyStr(ctx, indices, "length", JS_NewInt32(ctx, ncap + 1));
+
+        /* indices.groups: named capture groups -> [start, end] */
+        {
+            JSValue igroups = JS_UNDEFINED;
+            const char *p = rd->pattern ? rd->pattern : "";
+            int cap_idx = 0;
+            int in_class = 0;
+            while (*p) {
+                if (*p == '\\' && p[1]) { p += 2; continue; }
+                if (*p == '[') in_class = 1;
+                else if (*p == ']') in_class = 0;
+                else if (*p == '(' && !in_class) {
+                    if (p[1] == '?') {
+                        if (p[2] == '<' && p[3] != '=' && p[3] != '!') {
+                            cap_idx++;
+                            const char *ns = p + 3;
+                            const char *ne = ns;
+                            while (*ne && *ne != '>') ne++;
+                            if (*ne == '>' && ne > ns) {
+                                size_t nlen = (size_t)(ne - ns);
+                                char nbuf[128];
+                                if (nlen < sizeof(nbuf)) {
+                                    memcpy(nbuf, ns, nlen);
+                                    nbuf[nlen] = '\0';
+                                    if (JS_IsUndefined(igroups)) igroups = JS_NewObject(ctx);
+                                    if (cap_idx <= ncap && pmatch[cap_idx].rm_so >= 0) {
+                                        JSValue pair = JS_NewArray(ctx);
+                                        JS_SetPropertyUint32(ctx, pair, 0,
+                                            JS_NewInt32(ctx, (int32_t)(pmatch[cap_idx].rm_so + lastIndex)));
+                                        JS_SetPropertyUint32(ctx, pair, 1,
+                                            JS_NewInt32(ctx, (int32_t)(pmatch[cap_idx].rm_eo + lastIndex)));
+                                        JS_SetPropertyStr(ctx, pair, "length", JS_NewInt32(ctx, 2));
+                                        JS_SetPropertyStr(ctx, igroups, nbuf, pair);
+                                    } else {
+                                        JS_SetPropertyStr(ctx, igroups, nbuf, JS_UNDEFINED);
+                                    }
+                                }
+                                p = ne;
+                            }
+                        }
+                    } else {
+                        cap_idx++;
+                    }
+                }
+                p++;
+            }
+            JS_SetPropertyStr(ctx, indices, "groups", igroups);
+        }
+
+        JS_SetPropertyStr(ctx, arr, "indices", indices);
+    }
 
     /* Update lastIndex for global/sticky */
     if (rd->global || rd->sticky) {
@@ -1590,6 +1726,14 @@ static LRValue js_regexp_get_unicode(LRContext *ctx, LRValue this_val, int argc,
     return JS_NewBool(ctx, rd->unicode);
 }
 
+static LRValue js_regexp_get_hasIndices(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
+{
+    (void)argc; (void)argv;
+    RegExpData *rd = (RegExpData *)JS_GetOpaque(this_val, NULL);
+    if (!rd) return JS_ThrowTypeError(ctx, "RegExp.prototype.hasIndices getter called on non-RegExp");
+    return JS_NewBool(ctx, rd->hasIndices);
+}
+
 /* RegExp prototype methods */
 static const JSCFunctionListEntry js_regexp_proto_methods[] = {
     JS_CFUNC_DEF("exec",      1, js_regexp_exec),
@@ -1607,6 +1751,7 @@ static const JSCFunctionListEntry js_regexp_proto_getters[] = {
     JS_CGETSET_DEF("dotAll",     js_regexp_get_dotAll,     NULL),
     JS_CGETSET_DEF("sticky",     js_regexp_get_sticky,     NULL),
     JS_CGETSET_DEF("unicode",    js_regexp_get_unicode,    NULL),
+    JS_CGETSET_DEF("hasIndices", js_regexp_get_hasIndices, NULL),
 };
 
 /* ========================================================================

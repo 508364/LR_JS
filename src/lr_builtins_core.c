@@ -2609,7 +2609,48 @@ static JSValue js_string_proto_match_all(JSContext *ctx, JSValue this_val,
                                            int argc, JSValue *argv)
 {
     if (argc < 1) return JS_ThrowTypeError(ctx, "String.prototype.matchAll requires a regexp");
-    /* Simplified: return an array of all matches */
+
+    /* Use the RegExp exec protocol so real regex semantics apply */
+    JSValue re = argv[0];
+    JSValue exec_fn = JS_GetPropertyStr(ctx, re, "exec");
+    if (is_callable(ctx, exec_fn)) {
+        JSValue g = JS_GetPropertyStr(ctx, re, "global");
+        int is_global = JS_ToBool(ctx, g);
+        JS_FreeValue(ctx, g);
+        JS_SetPropertyStr(ctx, re, "lastIndex", JS_NewInt32(ctx, 0));
+
+        JSValue arr = JS_NewArray(ctx);
+        int32_t idx = 0;
+        JSValue sv = this_val;
+        for (int guard = 0; guard < 100000; guard++) {
+            JSValue m = lr_call(ctx, exec_fn, re, 1, &sv);
+            if (JS_IsException(m) || JS_IsNull(m) || JS_IsUndefined(m)) {
+                JS_FreeValue(ctx, m);
+                break;
+            }
+            JS_SetPropertyUint32(ctx, arr, idx++, m);
+            if (!is_global) break;
+            /* Avoid infinite loop on empty match: bump lastIndex */
+            JSValue m0 = JS_GetPropertyUint32(ctx, m, 0);
+            const char *m0s = JS_ToCString(ctx, m0);
+            int empty = (!m0s || m0s[0] == '\0');
+            if (m0s) JS_FreeCString(ctx, m0s);
+            JS_FreeValue(ctx, m0);
+            if (empty) {
+                JSValue li = JS_GetPropertyStr(ctx, re, "lastIndex");
+                int32_t liv = 0;
+                JS_ToInt32(ctx, &liv, li);
+                JS_FreeValue(ctx, li);
+                JS_SetPropertyStr(ctx, re, "lastIndex", JS_NewInt32(ctx, liv + 1));
+            }
+        }
+        set_array_length(ctx, arr, idx);
+        JS_FreeValue(ctx, exec_fn);
+        return arr;
+    }
+    JS_FreeValue(ctx, exec_fn);
+
+    /* Fallback: plain substring scan when argument is not RegExp-like */
     const char *str = JS_ToCString(ctx, this_val);
     const char *pattern = JS_ToCString(ctx, argv[0]);
     if (!str || !pattern) {
@@ -2621,7 +2662,7 @@ static JSValue js_string_proto_match_all(JSContext *ctx, JSValue this_val,
     int32_t idx = 0;
     const char *pos = str;
     size_t pat_len = strlen(pattern);
-    while ((pos = strstr(pos, pattern)) != NULL) {
+    while (pat_len > 0 && (pos = strstr(pos, pattern)) != NULL) {
         JSValue match = JS_NewArray(ctx);
         JS_SetPropertyUint32(ctx, match, 0, JS_NewString(ctx, pattern));
         set_array_length(ctx, match, 1);
@@ -3100,11 +3141,12 @@ static JSValue js_string_proto_trim_start(JSContext *ctx, JSValue this_val,
     (void)argv;
     const char *str = JS_ToCString(ctx, this_val);
     if (!str) return JS_EXCEPTION;
-    while (*str && (*str == ' ' || *str == '\t' || *str == '\n' ||
-                    *str == '\r' || *str == '\f' || *str == '\v')) {
-        str++;
+    const char *p = str;
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\n' ||
+                  *p == '\r' || *p == '\f' || *p == '\v')) {
+        p++;
     }
-    JSValue result = JS_NewString(ctx, str);
+    JSValue result = JS_NewString(ctx, p);
     JS_FreeCString(ctx, str);
     return result;
 }

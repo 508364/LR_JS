@@ -129,6 +129,31 @@ static Token make_token_from(Lexer *lex, TokenType type, size_t start_pos)
     t.str_val = NULL;
     t.line = lex->line;
     t.col = lex->col;
+
+    /* Centralised regexp-context rule: a '/' can start a regexp literal
+     * whenever the previous token cannot end an expression. This runs
+     * last, so it overrides any scattered allow_regexp assignments. */
+    switch (type) {
+    /* Tokens that can END an expression -> '/' is division */
+    case TOK_NUMBER: case TOK_STRING: case TOK_IDENTIFIER: case TOK_REGEXP:
+    case TOK_BOOL_LIT: case TOK_NULL_LIT: case TOK_UNDEFINED_LIT:
+    case TOK_RPAREN: case TOK_RBRACKET: case TOK_RBRACE:
+    case TOK_INC: case TOK_DEC:
+    case TOK_TEMPLATE_END:
+    case TOK_THIS: case TOK_SUPER:
+    case TOK_PRIVATE_NAME:
+    /* Contextual keywords frequently used as plain identifiers */
+    case TOK_GET: case TOK_SET: case TOK_STATIC: case TOK_OF:
+    case TOK_FROM: case TOK_AS: case TOK_ASYNC:
+        lex->allow_regexp = 0;
+        break;
+    case TOK_EOF: case TOK_ERROR:
+        break;
+    /* Operators, punctuation and keywords -> expression follows */
+    default:
+        lex->allow_regexp = 1;
+        break;
+    }
     return t;
 }
 
@@ -253,12 +278,7 @@ static Token lex_number(Lexer *lex)
             is_hex = 1;
             lexer_advance(lex); /* 0 */
             lexer_advance(lex); /* x */
-            while (is_hex_char(lexer_peek_char(lex))) {
-                /* Allow underscores: _ */
-                if (lexer_peek_char(lex) == '_') {
-                    lexer_advance(lex);
-                    continue;
-                }
+            while (is_hex_char(lexer_peek_char(lex)) || lexer_peek_char(lex) == '_') {
                 lexer_advance(lex);
             }
             goto done;
@@ -267,8 +287,7 @@ static Token lex_number(Lexer *lex)
             is_octal = 1;
             lexer_advance(lex); /* 0 */
             lexer_advance(lex); /* o */
-            while (is_octal_char(lexer_peek_char(lex))) {
-                if (lexer_peek_char(lex) == '_') { lexer_advance(lex); continue; }
+            while (is_octal_char(lexer_peek_char(lex)) || lexer_peek_char(lex) == '_') {
                 lexer_advance(lex);
             }
             goto done;
@@ -277,17 +296,16 @@ static Token lex_number(Lexer *lex)
             is_binary = 1;
             lexer_advance(lex); /* 0 */
             lexer_advance(lex); /* b */
-            while (is_binary_char(lexer_peek_char(lex))) {
-                if (lexer_peek_char(lex) == '_') { lexer_advance(lex); continue; }
+            while (is_binary_char(lexer_peek_char(lex)) || lexer_peek_char(lex) == '_') {
                 lexer_advance(lex);
             }
             goto done;
         }
     }
 
-    /* Decimal number */
-    while (isdigit((unsigned char)lexer_peek_char(lex))) {
-        if (lexer_peek_char(lex) == '_') { lexer_advance(lex); continue; }
+    /* Decimal number (numeric separators '_' allowed between digits) */
+    while (isdigit((unsigned char)lexer_peek_char(lex)) ||
+           (lexer_peek_char(lex) == '_' && isdigit((unsigned char)lexer_peek_char_next(lex)))) {
         lexer_advance(lex);
     }
 
@@ -295,8 +313,8 @@ static Token lex_number(Lexer *lex)
     if (lexer_peek_char(lex) == '.' && lexer_peek_char_next(lex) != '.' &&
         !is_js_ident_start(lexer_peek_char_next(lex))) {
         lexer_advance(lex); /* . */
-        while (isdigit((unsigned char)lexer_peek_char(lex))) {
-            if (lexer_peek_char(lex) == '_') { lexer_advance(lex); continue; }
+        while (isdigit((unsigned char)lexer_peek_char(lex)) ||
+               (lexer_peek_char(lex) == '_' && isdigit((unsigned char)lexer_peek_char_next(lex)))) {
             lexer_advance(lex);
         }
     }
@@ -307,8 +325,8 @@ static Token lex_number(Lexer *lex)
         if (lexer_peek_char(lex) == '+' || lexer_peek_char(lex) == '-') {
             lexer_advance(lex);
         }
-        while (isdigit((unsigned char)lexer_peek_char(lex))) {
-            if (lexer_peek_char(lex) == '_') { lexer_advance(lex); continue; }
+        while (isdigit((unsigned char)lexer_peek_char(lex)) ||
+               (lexer_peek_char(lex) == '_' && isdigit((unsigned char)lexer_peek_char_next(lex)))) {
             lexer_advance(lex);
         }
     }
@@ -491,33 +509,41 @@ static Token lex_string(Lexer *lex, char quote)
 static Token lex_template(Lexer *lex)
 {
     size_t start = lex->pos;
-    lexer_advance(lex); /* skip opening backtick */
+    /* The very first char is the opening backtick only when we are not already
+     * inside a template (i.e. this is the start of the whole literal). After an
+     * interpolation we are invoked at the continuation text, or at the closing
+     * backtick, which we must NOT treat as a new opening backtick. */
+    int opening = (lexer_peek_char(lex) == '`') && !lex->in_template;
+    if (opening) {
+        lexer_advance(lex);      /* skip opening backtick */
+        lex->in_template = 1;
+    }
+    size_t body_start = lex->pos; /* first char of the text fragment */
 
     while (lex->pos < lex->src_len) {
         char c = lexer_peek_char(lex);
         if (c == '`') {
             lexer_advance(lex); /* skip closing backtick */
-            Token t = make_token_from(lex, TOK_TEMPLATE, start);
-            /* Store the full template string including backticks for the parser */
-            size_t len = lex->pos - start;
+            lex->in_template = 0;
+            Token t = make_token_from(lex, TOK_TEMPLATE_END, start);
+            /* Store the verbatim text between the backticks (no backticks). */
+            size_t len = lex->pos - 1 - body_start;
             t.str_val = (char *)malloc(len + 1);
             if (t.str_val) {
-                memcpy(t.str_val, lex->src + start, len);
+                memcpy(t.str_val, lex->src + body_start, len);
                 t.str_val[len] = '\0';
             }
             return t;
         }
         if (c == '$' && lexer_peek_char_next(lex) == '{') {
-            /* Template expression start */
             lexer_advance(lex); /* skip $ */
             lexer_advance(lex); /* skip { */
             Token t = make_token_from(lex, TOK_TEMPLATE, start);
-            /* Store the text before the expression */
-            size_t expr_start = lex->pos - 2; /* point to ${ */
-            size_t len = expr_start - start;
+            /* Store the verbatim text up to (but not including) the '$'. */
+            size_t len = (lex->pos - 2) - body_start;
             t.str_val = (char *)malloc(len + 1);
             if (t.str_val) {
-                memcpy(t.str_val, lex->src + start, len);
+                memcpy(t.str_val, lex->src + body_start, len);
                 t.str_val[len] = '\0';
             }
             return t;
@@ -614,6 +640,16 @@ Token lexer_next(Lexer *lex)
 
     char c = lexer_peek_char(lex);
     size_t start = lex->pos;
+
+    /* Handle private names: #name (class private fields/methods) */
+    if (c == '#') {
+        lexer_advance(lex); /* skip # */
+        while (is_js_ident_continue(lexer_peek_char(lex))) {
+            lexer_advance(lex);
+        }
+        lex->allow_regexp = 0;
+        return make_token_from(lex, TOK_PRIVATE_NAME, start);
+    }
 
     /* Handle identifiers and keywords */
     if (is_js_ident_start(c)) {
@@ -915,6 +951,7 @@ void lexer_init(Lexer *lex, const char *src, size_t len)
     lex->col = 1;
     lex->has_peek = 0;
     lex->allow_regexp = 1; /* start of file can have regexp */
+    lex->in_template = 0;
     memset(&lex->current, 0, sizeof(Token));
     memset(&lex->peek, 0, sizeof(Token));
 }
@@ -1052,4 +1089,9 @@ void token_free_data(Token *tok)
 void lexer_reset_peek(Lexer *lex)
 {
     lex->has_peek = 0;
+}
+
+Token lexer_template_next(Lexer *lex)
+{
+    return lex_template(lex);
 }

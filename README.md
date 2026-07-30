@@ -10,8 +10,45 @@ Pure C, ES2022-compatible JavaScript engine with browser APIs.
 - **Error Handling**: `Error`, `TypeError`, `SyntaxError`, `RangeError`, `ReferenceError` with stack traces and `cause` support
 - **ES6+ Collections**: `Map`, `Set`, `WeakMap`, `WeakSet`
 - **GC**: Mark-and-sweep garbage collector
+- **IOME586 result cache**: whole-script interpreter-result caching in LZ4 archives (`.lrfile`) — cache-while-running, auto-refresh on script change, snapshots of globals / per-node results / run state, 15%-gain rule, hash-keyed payload, on-disk rollback, and BOM support (UTF-8 BOM strip, UTF-16 LE/BE transcode); covers full ES2022 including ES modules (`-m`/`--module`, re-run as a module on cache hit via static global restore + dynamic AST re-run); AST serialization uses the `LRA` v3 format with explicit literal type tags (see `docs/API.md` §6.1.1); enable with `--iome586 <dir>`
 - **Cross-platform**: Linux (x86_64, x86, ARM64, ARMv7), Windows 7+ (x86_64, x86), macOS
 - **Thread-safe**: Built-in thread pool, Worker support
+
+## Documentation
+
+- [API Reference (English)](docs/API.en.md)
+- [API 参考文档（中文）](docs/API.md)
+
+## ES2022 Support Matrix
+
+All features below are verified by the test suite (`tests/es2022_probe.js` plus
+`worker_echo_test.js`, `sab_share_test.js`, `atomics_stress_test.js`) under
+`make test` / the Windows MSVC build.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Classes (fields, methods, getters/setters) | ✅ | |
+| Private fields + brand check (`#x in o`) | ✅ | |
+| Static blocks | ✅ | |
+| Computed keys / shorthand methods | ✅ | |
+| Generators (incl. in classes) | ✅ | |
+| Destructuring (array / object / rest / default) | ✅ | also as params & in `for-of` |
+| Template literals & tagged templates | ✅ | |
+| Optional chaining `?.` | ✅ | |
+| Nullish coalescing `??` & logical assignment (`??=`, `\|\|=`, `&&=`) | ✅ | |
+| `BigInt` literals | ✅ | |
+| Numeric separators (`1_000_001`) | ✅ | |
+| `Symbol` | ✅ | |
+| Error `cause` option | ✅ | |
+| `RegExp` named groups, `d` (indices) flag, `{n}` quantifier | ✅ | custom POSIX engine |
+| `String`: `at`, `padStart/End`, `trimStart/End`, `replaceAll`, `includes`, `matchAll` | ✅ | via prototype delegation |
+| `Array`: `includes`, `flat`, `findLast` | ✅ | |
+| `Object`: `entries`, `hasOwn` | ✅ | |
+| `Map` / `Set` `.size` | ✅ | size kept in sync |
+| `Promise.allSettled` / `Promise.any` | ✅ | |
+| `globalThis`, global `NaN` / `Infinity` | ✅ | |
+| `SharedArrayBuffer` + `Atomics` (incl. `Atomics.wait`) | ✅ | verified no lost updates under contention |
+| Web Workers + structured clone (`postMessage`) | ✅ | bidirectional, event-loop pumped |
 
 ## Build
 

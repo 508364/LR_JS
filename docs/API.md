@@ -67,10 +67,10 @@ L/R_JS 是一个用纯 C 语言实现的轻量级浏览器 JavaScript 运行器�
     --no-memory-check \
     --gc-incremental \
     --gc-pause-target 5 \
-    --bytecode-cache ./cache \
+    --iome586 ./cache \
     --sandbox-log ./logs \
     --gc-stats \
-    --bytecode-stats \
+    --iome586-stats \
     script.js
 ```
 
@@ -85,7 +85,7 @@ int main() {
     lr_config_default(&cfg);
     cfg.memory_limit = 128 * 1024 * 1024;  // 128MB 堆限制
     cfg.gc_incremental = 1;                // 启用增量 GC
-    cfg.bytecode_cache_dir = "./cache";    // 启用字节码缓存
+    cfg.bytecode_cache_dir = "./cache";    // 启用 IOME586 结果缓存
     cfg.skip_memory_check = 1;             // 跳过系统内存检查
 
     // 2. 创建运行时
@@ -160,12 +160,12 @@ gcc -o myapp.exe myapp.c -I/path/to/LR_JS/include -L/path/to/LR_JS/build -llr_js
 | `int64_t lr_get_available_memory(void)` | 获取系统可用内存 |
 | `int lr_check_system_memory(min_bytes)` | 检查系统内存是否充足 |
 
-### 3.5 字节码缓存
+### 3.5 IOME586 结果缓存
 
 | 函数 | 说明 |
 |------|------|
-| `void lr_bytecode_cache_stats(rt, fp)` | 打印缓存统计 |
-| `void lr_bytecode_cache_clear(rt)` | 清空缓存 |
+| `void lr_bytecode_cache_stats(rt, fp)` | 打印缓存统计（内部封装 `lr_iome586_stats`） |
+| `void lr_bytecode_cache_clear(rt)` | 清空缓存（内部封装 `lr_iome586_clear`） |
 
 ### 3.6 错误处理
 
@@ -193,8 +193,8 @@ typedef struct LR_Config {
     size_t  gc_nursery_size;        // nursery 大小, 0=默认 4MB
     int64_t gc_pause_target_ns;     // 目标最大暂停, 0=默认 5ms
 
-    // 字节码缓存
-    char   *bytecode_cache_dir;     // .lrfile 缓存目录, NULL=禁用
+    // IOME586 结果缓存
+    char   *bytecode_cache_dir;     // IOME586 缓存目录 (.lrfile.lz4 归档), NULL=禁用
 
     // 沙箱日志
     char   *sandbox_log_dir;        // 沙箱日志目录, NULL=禁用
@@ -365,23 +365,80 @@ lr_sandbox_log_stats(sb->log, stdout);
 
 ---
 
-## 6. 字节码缓存
+## 6. IOME586 结果缓存
 
 ### 6.1 概述
 
-`.lrfile` 字节码缓存将编译后的 JS 字节码持久化到磁盘，避免重复编译。
+**IOME586** 是缓存技术的正式名称。它以整个 JS 脚本为粒度，直接缓存解释器的成果数据
+（序列化 AST、全局变量绑定快照、每级节点结果、运行状态等），并在**边运行边缓存**：
+解析完成后先落盘 WRITING 状态归档，脚本执行结束后归档为 ARCHIVED。
 
-**缓存文件格式**：
+缓存覆盖**全量 ES2022**，包括普通脚本与 ES 模块（`-m`/`--module` 或
+`JS_EVAL_TYPE_MODULE`）。脚本与模块统一走 `lr_exec_file_cached`，共用同一缓存路径；
+归档会记下 `LR_IOME586_FLAG_MODULE` 标志，热路径据此以**模块方式**重跑（正确重建
+`module_ns` 命名空间与 `import`/`export` 绑定）。默认导入
+`import defFn from "mod"` 的 `is_default` 标记在 AST 序列化/反序列化中完整往返，因此
+缓存命中的模块行为与冷跑完全一致。
+
+**热路径 = 静态还原 + 动态重跑**（这是缓存能覆盖全量 ES2022 的关键）：
+- **静态部分直接还原**：`lr_iome586_restore_globals` 还原全局变量绑定快照，原语全局变量立即就位；
+- **动态部分重新跑**：对反序列化的 AST 重新执行。解释器重建函数/类绑定（保持可调用）、
+  重跑 I/O 与副作用、重算原语，因此无论脚本多"动态"，结果始终正确。
+
+**归档文件本质是一个 LZ4 压缩包**，输出文件为 `<namehash>.lrfile`（加载时也兼容
+`.lrfile.lz4` 写法）。文件名取脚本**路径**哈希，因此 JS 脚本修改后会自动原位更新
+同一归档（旧版本转为 `.bak` 可撤回）。payload 以脚本**内容**哈希作为 XOR 密钥
+（"压缩密码即哈希值"），文件描述区以明文保存脚本名 + 时间 + 版本号的副本。
+
+**容器格式**（魔数 `"IOME586\0"`）：
 ```
-Magic    "LRBC"          4 bytes
-Version  uint32          4 bytes
-Flags    uint32          4 bytes
-Hash     FNV-1a 64-bit   8 bytes
-Mtime    int64           8 bytes
-SrcSize  uint64          8 bytes
-BcLen    uint32          4 bytes
-Bytecode variable        N bytes
+Magic          "IOME586\0"     8 bytes
+ContainerVer   uint32          4 bytes
+EngineVer      uint32          4 bytes   (版本串 FNV-1a32)
+Status         uint32          4 bytes   (1=WRITING 写入中, 2=ARCHIVED 已归档)
+Flags          uint32          4 bytes
+CreatedAt      int64           8 bytes
+SourceHash     FNV-1a 64-bit   8 bytes   (亦为 payload XOR 密钥)
+Mtime          int64           8 bytes
+SrcSize        uint64          8 bytes
+OptRatio       uint32          4 bytes   (优化比值 ×1e6)
+CRC32          uint32          4 bytes
+PayloadStored  uint32          4 bytes   (LZ4 压缩后)
+PayloadRaw     uint32          4 bytes
+DescLen+Desc   variable                  (明文描述: 脚本名/时间/版本)
+Payload        variable                  (XOR 加密 + LZ4 压缩)
 ```
+
+**Payload 内为命名条目**（`u16 name_len|name|u32 data_len|data`），相当于压缩包内的
+多个二进制文件：`meta`（元信息）、`path`（解释路径/方法）、`config`（配置）、
+`init`（初始化内容与结果）、`ast`（序列化 AST）、`nodes`（每级节点结果）、
+`globals`（全局变量绑定快照）、`state`（状态机/运行状态）。
+
+#### 6.1.1 AST 序列化格式（魔数 `LRA`）
+
+归档的 `ast` 条目保存的是**序列化后的 AST**，而非字节码。其二进制布局以 4 字节魔数
+`"LRA"` 开头，紧随 1 字节**格式版本号**（当前为 `3`）。
+
+反序列化时校验魔数与版本号，若不匹配（魔数非法或版本不兼容）直接返回 `NULL`，
+归档被拒绝加载并删除，下次运行自动重新冷跑并重建缓存（见 §6.4）。
+
+**字面量序列化（`AST_LITERAL`）采用显式类型标记 `ltag`**，取值 5 类：
+
+| `ltag` | 类型 | 反序列化处理 |
+|--------|------|--------------|
+| 0 | bool（`true`/`false`） | 读 `u32` 布尔值，仅写入 `u.bool_val.val` |
+| 1 | string | 读字符串载荷 |
+| 2 | number（`double`） | 读 `f64` 数值 |
+| 3 | `null` | 置 `u.number.num = 0.0`，标记 `TOK_NULL_LIT` |
+| 4 | `undefined` | 置 `u.number.num = -1.0`，标记 `TOK_UNDEFINED_LIT` |
+
+> **已知修复（v0.7.0 / `LRA` v3）**：早期版本在反序列化 bool 字面量时，写入
+> `u.bool_val.val` 后又写入 `u.number.num`（`double`）。由于 `bool_val` 与 `number`
+> 在 `ASTNode` 的 union 中内存重叠，`double 1.0` 的低 4 字节为零，会把 `true`
+> 覆盖成 `false`。后果是暖跑中 `let ok = true` 变成 `false`，导致 `if(!ok) throw`
+> 误触发、丢弃后续语句（如缓存命中后末句 `MODULE TEST OK` 丢失）。v3 改为反序列化
+> bool 时**只写 `bool_val.val`**，与解析期的常量节点（仅设 `bool_val.val`）保持一致，
+> 该 bug 已彻底修复并验证（冷/暖跑输出一致）。
 
 ### 6.2 API
 
@@ -392,17 +449,27 @@ lr_config_default(&cfg);
 cfg.bytecode_cache_dir = "./my_cache";  // 绝对或相对路径
 
 // 或运行时设置
-lr_bytecode_cache_set_dir(&rt->bytecode_cache, "./my_cache");
+lr_iome586_set_dir(&rt->iome586, "./my_cache");
 
-// 查看统计
-lr_bytecode_cache_stats(rt, stdout);
+// 查看统计 / 清空
+lr_bytecode_cache_stats(rt, stdout);   // 封装 lr_iome586_stats
+lr_bytecode_cache_clear(rt);           // 封装 lr_iome586_clear
 ```
 
-### 6.3 缓存失效
+### 6.3 缓存策略
 
-- 源文件修改后（mtime 变化），缓存自动失效
-- 源文件内容变化后（FNV-1a hash 变化），缓存自动失效
-- 可手动失效：`lr_bytecode_cache_invalidate(&rt->bytecode_cache, "script.js")`
+- **15% 规则**：解析耗时收益 (parse_us / total_us) 低于 15% 时不缓存，commit 时自动丢弃归档
+- **边运行边缓存**：`lr_iome586_begin`（WRITING）→ 执行 → `lr_iome586_commit`（ARCHIVED）；执行抛异常时 `lr_iome586_abort` 回滚
+- **BOM 支持**：加载脚本时自动剥离 UTF-8 BOM，UTF-16 LE/BE 自动转码为 UTF-8
+
+### 6.4 缓存自动更新、失效与撤回
+
+- **脚本修改自动更新**：归档按脚本路径命名，源文件修改后（内容 hash / mtime 变化），旧归档转为 `.bak`，下一次运行自动重新缓存到同一文件
+- 引擎版本变化后（EngineVer 不匹配），同样自动更新
+- **AST 格式版本不匹配**：`ast` 条目的 `LRA` 魔数或格式版本号不兼容时，归档被拒绝加载并删除，下次运行自动重建缓存（见 §6.1.1）
+- CRC32 校验失败或状态为 WRITING（残留半成品）时拒绝加载并删除
+- 手动失效：`lr_iome586_invalidate(&rt->iome586, "script.js")`
+- **落盘撤回**：begin 时保留 `.bak` 备份，`lr_iome586_revert` 可回滚到上一版归档（CLI：`--iome586-revert <js>`）
 
 ---
 
@@ -1197,8 +1264,9 @@ lr_thread_pool_submit(&rt->thread_pool, my_task, my_data);
 | `--gc-nursery-size <mb>` | 设置 nursery 大小 |
 | `--gc-pause-target <ms>` | 设置目标最大暂停 |
 | `--gc-stats` | 退出时打印 GC 统计 |
-| `--bytecode-cache <dir>` | 启用 .lrfile 字节码缓存 |
-| `--bytecode-stats` | 退出时打印缓存统计 |
+| `--iome586 <dir>` | 启用 IOME586 结果缓存（别名 `--bytecode-cache`） |
+| `--iome586-stats` | 退出时打印缓存统计（别名 `--bytecode-stats`） |
+| `--iome586-revert <js>` | 撤回指定脚本的缓存落盘（回滚到 .bak） |
 | `--sandbox-log <dir>` | 启用沙箱日志 |
 | `--min-memory <bytes>` | 最小系统内存要求 |
 | `--no-memory-check` | 跳过系统内存检查 |
@@ -1217,7 +1285,7 @@ lr_thread_pool_submit(&rt->thread_pool, my_task, my_data);
 | `.clear` | 清屏 |
 | `.gc` | 触发 GC |
 | `.gc_stats` | 显示 GC 统计 |
-| `.bc_stats` | 显示字节码缓存统计 |
+| `.bc_stats` | 显示 IOME586 缓存统计 |
 | `.memory` | 显示内存使用 |
 
 ---
@@ -1327,7 +1395,7 @@ make CC="$CC" clean && make CC="$CC"
 | 100K 对象循环 | ~50ms | 内存分配 |
 | 50K 对象 (分代 GC) | ~45ms | GC 暂停 < 4ms |
 | 50K 对象 (增量 GC) | ~48ms | GC 暂停 < 2ms |
-| 字节码缓存命中 | < 5ms | 跳过编译 |
+| IOME586 缓存命中 | < 5ms | 跳过词法/解析 |
 
 ---
 
@@ -1350,11 +1418,7 @@ make CC="$CC" clean && make CC="$CC"
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
-| 0.1.0 | 2026-07 | 初始版本，ES2022+ 支持 |
-| 0.2.0 | 2026-07 | 多线程沙箱、渲染器桥接 |
-| 0.3.0 | 2026-07 | 系统内存限制 |
-| 0.4.0 | 2026-07 | 分代 GC + 增量 GC |
-| 0.5.0 | 2026-07 | .lrfile 字节码缓存 + 沙箱日志 |
+| 0.1.0 | 2026-07 | 初始版本：ES2022+ 支持、多线程沙箱、渲染器桥接、系统内存限制、分代/增量 GC、`.lrfile` 字节码缓存与沙箱日志、IOME586 结果缓存（LZ4 归档、边运行边缓存、15% 规则、BOM、撤回）、AST 序列化 `LRA` v3（字面量显式类型标记），修复暖跑中 `true`→`false` 的 bug |
 
 ---
 
