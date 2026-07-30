@@ -2759,7 +2759,6 @@ static LREvalUnit *lr_engine_parse_source(LRContext *ctx, const char *input,
 static LRValue lr_engine_exec_unit(LRContext *ctx, LREvalUnit *unit,
                                    int is_module, const char *filename)
 {
-    (void)filename;
     LRPersistentInterp *ps = (LRPersistentInterp *)ctx->persistent_interp;
     if (!ps) {
         ps = (LRPersistentInterp *)calloc(1, sizeof(LRPersistentInterp));
@@ -2777,8 +2776,12 @@ static LRValue lr_engine_exec_unit(LRContext *ctx, LREvalUnit *unit,
     InterpScope *saved_scope = interp->current_scope;
     int saved_is_module = interp->is_module;
     LRObject *saved_ns = interp->module_ns;
+    const char *saved_filename = interp->filename;
+    LRValue saved_meta = interp->import_meta;
     interp->current_scope = interp->global_scope;
     interp->is_module = is_module;
+    interp->filename = filename;
+    interp->import_meta = LR_VALUE_UNDEFINED;
     if (is_module) {
         if (unit->ns.tag != LR_TYPE_OBJECT)
             unit->ns = lr_new_object(ctx);
@@ -2790,6 +2793,10 @@ static LRValue lr_engine_exec_unit(LRContext *ctx, LREvalUnit *unit,
     interp->current_scope = saved_scope;
     interp->is_module = saved_is_module;
     interp->module_ns = saved_ns;
+    if (interp->import_meta.tag == LR_TYPE_OBJECT)
+        lr_free_value(ctx, interp->import_meta);
+    interp->import_meta = saved_meta;
+    interp->filename = saved_filename;
 
     if (lr_is_job_pending(ctx->rt)) {
         int job_count = 0;

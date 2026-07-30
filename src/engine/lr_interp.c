@@ -1073,9 +1073,81 @@ static LRValue eval_assign(Interpreter *interp, ASTNode *node)
     return ret;
 }
 
+/* Build (or return cached) import.meta object for the current unit.
+ * Exposes: url (file:// URL), filename (absolute path), dirname. */
+static LRValue interp_get_import_meta(Interpreter *interp)
+{
+    LRContext *ctx = interp->ctx;
+
+    if (interp->import_meta.tag == LR_TYPE_OBJECT)
+        return lr_dup_value(ctx, interp->import_meta);
+
+    LRValue meta = lr_new_object(ctx);
+    const char *fn = interp->filename ? interp->filename : "";
+
+    /* Resolve to an absolute path when possible */
+    char abs[4096];
+    abs[0] = '\0';
+#ifdef _WIN32
+    if (fn[0] == '\0' || fn[0] == '<' || !_fullpath(abs, fn, sizeof(abs))) {
+        strncpy(abs, fn, sizeof(abs) - 1);
+        abs[sizeof(abs) - 1] = '\0';
+    }
+#else
+    if (fn[0] == '\0' || fn[0] == '<' || !realpath(fn, abs)) {
+        strncpy(abs, fn, sizeof(abs) - 1);
+        abs[sizeof(abs) - 1] = '\0';
+    }
+#endif
+
+    /* file:// URL: normalize separators to '/' */
+    char url[4352];
+    {
+        char norm[4096];
+        size_t i;
+        for (i = 0; abs[i] && i < sizeof(norm) - 1; i++)
+            norm[i] = (abs[i] == '\\') ? '/' : abs[i];
+        norm[i] = '\0';
+        if (norm[0] == '/')
+            snprintf(url, sizeof(url), "file://%s", norm);
+        else if (norm[0])
+            snprintf(url, sizeof(url), "file:///%s", norm);
+        else
+            snprintf(url, sizeof(url), "file:///");
+    }
+    lr_set_property_str(ctx, meta, "url", lr_new_string(ctx, url));
+    lr_set_property_str(ctx, meta, "filename", lr_new_string(ctx, abs));
+
+    /* dirname: strip last path component */
+    {
+        char dir[4096];
+        strncpy(dir, abs, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = '\0';
+        char *last = NULL;
+        for (char *p = dir; *p; p++)
+            if (*p == '/' || *p == '\\') last = p;
+        if (last) *last = '\0';
+        lr_set_property_str(ctx, meta, "dirname", lr_new_string(ctx, dir));
+    }
+
+    interp->import_meta = lr_dup_value(ctx, meta);
+    return meta;
+}
+
 static LRValue eval_member(Interpreter *interp, ASTNode *node)
 {
     int is_optional = node->u.member.is_optional;
+
+    /* import.meta: the parser encodes it as member expr `import`.`meta` */
+    if (node->u.member.obj && node->u.member.obj->type == AST_IDENTIFIER &&
+        node->u.member.obj->u.ident.name &&
+        strcmp(node->u.member.obj->u.ident.name, "import") == 0 &&
+        node->u.member.prop && node->u.member.prop->type == AST_IDENTIFIER &&
+        node->u.member.prop->u.ident.name &&
+        strcmp(node->u.member.prop->u.ident.name, "meta") == 0) {
+        return interp_get_import_meta(interp);
+    }
+
     LRValue obj = interp_eval_node(interp, node->u.member.obj);
     if (interp->error_flag) return obj;
 
@@ -4268,6 +4340,8 @@ void interp_init(Interpreter *interp, LRContext *ctx, int is_module)
     memset(interp, 0, sizeof(*interp));
     interp->ctx = ctx;
     interp->is_module = is_module;
+    interp->filename = NULL;
+    interp->import_meta = LR_VALUE_UNDEFINED;
 
     /* Set up the callback so C builtins can call JS functions */
     if (!ctx->call_js_function) {

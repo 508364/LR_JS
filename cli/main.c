@@ -334,6 +334,12 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Error: %s\n", lr_get_last_error(g_rt));
         }
     } else if (script_file) {
+        /* Auto-detect ES modules by extension (same as node) */
+        if (!is_module) {
+            size_t n = strlen(script_file);
+            if (n >= 4 && strcmp(script_file + n - 4, ".mjs") == 0)
+                is_module = 1;
+        }
         /* Evaluate script file */
         if (is_module) {
             size_t buf_len;

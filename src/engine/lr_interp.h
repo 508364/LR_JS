@@ -58,6 +58,8 @@ typedef struct {
     int          error_flag;
     char         error_message[512];
     int          is_module;
+    const char  *filename;          /* current script/module path (import.meta) */
+    LRValue      import_meta;       /* lazily created per-unit import.meta object */
     LRObject    *module_ns;         /* current module namespace object; set while
                                      * a module is being evaluated so that
                                      * eval_export can populate it and eval_import
