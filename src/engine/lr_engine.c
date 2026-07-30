@@ -1753,7 +1753,7 @@ int lr_has_property(LRContext *ctx, LRValue obj, LRString *atom)
     }
 
     /* Check own properties */
-    LRValue *found = lr_object_find_own_prop(o, atom);
+    LRProperty *found = lr_object_find_own_prop(o, atom);
     if (found) return 1;
 
     /* Walk prototype chain */
@@ -1779,7 +1779,7 @@ int lr_has_property_direct(LRContext *ctx, LRValue obj, LRString *atom)
     LRObject *o = (LRObject *)obj.u.ptr;
 
     /* Check own properties */
-    LRValue *found = lr_object_find_own_prop(o, atom);
+    LRProperty *found = lr_object_find_own_prop(o, atom);
     if (found) return 1;
 
     /* Walk prototype chain */

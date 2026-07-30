@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <stdarg.h>
+#include <ctype.h>
 
 /* ── Constants ─────────────────────────────────────────────────────────── */
 
@@ -3647,7 +3648,7 @@ static LRValue eval_with(Interpreter *interp, ASTNode *node)
                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY);
 
     for (uint32_t i = 0; i < nprops; i++) {
-        if (!props[i].atom || !props[i].atom->str) continue;
+        if (!props[i].atom) continue;
         LRValue pv = lr_get_property(ctx, obj, props[i].atom);
         scope_declare_name(interp, props[i].atom->str, pv, 1 /* let-like */);
         lr_free_value(ctx, pv);
@@ -4172,6 +4173,10 @@ typedef struct {
     InterpScope *scope;
     char         name[256];
 } LiveBindData;
+
+/* Forward declaration — used by live_bind_setter below */
+static int scope_set_name_in_scope(InterpScope *scope, LRContext *ctx,
+                                    const char *name, LRValue value);
 
 /* Live-binding getter: searches the captured scope for `name` and returns
  * the current value. (scope is the source of truth; value can change.) */

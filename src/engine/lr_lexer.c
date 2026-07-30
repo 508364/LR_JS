@@ -269,7 +269,7 @@ static Token lex_number(Lexer *lex)
 {
     size_t start = lex->pos;
     char c = lexer_peek_char(lex);
-    int is_hex = 0, is_octal = 0, is_binary = 0;
+    int is_hex = 0, is_octal = 0, is_binary = 0, is_bigint = 0;
 
     /* Check for 0x, 0o, 0b prefixes */
     if (c == '0' && lex->pos + 1 < lex->src_len) {
@@ -332,7 +332,6 @@ static Token lex_number(Lexer *lex)
     }
 
     /* BigInt suffix */
-    int is_bigint = 0;
     if (lexer_peek_char(lex) == 'n') {
         lexer_advance(lex); /* n */
         is_bigint = 1;

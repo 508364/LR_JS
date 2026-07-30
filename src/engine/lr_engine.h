@@ -730,7 +730,7 @@ void lr_set_module_loader_func(LRRuntime *rt,
 
 LRValue lr_engine_eval(LRContext *ctx, const char *input, size_t input_len,
                 const char *filename, int flags);
-/* Parse + (optionally serialize the AST into *out_bc/*out_bc_len) + execute.
+/* Parse + (optionally serialize the AST into *out_bc / *out_bc_len) + execute.
  * If out_bc/out_bc_len are NULL, no serialization is performed. */
 LRValue lr_engine_eval_source(LRContext *ctx, const char *input, size_t input_len,
                 int is_module, const char *filename, uint8_t **out_bc, size_t *out_bc_len);
