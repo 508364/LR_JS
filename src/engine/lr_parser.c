@@ -2122,6 +2122,10 @@ static ASTNode *parse_var_declaration(Parser *parser, TokenType decl_type, int a
     ASTNode *n = ast_alloc(AST_VAR_DECL);
     if (!n) return NULL;
 
+    /* Record the declaration keyword (var/let/const) so the interpreter can
+     * distinguish them (e.g. only var/function bind to the global object). */
+    n->token.type = decl_type;
+
     n->u.var_decl.vars = NULL;
     n->u.var_decl.nvars = 0;
     int cap = 0;

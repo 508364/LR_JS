@@ -377,7 +377,7 @@ The cache covers **full ES2022**, including both ordinary scripts and ES modules
 - **Static part restored directly**: `lr_iome586_restore_globals` restores the global variable binding snapshot, so primitive globals are in place immediately;
 - **Dynamic part re-run**: re-execute the deserialized AST. The interpreter rebuilds function/class bindings (keeping them callable), re-runs I/O and side effects, and recomputes primitives, so results are always correct no matter how "dynamic" the script is.
 
-**An archive is essentially an LZ4 compressed package**, written out as `<namehash>.lrfile` (the `.lrfile.lz4` spelling is also accepted when loading). The file name is a hash of the script **path**, so modifying a JS script auto-updates the same archive in place (the old version is moved to `.bak` for rollback). The payload uses the script **content** hash as an XOR key ("the compression password is the hash value"), and the file description area keeps a plaintext copy of the script name + time + version.
+**An archive is essentially an LZ4 compressed package**, written out as `<namehash>.lrfile` (the `.lrfile.lz4` spelling is also accepted when loading). The file name is a hash of the script **path**, so modifying a JS script auto-updates the same archive in place (the old version is moved to `.bak` for rollback). The payload is **LZ4-compressed only — no encryption**; integrity is guaranteed by `CRC32` and the content hash `SourceHash` (FNV-1a 64-bit). The self-keyed XOR was removed (legacy KEYED archives are still loaded compatibly). The file description area keeps a plaintext copy of the script name + time + version.
 
 **Container format** (magic `"IOME586\0"`):
 ```
@@ -387,7 +387,7 @@ EngineVer      uint32          4 bytes   (version string FNV-1a32)
 Status         uint32          4 bytes   (1=WRITING in-progress, 2=ARCHIVED)
 Flags          uint32          4 bytes
 CreatedAt      int64           8 bytes
-SourceHash     FNV-1a 64-bit   8 bytes   (also the payload XOR key)
+SourceHash     FNV-1a 64-bit   8 bytes   (script content hash, for validation, not a key)
 Mtime          int64           8 bytes
 SrcSize        uint64          8 bytes
 OptRatio       uint32          4 bytes   (optimization ratio ×1e6)
@@ -395,8 +395,15 @@ CRC32          uint32          4 bytes
 PayloadStored  uint32          4 bytes   (after LZ4 compression)
 PayloadRaw     uint32          4 bytes
 DescLen+Desc   variable                  (plaintext description: script name/time/version)
-Payload        variable                  (XOR-encrypted + LZ4-compressed)
+Payload        variable                  (LZ4-compressed; no encryption, CRC32/SourceHash validated)
 ```
+
+**Security model (v0.1.0 hardening)**:
+- **Sensitive-value exclusion**: the snapshot skips any global binding whose name matches a sensitive token (token/secret/password/credential/apikey/auth/bearer/cookie/session/private, etc.), so tokens/keys are never persisted with the cache.
+- **Strings are opt-out**: `snapshot_strings` is on by default (records string-literal bindings); `--iome586-no-strings` disables it so the archive contains no string-literal values at all.
+- **Restore off by default**: `restore_globals` is off by default; a warm run only does "static restore + dynamic re-run" and does not write archived global bindings back onto the global object. Enable explicitly with `--iome586-restore-globals` when needed.
+- **BOM baseline remap protection**: after builtins are registered, the runtime captures a baseline of pre-existing global property names and skips those engine/BOM names during restore, so cache recovery cannot pollute builtin APIs.
+
 
 **The payload contains named entries** (`u16 name_len|name|u32 data_len|data`), equivalent to multiple binary files inside the package: `meta` (meta info), `path` (interpreter path/method), `config` (configuration), `init` (init content and result), `ast` (serialized AST), `nodes` (per-node results), `globals` (global variable binding snapshot), `state` (state machine / run state).
 
@@ -1241,6 +1248,8 @@ lr_thread_pool_submit(&rt->thread_pool, my_task, my_data);
 | `--iome586 <dir>` | Enable IOME586 result cache (alias `--bytecode-cache`) |
 | `--iome586-stats` | Print cache stats on exit (alias `--bytecode-stats`) |
 | `--iome586-revert <js>` | Roll back a script's on-disk cache (to .bak) |
+| `--iome586-no-strings` | Do not record any string-literal values in the cache snapshot (sensitive-value guard) |
+| `--iome586-restore-globals` | Allow warm runs to restore archived global-variable bindings onto the global object (off by default; opt in as needed) |
 | `--sandbox-log <dir>` | Enable sandbox logging |
 | `--min-memory <bytes>` | Minimum system memory requirement |
 | `--no-memory-check` | Skip system memory check |
@@ -1392,7 +1401,7 @@ make CC="$CC" clean && make CC="$CC"
 
 | Version | Date | Description |
 |---------|------|-------------|
-| 0.1.0 | 2026-07 | Initial version: ES2022+ support, multithreaded sandbox, renderer bridge, system memory limit, generational/incremental GC, `.lrfile` bytecode cache and sandbox logging, IOME586 result cache (LZ4 archive, cache-while-running, 15% rule, BOM, rollback), AST serialization `LRA` v3 (explicit literal type tags); fixes the warm-run `true`→`false` bug |
+| 0.1.0 | 2026-07 | Initial version: ES2022+ support, multithreaded sandbox, renderer bridge, system memory limit, generational/incremental GC, `.lrfile` bytecode cache and sandbox logging, IOME586 result cache (LZ4 archive, cache-while-running, 15% rule, BOM, rollback), AST serialization `LRA` v3 (explicit literal type tags); fixes the warm-run `true`→`false` bug. Added capabilities: top-level `var`/`function` bound to the global object in non-module Script mode (per `GlobalDeclarationInstantiation`; `let`/`const`/`class` are not mounted), `import.meta` inside modules, the `RegExp` `d` (match indices) flag, Windows console UTF-8 output; IOME586 security hardening (sensitive global-value exclusion, `snapshot_strings` on by default, self-keyed XOR removed, `restore_globals` off by default, BOM baseline remap protection), new CLI flags `--iome586-no-strings` / `--iome586-restore-globals` |
 
 ---
 
@@ -2304,9 +2313,39 @@ ws.delete(value);
 
 ## 25. ES2022+ Syntax Features
 
-### 25.1 globalThis
+### 25.1 globalThis and top-level declaration binding
+
 ```javascript
-globalThis === window;  // true
+globalThis === window;  // true (the global object is `window` in browser semantics)
+```
+
+**Top-level `var` / `function` are bound to the global object (Script mode only).** Per
+the ECMAScript `GlobalDeclarationInstantiation` spec, in a *non-module* Script, top-level
+`var` and `function` declarations become properties of the global object; `let` / `const` /
+`class` are declarative bindings and are *not* mirrored onto the global object. Under ES
+modules (`.mjs` or `-m`) every top-level declaration lives in the module namespace and never
+pollutes the global object.
+
+```javascript
+// Run as a script (default)
+var topVar = 42;
+function topFunc() { return "fn"; }
+let topLet = 1;
+const topConst = 2;
+class TopClass {}
+
+globalThis.topVar;            // 42
+typeof globalThis.topFunc;   // "function"
+"topLet"    in globalThis;   // false (declarative, not mounted)
+"topConst"  in globalThis;   // false
+"TopClass"  in globalThis;   // false
+
+topVar = 200;
+globalThis.topVar;           // 200 (assignment is mirrored onto the global object)
+
+// Run as a module (-m / .mjs)
+//   'mVar' in globalThis  -> false
+//   'mFunc' in globalThis -> false
 ```
 
 ### 25.2 for...of loop
@@ -2329,3 +2368,14 @@ const million = 1_000_000;  // 1000000
 const bits = 0xFF_FF_FF;    // 16777215
 const binary = 0b1010_0001; // 161
 ```
+
+### 25.5 `import.meta`
+Inside a module (`.mjs` or `-m`), `import.meta` exposes metadata about the current module:
+```javascript
+// module.mjs
+import.meta.url;       // "file:///abs/path/module.mjs"
+import.meta.filename;  // absolute path
+import.meta.dirname;   // containing directory
+console.log(import.meta.url);
+```
+Accessing `import.meta` in a non-module script is an error.

@@ -189,6 +189,8 @@ void lr_iome586_init(LR_Iome586Cache *c, LR_Runtime *rt, const char *dir)
     memset(c, 0, sizeof(*c));
     c->runtime = rt;
     c->compression = 1;
+    c->snapshot_strings = 1;   /* sensitive names are always excluded */
+    c->restore_globals = 0;    /* warm re-run recomputes; restore is opt-in */
     pthread_mutex_init(&c->mutex, NULL);
     if (dir && dir[0]) {
         c->cache_dir = strdup(dir);
@@ -201,7 +203,65 @@ void lr_iome586_destroy(LR_Iome586Cache *c)
 {
     free(c->cache_dir);
     c->cache_dir = NULL;
+    if (c->baseline_names) {
+        for (uint32_t i = 0; i < c->baseline_count; i++)
+            free(c->baseline_names[i]);
+        free(c->baseline_names);
+        c->baseline_names = NULL;
+        c->baseline_count = 0;
+    }
     pthread_mutex_destroy(&c->mutex);
+}
+
+/* ── Builtin baseline ("remap set") ────────────────────────────────────── */
+
+int lr_iome586_capture_baseline(LR_Iome586Cache *c, LRContext *ctx)
+{
+    if (!c || !ctx) return -1;
+
+    /* Reset a previous capture */
+    if (c->baseline_names) {
+        for (uint32_t i = 0; i < c->baseline_count; i++)
+            free(c->baseline_names[i]);
+        free(c->baseline_names);
+        c->baseline_names = NULL;
+        c->baseline_count = 0;
+    }
+
+    LRPropertyEnum *tab = NULL;
+    uint32_t len = 0;
+    if (lr_get_own_property_names(ctx, &tab, &len, ctx->global_obj,
+                                  JS_GPN_STRING_MASK) != 0)
+        return -1;
+
+    c->baseline_names = (char **)calloc(len ? len : 1, sizeof(char *));
+    if (!c->baseline_names) {
+        lr_free_property_enum(ctx, tab, len);
+        return -1;
+    }
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < len; i++) {
+        if (!tab[i].atom || !tab[i].atom->str) continue;
+        c->baseline_names[n] = strdup(tab[i].atom->str);
+        if (c->baseline_names[n]) n++;
+    }
+    c->baseline_count = n;
+    lr_free_property_enum(ctx, tab, len);
+    return (int)n;
+}
+
+/* Is this name part of the engine/BOM namespace? Prefers the dynamically
+ * captured baseline; falls back to the static list when no baseline. */
+static int is_builtin_global(const char *name);   /* fwd (static list) */
+
+static int in_engine_namespace(const LR_Iome586Cache *c, const char *name)
+{
+    if (c && c->baseline_names && c->baseline_count) {
+        for (uint32_t i = 0; i < c->baseline_count; i++)
+            if (strcmp(c->baseline_names[i], name) == 0) return 1;
+        return 0;
+    }
+    return is_builtin_global(name);
 }
 
 int lr_iome586_set_dir(LR_Iome586Cache *c, const char *dir)
@@ -319,9 +379,33 @@ static int is_builtin_global(const char *name)
     return 0;
 }
 
+/* Sensitive-looking global names must never have their VALUES persisted to
+ * disk (they are still listed, as opaque tag 6). Case-insensitive substring
+ * match. */
+static int is_sensitive_global(const char *name)
+{
+    static const char *needles[] = {
+        "token", "secret", "passw", "credential", "apikey", "api_key",
+        "auth", "bearer", "cookie", "session", "private", NULL
+    };
+    char low[512];
+    size_t i;
+    for (i = 0; name[i] && i < sizeof(low) - 1; i++) {
+        char ch = name[i];
+        low[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+    }
+    low[i] = '\0';
+    for (int k = 0; needles[k]; k++)
+        if (strstr(low, needles[k])) return 1;
+    return 0;
+}
+
 /* Snapshot the global variable bindings into an entry blob.
- * format: u32 count, then per binding: u16 name_len|name|value */
-static void snapshot_globals(Blob *out, LRContext *ctx)
+ * format: u32 count, then per binding: u16 name_len|name|value
+ * allow_strings=0 records ALL string values as opaque (tag 6).
+ * Names in the engine/BOM baseline are skipped entirely. */
+static void snapshot_globals(Blob *out, LRContext *ctx,
+                             const LR_Iome586Cache *c, int allow_strings)
 {
     LRPropertyEnum *tab = NULL;
     uint32_t len = 0, count = 0;
@@ -332,13 +416,19 @@ static void snapshot_globals(Blob *out, LRContext *ctx)
         for (uint32_t i = 0; i < len; i++) {
             if (!tab[i].atom) continue;
             const char *name = tab[i].atom->str;
-            if (is_builtin_global(name)) continue;
+            if (in_engine_namespace(c, name)) continue;
             LRValue v = lr_get_property(ctx, ctx->global_obj, tab[i].atom);
             if (v.tag == LR_TYPE_EXCEPTION) continue;
             size_t nlen = strlen(name);
             blob_u16(&body, (uint16_t)nlen);
             blob_put(&body, name, nlen);
-            blob_value(&body, ctx, v);
+            /* Never persist sensitive values; optionally no strings at all.
+             * Such bindings are recorded as opaque (tag 6). */
+            if (is_sensitive_global(name) ||
+                (!allow_strings && v.tag == LR_TYPE_STRING))
+                blob_u8(&body, 6);
+            else
+                blob_value(&body, ctx, v);
             lr_free_value(ctx, v);
             count++;
         }
@@ -353,7 +443,8 @@ static void snapshot_globals(Blob *out, LRContext *ctx)
  * format: u32 count, then per node:
  *   u16 ast_type | u32 line | u8 run_status(1=executed)
  *   u8 has_name | [u16 name_len|name|value(binding after run)] */
-static void snapshot_nodes(Blob *out, LRContext *ctx, const ASTNode *program)
+static void snapshot_nodes(Blob *out, LRContext *ctx, const ASTNode *program,
+                           int allow_strings)
 {
     int count = lr_engine_program_count(program);
     blob_u32(out, (uint32_t)count);
@@ -371,7 +462,13 @@ static void snapshot_nodes(Blob *out, LRContext *ctx, const ASTNode *program)
             blob_u16(out, (uint16_t)nlen);
             blob_put(out, name, nlen);
             LRValue v = lr_get_property_str(ctx, ctx->global_obj, name);
-            blob_value(out, ctx, v);
+            /* Same policy as snapshot_globals: never persist sensitive
+             * values; optionally no strings at all (recorded as tag 6). */
+            if (is_sensitive_global(name) ||
+                (!allow_strings && v.tag == LR_TYPE_STRING))
+                blob_u8(out, 6);
+            else
+                blob_value(out, ctx, v);
             lr_free_value(ctx, v);
         } else {
             blob_u8(out, 0);
@@ -408,9 +505,9 @@ static int write_container(LR_Iome586Cache *c, const char *path,
         flags |= LR_IOME586_FLAG_COMPRESSED;
         c->bytes_saved += (int64_t)(payload_raw_len - stored_len);
     }
-    /* The package password is the source hash. */
-    xor_key(stored, stored_len, w->hash);
-    flags |= LR_IOME586_FLAG_KEYED;
+    /* No XOR keying: the old key (source_hash) lived in the same header,
+     * making it obfuscation rather than encryption. Integrity is covered by
+     * payload_crc32; legacy KEYED archives remain readable in the loader. */
 
     /* Plaintext archive comment: script name + creation time + version. */
     char desc[768];
@@ -615,13 +712,13 @@ int lr_iome586_commit(LR_Iome586Cache *c, LR_Iome586Writer *w,
     entry_add(&payload, "ast", w->ast, w->ast_len);
 
     Blob nodes = {0};
-    snapshot_nodes(&nodes, ctx, program);
+    snapshot_nodes(&nodes, ctx, program, c->snapshot_strings);
     entry_add(&payload, "nodes", nodes.data ? (void *)nodes.data : (void *)"",
               nodes.len);
     free(nodes.data);
 
     Blob globals = {0};
-    snapshot_globals(&globals, ctx);
+    snapshot_globals(&globals, ctx, c, c->snapshot_strings);
     entry_add(&payload, "globals",
               globals.data ? (void *)globals.data : (void *)"", globals.len);
     free(globals.data);
@@ -822,7 +919,8 @@ void lr_iome586_manifest_free(LR_Iome586Manifest *mf)
 
 /* ── Restore ───────────────────────────────────────────────────────────── */
 
-int lr_iome586_restore_globals(LRContext *ctx, const LR_Iome586Manifest *mf)
+int lr_iome586_restore_globals(LR_Iome586Cache *c, LRContext *ctx,
+                               const LR_Iome586Manifest *mf)
 {
     if (!ctx || !mf->globals || mf->globals_len < 4) return -1;
 
@@ -876,6 +974,13 @@ int lr_iome586_restore_globals(LRContext *ctx, const LR_Iome586Manifest *mf)
             break;
         }
         if (!restorable) continue;
+        /* Remap protection: never let an archive (old version, another
+         * engine build, or a tampered file) overwrite BOM / engine
+         * namespace bindings like fetch, localStorage, console... */
+        if (in_engine_namespace(c, name)) {
+            lr_free_value(ctx, v);
+            continue;
+        }
         if (lr_set_property_str(ctx, ctx->global_obj, name, v) >= 0)
             restored++;
     }

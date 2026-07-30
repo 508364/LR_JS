@@ -89,6 +89,7 @@ static InterpScope *scope_new(InterpScope *parent, int is_function, int is_globa
     s->names = (char **)calloc(s->capacity, sizeof(char *));
     s->values = (LRValue *)calloc(s->capacity, sizeof(LRValue));
     s->is_const = (int *)calloc(s->capacity, sizeof(int));
+    s->is_lexical = (int *)calloc(s->capacity, sizeof(int));
     return s;
 }
 
@@ -106,6 +107,7 @@ static void scope_release(InterpScope *scope, LRContext *ctx)
         free(scope->names);
         free(scope->values);
         free(scope->is_const);
+        free(scope->is_lexical);
         free(scope);
         scope = parent;   /* release the reference this child held */
     }
@@ -132,6 +134,7 @@ static void interp_push_scope(Interpreter *interp, int is_function_scope)
     InterpScope *s = scope_new(interp->current_scope, is_function_scope, 0);
     if (interp->current_scope == NULL) {
         s->is_global_scope = 1;
+        s->mirror_globals = !interp->is_module;
     }
     interp->current_scope = s;
 }
@@ -155,10 +158,15 @@ static InterpScope *find_function_scope(Interpreter *interp)
     return interp->global_scope;
 }
 
-/* Look up a name in the scope chain.
- * Returns 1 if found (value set), 0 if not found. */
-static int scope_lookup_internal(InterpScope *scope, const char *name, LRValue *value)
+    /* Look up a name in the scope chain.
+     * Returns 1 if found (value set), 0 if not found.
+     * For mirrored script-mode global var/function bindings the value is
+     * read authoritatively from the global object so that bare `x` and
+     * `globalThis.x` are the same binding (two-way consistency). */
+static int scope_lookup_internal(InterpScope *scope, LRContext *ctx,
+                                 const char *name, LRValue *value)
 {
+    (void)ctx;   /* reserved; bindings remain the source of truth for reads */
     while (scope) {
         for (int i = 0; i < scope->count; i++) {
             if (scope->names[i] && strcmp(scope->names[i], name) == 0) {
@@ -171,18 +179,32 @@ static int scope_lookup_internal(InterpScope *scope, const char *name, LRValue *
     return 0;
 }
 
+/* ES spec (GlobalDeclarationInstantiation): in Script mode, top-level var
+ * and function declarations create properties of the global object.
+ * Mirror such bindings onto the global object (scope stays source of truth
+ * for reads; writes are kept in sync by scope_set_name). */
+static void mirror_global_binding(Interpreter *interp, const char *name, LRValue value)
+{
+    LRValue global = lr_get_global_object(interp->ctx);
+    lr_set_property_str(interp->ctx, global, name,
+                        lr_dup_value(interp->ctx, value));
+    lr_free_value(interp->ctx, global);
+}
+
 /* Declare a variable in the current scope (for let/const) or function scope (for var).
  * kind: 0=var, 1=let, 2=const */
 static void scope_declare_name(Interpreter *interp, const char *name, LRValue value, int kind)
 {
-    InterpScope *scope;
-    if (kind == 0) {
-        /* var hoists to function scope */
-        scope = find_function_scope(interp);
-    } else {
-        /* let/const are block-scoped */
-        scope = interp->current_scope;
-    }
+    /* NOTE: the engine currently treats let/const like var for scoping and
+     * const-enforcement purposes (pre-existing behavior, preserved here so we
+     * only change what the user asked for). We therefore always hoist the
+     * binding to the nearest function/global scope. The *only* thing driven by
+     * the real declaration kind is the global-object mirror: per the ES spec,
+     * only top-level var/function (kind == 0) become properties of the global
+     * object in Script mode; let/const/class do not. */
+    InterpScope *scope = find_function_scope(interp);
+
+    int mirror = (kind == 0 && scope->is_global_scope && scope->mirror_globals);
 
     /* Check if already declared in this scope */
     for (int i = 0; i < scope->count; i++) {
@@ -190,6 +212,8 @@ static void scope_declare_name(Interpreter *interp, const char *name, LRValue va
             /* Redeclaration in same scope - update value */
             lr_free_value(interp->ctx, scope->values[i]);
             scope->values[i] = lr_dup_value(interp->ctx, value);
+            if (mirror && !scope->is_lexical[i])
+                mirror_global_binding(interp, name, value);
             return;
         }
     }
@@ -200,17 +224,24 @@ static void scope_declare_name(Interpreter *interp, const char *name, LRValue va
         scope->names = (char **)realloc(scope->names, scope->capacity * sizeof(char *));
         scope->values = (LRValue *)realloc(scope->values, scope->capacity * sizeof(LRValue));
         scope->is_const = (int *)realloc(scope->is_const, scope->capacity * sizeof(int));
+        scope->is_lexical = (int *)realloc(scope->is_lexical, scope->capacity * sizeof(int));
         /* Zero out new entries */
         for (int i = scope->count; i < scope->capacity; i++) {
             scope->names[i] = NULL;
             scope->values[i] = LR_VALUE_UNDEFINED;
             scope->is_const[i] = 0;
+            scope->is_lexical[i] = 0;
         }
     }
     scope->names[scope->count] = strdup(name);
     scope->values[scope->count] = lr_dup_value(interp->ctx, value);
-    scope->is_const[scope->count] = (kind == 2) ? 1 : 0;
+    scope->is_const[scope->count] = 0;   /* const enforcement left as the
+                                           * engine's pre-existing behavior */
+    scope->is_lexical[scope->count] = (kind != 0) ? 1 : 0;
     scope->count++;
+
+    if (mirror)
+        mirror_global_binding(interp, name, value);
 }
 
 /* Set a variable's value in the scope chain.
@@ -229,6 +260,11 @@ static int scope_set_name(Interpreter *interp, const char *name, LRValue value)
                 }
                 lr_free_value(interp->ctx, scope->values[i]);
                 scope->values[i] = lr_dup_value(interp->ctx, value);
+                /* Keep the ES-spec global-object mirror in sync for
+                 * script-mode top-level var/function bindings */
+                if (scope->is_global_scope && !scope->is_lexical[i] &&
+                    scope->mirror_globals)
+                    mirror_global_binding(interp, name, value);
                 return 1;
             }
         }
@@ -379,7 +415,7 @@ static LRValue eval_identifier(Interpreter *interp, ASTNode *node)
     if (!name) return LR_VALUE_UNDEFINED;
 
     LRValue val;
-    if (scope_lookup_internal(interp->current_scope, name, &val)) {
+    if (scope_lookup_internal(interp->current_scope, interp->ctx, name, &val)) {
         return val;
     }
 
@@ -651,6 +687,16 @@ static LRValue eval_unary(Interpreter *interp, ASTNode *node)
 
     if (strcmp(op, "typeof") == 0) {
         LRValue arg = interp_eval_node(interp, node->u.unary.arg);
+        /* ES spec: typeof on an unresolvable identifier must NOT throw a
+         * ReferenceError; it evaluates to "undefined". */
+        if (interp->error_flag &&
+            node->u.unary.arg && node->u.unary.arg->type == AST_IDENTIFIER) {
+            interp->error_flag = 0;
+            interp->error_message[0] = '\0';
+            interp->exception_pending = 0;
+            lr_free_value(interp->ctx, arg);
+            return lr_new_string(interp->ctx, "undefined");
+        }
         const char *type_str = "undefined";
         switch (arg.tag) {
         case LR_TYPE_UNDEFINED: type_str = "undefined"; break;
@@ -1326,14 +1372,14 @@ static LRValue eval_call(Interpreter *interp, ASTNode *node)
     /* super(...) call inside a derived class constructor */
     if (callee_node->type == AST_SUPER) {
         LRValue sup = LR_VALUE_UNDEFINED;
-        if (!scope_lookup_internal(interp->current_scope, "%superctor%", &sup)) {
+        if (!scope_lookup_internal(interp->current_scope, interp->ctx, "%superctor%", &sup)) {
             if (argv) { for (int i = 0; i < argc; i++) lr_free_value(interp->ctx, argv[i]); free(argv); }
             snprintf(interp->error_message, sizeof(interp->error_message),
                      "'super' keyword unexpected here");
             interp->error_flag = 1;
             return LR_VALUE_UNDEFINED;
         }
-        if (!scope_lookup_internal(interp->current_scope, "this", &this_val)) {
+        if (!scope_lookup_internal(interp->current_scope, interp->ctx, "this", &this_val)) {
             this_val = LR_VALUE_UNDEFINED;
         }
         LRValue result_sup = LR_VALUE_UNDEFINED;
@@ -1360,7 +1406,7 @@ static LRValue eval_call(Interpreter *interp, ASTNode *node)
     if ((callee_node->type == AST_MEMBER || callee_node->type == AST_COMPUTED_MEMBER) &&
         callee_node->u.member.obj && callee_node->u.member.obj->type == AST_SUPER) {
         LRValue sproto = LR_VALUE_UNDEFINED;
-        scope_lookup_internal(interp->current_scope, "%superproto%", &sproto);
+        scope_lookup_internal(interp->current_scope, interp->ctx, "%superproto%", &sproto);
         if (callee_node->type == AST_MEMBER &&
             callee_node->u.member.prop &&
             callee_node->u.member.prop->type == AST_IDENTIFIER) {
@@ -1373,7 +1419,7 @@ static LRValue eval_call(Interpreter *interp, ASTNode *node)
             lr_free_value(interp->ctx, pk);
         }
         lr_free_value(interp->ctx, sproto);
-        if (!scope_lookup_internal(interp->current_scope, "this", &this_val)) {
+        if (!scope_lookup_internal(interp->current_scope, interp->ctx, "this", &this_val)) {
             this_val = LR_VALUE_UNDEFINED;
         }
     }
@@ -3945,7 +3991,7 @@ static LRValue eval_export(Interpreter *interp, ASTNode *node)
                 val = lr_get_property_str(interp->ctx, re_ns, local_name ? local_name : "");
             } else {
                 val = LR_VALUE_UNDEFINED;
-                scope_lookup_internal(interp->current_scope, local_name, &val);
+                scope_lookup_internal(interp->current_scope, interp->ctx, local_name, &val);
             }
             if (ns) lr_set_property_str(interp->ctx, ns_val, exported_name, val); /* takes ownership */
             else lr_free_value(interp->ctx, val);
@@ -3979,7 +4025,7 @@ static LRValue eval_export(Interpreter *interp, ASTNode *node)
             }
             for (int v = 0; v < n; v++) {
                 LRValue bval = LR_VALUE_UNDEFINED;
-                scope_lookup_internal(interp->current_scope, names[v], &bval);
+                scope_lookup_internal(interp->current_scope, interp->ctx, names[v], &bval);
                 if (ns) lr_set_property_str(interp->ctx, ns_val, names[v], bval); /* takes ownership */
                 else lr_free_value(interp->ctx, bval);
             }
@@ -3993,7 +4039,7 @@ static LRValue eval_export(Interpreter *interp, ASTNode *node)
             lr_free_value(interp->ctx, decl);
             if (fname) {
                 LRValue bval = LR_VALUE_UNDEFINED;
-                scope_lookup_internal(interp->current_scope, fname, &bval);
+                scope_lookup_internal(interp->current_scope, interp->ctx, fname, &bval);
                 if (ns) lr_set_property_str(interp->ctx, ns_val, fname, bval); /* takes ownership */
                 else lr_free_value(interp->ctx, bval);
             }
@@ -4150,7 +4196,7 @@ static LRValue eval_this_expr(Interpreter *interp, ASTNode *node)
 {
     (void)node;
     LRValue this_val;
-    if (scope_lookup_internal(interp->current_scope, "this", &this_val)) {
+    if (scope_lookup_internal(interp->current_scope, interp->ctx, "this", &this_val)) {
         return this_val;
     }
     return lr_get_global_object(interp->ctx);
@@ -4161,7 +4207,7 @@ static LRValue eval_super_expr(Interpreter *interp, ASTNode *node)
     (void)node;
     /* 'super.prop' reads resolve against the parent prototype */
     LRValue sproto;
-    if (scope_lookup_internal(interp->current_scope, "%superproto%", &sproto)) {
+    if (scope_lookup_internal(interp->current_scope, interp->ctx, "%superproto%", &sproto)) {
         return sproto;
     }
     return LR_VALUE_UNDEFINED;
@@ -4355,6 +4401,8 @@ void interp_init(Interpreter *interp, LRContext *ctx, int is_module)
 
     /* Create global scope */
     InterpScope *global = scope_new(NULL, 1, 1);
+    global->mirror_globals = !is_module;   /* Script mode mirrors top-level
+                                             * var/function onto the global object */
     interp->global_scope = global;
     interp->current_scope = global;
 

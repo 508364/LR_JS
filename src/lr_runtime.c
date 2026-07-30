@@ -544,6 +544,10 @@ LR_Runtime *lr_runtime_new(const LR_Config *cfg)
     /* Register all built-in browser APIs */
     lr_register_builtins(rt);
 
+    /* IOME586 remap baseline: record the post-builtin global namespace so
+     * the cache never archives nor overwrites BOM API bindings. */
+    lr_iome586_capture_baseline(&rt->iome586, rt->lr_ctx);
+
     lr_log(rt, LR_LOG_INFO, "L/R_JS v%s initialized (lightweight JS engine)",
            LR_JS_VERSION_STRING);
 
@@ -681,8 +685,12 @@ static int lr_exec_file_cached(LR_Runtime *rt, const char *filename,
         ASTNode *ast = lr_ast_deserialize(mf.ast, mf.ast_len, &dparser);
         if (ast) {
             int warm_module = (mf.flags & LR_IOME586_FLAG_MODULE) ? 1 : 0;
-            /* static restore: rebind the archived global-variable snapshot */
-            lr_iome586_restore_globals(ctx, &mf);
+            /* static restore (OPT-IN, --iome586-restore-globals): rebind the
+             * archived global snapshot. Default off: the dynamic re-run below
+             * recomputes everything, and pre-seeding old values could be
+             * observed by typeof-probing scripts (stale-state side channel). */
+            if (rt->iome586.restore_globals)
+                lr_iome586_restore_globals(&rt->iome586, ctx, &mf);
             /* dynamic re-run: re-execute the deserialized AST */
             LRValue result = lr_engine_eval_ast(ctx, ast, dparser,
                                                 warm_module, filename);

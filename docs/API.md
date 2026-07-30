@@ -387,8 +387,10 @@ lr_sandbox_log_stats(sb->log, stdout);
 
 **归档文件本质是一个 LZ4 压缩包**，输出文件为 `<namehash>.lrfile`（加载时也兼容
 `.lrfile.lz4` 写法）。文件名取脚本**路径**哈希，因此 JS 脚本修改后会自动原位更新
-同一归档（旧版本转为 `.bak` 可撤回）。payload 以脚本**内容**哈希作为 XOR 密钥
-（"压缩密码即哈希值"），文件描述区以明文保存脚本名 + 时间 + 版本号的副本。
+同一归档（旧版本转为 `.bak` 可撤回）。payload 仅做 **LZ4 压缩，不做任何加密**；
+完整性由 `CRC32` 与内容哈希 `SourceHash`（FNV-1a 64-bit）保证，不再使用任何自密钥
+XOR（历史版本的 KEYED 归档仍可被兼容加载）。文件描述区以明文保存脚本名 + 时间 +
+版本号的副本。
 
 **容器格式**（魔数 `"IOME586\0"`）：
 ```
@@ -398,7 +400,7 @@ EngineVer      uint32          4 bytes   (版本串 FNV-1a32)
 Status         uint32          4 bytes   (1=WRITING 写入中, 2=ARCHIVED 已归档)
 Flags          uint32          4 bytes
 CreatedAt      int64           8 bytes
-SourceHash     FNV-1a 64-bit   8 bytes   (亦为 payload XOR 密钥)
+SourceHash     FNV-1a 64-bit   8 bytes   (脚本内容哈希，用于校验，非密钥)
 Mtime          int64           8 bytes
 SrcSize        uint64          8 bytes
 OptRatio       uint32          4 bytes   (优化比值 ×1e6)
@@ -406,8 +408,19 @@ CRC32          uint32          4 bytes
 PayloadStored  uint32          4 bytes   (LZ4 压缩后)
 PayloadRaw     uint32          4 bytes
 DescLen+Desc   variable                  (明文描述: 脚本名/时间/版本)
-Payload        variable                  (XOR 加密 + LZ4 压缩)
+Payload        variable                  (LZ4 压缩；无加密，CRC32/SourceHash 校验)
 ```
+
+**安全模型（v0.1.0 加固）**：
+- **敏感值排除**：快照跳过名称命中敏感词（token/secret/password/credential/apikey/
+  auth/bearer/cookie/session/private 等）的全局绑定，避免令牌/密钥随缓存落盘泄露。
+- **字符串可控**：`snapshot_strings` 默认开启（记录字符串字面量绑定）；`--iome586-no-strings`
+  可关闭，使归档中完全不出现任何字符串字面量值。
+- **还原默认关闭**：`restore_globals` 默认关闭，暖跑只做"静态还原 + 动态重跑"，不把
+  归档里的全局变量绑定写回全局对象；需要时通过 `--iome586-restore-globals` 显式开启。
+- **BOM 基线重映射保护**：运行时在注册完内建 API 后捕获一份"已存在全局属性"基线，
+  还原时跳过这些属于引擎/BOM 的名称，避免缓存恢复污染内建 API。
+
 
 **Payload 内为命名条目**（`u16 name_len|name|u32 data_len|data`），相当于压缩包内的
 多个二进制文件：`meta`（元信息）、`path`（解释路径/方法）、`config`（配置）、
@@ -1267,6 +1280,8 @@ lr_thread_pool_submit(&rt->thread_pool, my_task, my_data);
 | `--iome586 <dir>` | 启用 IOME586 结果缓存（别名 `--bytecode-cache`） |
 | `--iome586-stats` | 退出时打印缓存统计（别名 `--bytecode-stats`） |
 | `--iome586-revert <js>` | 撤回指定脚本的缓存落盘（回滚到 .bak） |
+| `--iome586-no-strings` | 缓存快照中不记录任何字符串字面量值（敏感值防护） |
+| `--iome586-restore-globals` | 允许暖跑时把归档中的全局变量绑定还原回全局对象（默认关闭，按需开启） |
 | `--sandbox-log <dir>` | 启用沙箱日志 |
 | `--min-memory <bytes>` | 最小系统内存要求 |
 | `--no-memory-check` | 跳过系统内存检查 |
@@ -1418,7 +1433,7 @@ make CC="$CC" clean && make CC="$CC"
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
-| 0.1.0 | 2026-07 | 初始版本：ES2022+ 支持、多线程沙箱、渲染器桥接、系统内存限制、分代/增量 GC、`.lrfile` 字节码缓存与沙箱日志、IOME586 结果缓存（LZ4 归档、边运行边缓存、15% 规则、BOM、撤回）、AST 序列化 `LRA` v3（字面量显式类型标记），修复暖跑中 `true`→`false` 的 bug |
+| 0.1.0 | 2026-07 | 初始版本：ES2022+ 支持、多线程沙箱、渲染器桥接、系统内存限制、分代/增量 GC、`.lrfile` 字节码缓存与沙箱日志、IOME586 结果缓存（LZ4 归档、边运行边缓存、15% 规则、BOM、撤回）、AST 序列化 `LRA` v3（字面量显式类型标记），修复暖跑中 `true`→`false` 的 bug；追加能力：顶层 `var`/`function` 在非模块 Script 下绑定到全局对象（符合 `GlobalDeclarationInstantiation`，`let`/`const`/`class` 不挂载），模块内 `import.meta`，`RegExp` 的 `d`（match indices）标志，Windows 控制台 UTF-8 输出；IOME586 安全加固（敏感全局值排除、`snapshot_strings` 默认开启、去除自密钥 XOR、`restore_globals` 默认关闭、BOM 基线重映射保护），新增 CLI `--iome586-no-strings` / `--iome586-restore-globals` |
 
 ---
 
@@ -2330,9 +2345,37 @@ ws.delete(value);
 
 ## 25. ES2022+ 语法特性
 
-### 25.1 globalThis
+### 25.1 globalThis 与顶层声明绑定
+
 ```javascript
-globalThis === window;  // true
+globalThis === window;  // true（浏览器语义下全局对象即 window）
+```
+
+**顶层 `var` / `function` 绑定到全局对象（仅非模块 Script 模式）。** 依据 ECMAScript
+`GlobalDeclarationInstantiation` 规范：在非模块的 Script 中，顶层的 `var` 和 `function`
+声明会成为全局对象的属性；而 `let` / `const` / `class` 属于声明式绑定，不会挂载到全局对象。
+ES 模块（`.mjs` 或 `-m`）下所有顶层声明都保存在模块命名空间，绝不污染全局对象。
+
+```javascript
+// 以脚本方式运行（默认）
+var topVar = 42;
+function topFunc() { return "fn"; }
+let topLet = 1;
+const topConst = 2;
+class TopClass {}
+
+globalThis.topVar;            // 42
+typeof globalThis.topFunc;   // "function"
+"topLet"    in globalThis;   // false（声明式，不挂载）
+"topConst"  in globalThis;   // false
+"TopClass"  in globalThis;   // false
+
+topVar = 200;
+globalThis.topVar;           // 200（赋值经镜像同步到全局对象）
+
+// 以模块方式运行（-m / .mjs）
+//   'mVar' in globalThis  -> false
+//   'mFunc' in globalThis -> false
 ```
 
 ### 25.2 for...of 循环
@@ -2355,3 +2398,14 @@ const million = 1_000_000;  // 1000000
 const bits = 0xFF_FF_FF;    // 16777215
 const binary = 0b1010_0001; // 161
 ```
+
+### 25.5 `import.meta`
+模块（`.mjs` 或 `-m`）内部可访问 `import.meta`，提供当前模块元信息：
+```javascript
+// module.mjs
+import.meta.url;       // "file:///abs/path/module.mjs"
+import.meta.filename;  // 绝对路径
+import.meta.dirname;   // 所在目录
+console.log(import.meta.url);
+```
+非模块脚本中访问 `import.meta` 会报错。

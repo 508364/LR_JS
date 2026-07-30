@@ -22,10 +22,20 @@ typedef struct InterpScope {
     char             **names;
     LRValue           *values;
     int               *is_const;    /* 1 = const declaration */
+    int               *is_lexical;  /* 1 = let/const/class (declarative);
+                                     * 0 = var/function. Global-scope var and
+                                     * function bindings in Script mode are
+                                     * mirrored onto the global object per
+                                     * the ES spec (GlobalDeclarationInstantiation) */
     int                count;
     int                capacity;
     int                is_function_scope;
     int                is_global_scope;
+    int                mirror_globals;/* for the global scope only: non-zero means
+                                     * top-level var/function bindings are mirrored
+                                     * onto the global object (Script mode). Zero in
+                                     * module mode so top-level declarations stay
+                                     * declarative (ES spec GlobalDeclarationInstantiation) */
     int                refcount;      /* scopes are refcounted so closures can
                                        * keep their defining chain alive */
 } InterpScope;

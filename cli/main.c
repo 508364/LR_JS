@@ -53,6 +53,8 @@ static void print_usage(const char *prog)
     printf("  --iome586 <dir>          Enable IOME586 result cache (.lrfile.lz4)\n");
     printf("  --iome586-stats          Print IOME586 cache statistics on exit\n");
     printf("  --iome586-revert <js>    Roll back the last archived cache for a script\n");
+    printf("  --iome586-no-strings     Never persist string globals in the cache\n");
+    printf("  --iome586-restore-globals  Rebind archived globals before warm re-run\n");
     printf("  --bytecode-cache <dir>   Alias of --iome586\n");
     printf("  --bytecode-stats         Alias of --iome586-stats\n");
     printf("  --sandbox-log <dir>      Enable per-sandbox log files (set log dir)\n");
@@ -170,6 +172,8 @@ int main(int argc, char *argv[])
     int print_debug_info = 0;
     const char *bytecode_cache_dir = NULL;
     const char *iome586_revert_script = NULL;
+    int iome586_no_strings = 0;
+    int iome586_restore_globals = 0;
     const char *sandbox_log_dir = NULL;
     LR_Config cfg;
 
@@ -243,6 +247,10 @@ int main(int argc, char *argv[])
         } else if (strcmp(argv[i], "--iome586-stats") == 0 ||
                    strcmp(argv[i], "--bytecode-stats") == 0) {
             print_bytecode_stats = 1;
+        } else if (strcmp(argv[i], "--iome586-no-strings") == 0) {
+            iome586_no_strings = 1;
+        } else if (strcmp(argv[i], "--iome586-restore-globals") == 0) {
+            iome586_restore_globals = 1;
         } else if (strcmp(argv[i], "--iome586-revert") == 0) {
             if (i + 1 < argc) {
                 iome586_revert_script = argv[++i];
@@ -291,6 +299,12 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Failed to create L/R_JS runtime\n");
         return 1;
     }
+
+    /* IOME586 privacy/behaviour switches */
+    if (iome586_no_strings)
+        g_rt->iome586.snapshot_strings = 0;
+    if (iome586_restore_globals)
+        g_rt->iome586.restore_globals = 1;
 
     /* Debug info dump (--debug) */
     if (print_debug_info) {

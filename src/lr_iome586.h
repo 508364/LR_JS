@@ -11,8 +11,21 @@
  *                                        ".lrfile.lz4" spelling)
  * The file is named by the *script path* hash so that editing the script
  * refreshes the same archive in place (auto-update). The script *content*
- * hash is stored in the header (source_hash) for validation and is the
- * payload XOR key.
+ * hash is stored in the header (source_hash) for validation.
+ *
+ * Security notes:
+ *   - New archives are written UNKEYED: the historical XOR "keying" used
+ *     source_hash as the key, which is stored in the same header, so it was
+ *     obfuscation, not encryption. Integrity is covered by payload_crc32.
+ *     The loader still accepts legacy KEYED archives for compatibility.
+ *   - The globals snapshot never serializes values of sensitive-looking
+ *     names (token/secret/password/...); they are recorded as opaque
+ *     (tag 6, present-but-not-restorable). "snapshot_strings=0" extends
+ *     this to ALL string globals (--iome586-no-strings).
+ *   - The warm path re-executes the AST, so restoring the globals snapshot
+ *     is redundant for correctness; it is now OPT-IN (restore_globals,
+ *     --iome586-restore-globals) to avoid pre-seeding stale state that a
+ *     script could observe via typeof-probing before its own assignments.
  *
  * Container layout (little-endian):
  *   ┌────────────────────────────────────────────────────────────────────┐
@@ -93,6 +106,20 @@ typedef struct LR_Iome586Cache {
     char            *cache_dir;      /* NULL = disabled */
     int              enabled;
     int              compression;    /* LZ4 payload compression (default on) */
+    int              snapshot_strings; /* 1 = string globals may be archived
+                                        * (sensitive names always excluded);
+                                        * 0 = record all strings as opaque */
+    int              restore_globals;  /* 1 = warm path rebinds the archived
+                                        * globals snapshot before re-run
+                                        * (default 0: re-run recomputes) */
+
+    /* Builtin baseline ("remap set"): the global property names present
+     * right after builtin registration, captured at runtime init. Both the
+     * snapshot AND the restore path treat these names as engine namespace:
+     * never archived, never overwritten by an archive. Falls back to the
+     * static builtin list when empty (embedders that skip capture). */
+    char           **baseline_names;
+    uint32_t         baseline_count;
 
     /* Statistics */
     int64_t          hit_count;
@@ -160,6 +187,13 @@ void lr_iome586_init(LR_Iome586Cache *c, LR_Runtime *rt, const char *dir);
 void lr_iome586_destroy(LR_Iome586Cache *c);
 int  lr_iome586_set_dir(LR_Iome586Cache *c, const char *dir);
 
+/* Capture the builtin baseline: record every property name currently on the
+ * global object (call right after lr_register_builtins). These names are
+ * excluded from snapshots and protected from restore, so BOM APIs
+ * (fetch/localStorage/...) can never be shadowed by archived state.
+ * Returns the number of names captured, or -1. */
+int  lr_iome586_capture_baseline(LR_Iome586Cache *c, LRContext *ctx);
+
 /* ── Load / restore ─────────────────────────────────────────────────────── */
 
 /* Load and fully parse the archive for a script (content-hash keyed).
@@ -170,8 +204,11 @@ int  lr_iome586_load(LR_Iome586Cache *c, const char *script_path,
 void lr_iome586_manifest_free(LR_Iome586Manifest *mf);
 
 /* Re-bind the archived global variable snapshot (primitive values) onto the
- * live global object. Returns number of bindings restored, or -1. */
-int  lr_iome586_restore_globals(LRContext *ctx, const LR_Iome586Manifest *mf);
+ * live global object. Names inside the builtin baseline (BOM APIs) are
+ * NEVER overwritten, regardless of archive contents (remap protection).
+ * Returns number of bindings restored, or -1. */
+int  lr_iome586_restore_globals(LR_Iome586Cache *c, LRContext *ctx,
+                                const LR_Iome586Manifest *mf);
 
 /* ── Store (two-phase) ──────────────────────────────────────────────────── */
 

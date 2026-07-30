@@ -13,6 +13,8 @@ Pure C, ES2022-compatible JavaScript engine with browser APIs.
 - **IOME586 result cache**: whole-script interpreter-result caching in LZ4 archives (`.lrfile`) — cache-while-running, auto-refresh on script change, snapshots of globals / per-node results / run state, 15%-gain rule, hash-keyed payload, on-disk rollback, and BOM support (UTF-8 BOM strip, UTF-16 LE/BE transcode); covers full ES2022 including ES modules (`-m`/`--module`, re-run as a module on cache hit via static global restore + dynamic AST re-run); AST serialization uses the `LRA` v3 format with explicit literal type tags (see `docs/API.md` §6.1.1); enable with `--iome586 <dir>`
 - **Cross-platform**: Linux (x86_64, x86, ARM64, ARMv7), Windows 7+ (x86_64, x86), macOS
 - **Thread-safe**: Built-in thread pool, Worker support
+- **Script/Module semantics**: In non-module Script mode, top-level `var` and `function` declarations are bound as properties of the global object (ECMAScript `GlobalDeclarationInstantiation`); `let`/`const`/`class` are declarative and are *not* mirrored onto the global object. ES modules (`.mjs` or `-m`) keep all top-level declarations in the module namespace (nothing is bound to the global object). `import.meta` is supported inside modules.
+- **Windows console UTF-8**: `lr_js` switches the console output codepage to UTF-8, so non-ASCII output (e.g. Chinese) renders without garbling.
 
 ## Documentation
 
@@ -46,7 +48,7 @@ All features below are verified by the test suite (`tests/es2022_probe.js` plus
 | `Object`: `entries`, `hasOwn` | ✅ | |
 | `Map` / `Set` `.size` | ✅ | size kept in sync |
 | `Promise.allSettled` / `Promise.any` | ✅ | |
-| `globalThis`, global `NaN` / `Infinity` | ✅ | |
+| `globalThis`, global `NaN` / `Infinity` | ✅ | top-level `var`/`function` bound to the global object in Script mode |
 | `SharedArrayBuffer` + `Atomics` (incl. `Atomics.wait`) | ✅ | verified no lost updates under contention |
 | Web Workers + structured clone (`postMessage`) | ✅ | bidirectional, event-loop pumped |
 

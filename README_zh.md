@@ -13,6 +13,8 @@
 - **IOME586 结果缓存**：以整个脚本为粒度直接缓存解释器成果数据，归档为 LZ4 压缩包（`.lrfile`）——支持边运行边缓存、脚本修改自动更新缓存、全局变量/节点结果/运行状态快照、15% 收益规则、哈希做压缩密钥、落盘撤回，并支持 BOM 文件（剥离 UTF-8 BOM、UTF-16 LE/BE 自动转码）；覆盖全量 ES2022（含 ES 模块：`-m`/`--module` 执行的脚本同样落盘，缓存命中时以模块方式重跑，采用"静态还原全局变量 + 动态重跑 AST"策略）；AST 序列化采用 `LRA` v3 格式、字面量带显式类型标记（详见 `docs/API.md` §6.1.1）；使用 `--iome586 <dir>` 启用
 - **跨平台**：Linux (x86_64, x86, ARM64, ARMv7)、Windows 7+ (x86_64, x86)、macOS
 - **线程安全**：内置线程池，Worker 支持
+- **Script / 模块语义**：非模块的 Script 模式下，顶层的 `var` 与 `function` 声明会作为属性绑定到全局对象（符合 ECMAScript 的 `GlobalDeclarationInstantiation` 规范）；`let`/`const`/`class` 属于声明式绑定，不会镜像到全局对象。ES 模块（`.mjs` 或 `-m`）下所有顶层声明都保存在模块命名空间中（不绑定到全局对象）。模块内部支持 `import.meta`。
+- **Windows 控制台 UTF-8**：`lr_js` 会把控制台输出代码页切到 UTF-8，中文等非 ASCII 输出不再乱码。
 
 ## 构建
 
