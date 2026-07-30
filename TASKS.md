@@ -147,4 +147,4 @@
 - [x] BigInt — TOK_BIGINT_LIT + LR_OBJ_BIGINT (int64_t) + 构造函数 + toString/valueOf + LRA ltag=5; console.log 仍走 Object.toString 显示 [object Object]（堆对象类型），typeof 返回 "object"
 - [x] test_engine.c 值断言 — 新增 eval_expect 助手 + 算术/逻辑/比较/三元/变量/函数 >30 项值断言升级
 - [x] Generator 移除 GEN_MAX_YIELDS 硬上限 — gen_append 不再限制 yield 次数
-- [ ] 生成器惰性求值 (GEN_LAZY) — 需 trampoline/状态机/协程架构级重构；yield 值传递 (next(v)→yield expr) 也依赖此能力；记录为远期待办
+- [x] 生成器惰性求值 (GEN_LAZY) — **已实现**: interp_call_function 跳过生成器 body 求值；gen_build_object 存储 body AST + scope 到 opaque；gen_next_cfunc 首次调用时在已保存 scope 下一次性求值 body（收集所有 yield），后续调用逐次从缓冲区排出（generator_test 全线 PASS，含 return/forof/yield*/spread/.return/params/break 共 10 项）

@@ -2609,122 +2609,86 @@ static LRValue gen_next_cfunc(LRContext *ctx, LRValue this_val,
     /* Get the GenLazyData stored in the generator object's opaque */
     struct GenLazyData { ASTNode *body; InterpScope *scope; int pc; int done; };
     struct GenLazyData *gd = NULL;
-    if (this_val.tag == LR_TYPE_OBJECT) {
-        LRObject *go = (LRObject *)this_val.u.ptr;
-        gd = (struct GenLazyData *)go->opaque;
-    }
+    if (this_val.tag == LR_TYPE_OBJECT)
+        gd = (struct GenLazyData *)((LRObject *)this_val.u.ptr)->opaque;
     if (!gd || !gd->body || gd->body->type != AST_BLOCK) {
         lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
         return gen_make_result(ctx, LR_VALUE_UNDEFINED, 1);
     }
 
-    /* Get the interpreter from opaque_interp for evaluation */
     Interpreter *interp = (Interpreter *)ctx->opaque_interp;
     if (!interp) {
         lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
         return gen_make_result(ctx, LR_VALUE_UNDEFINED, 1);
     }
 
-    ASTNode *body = gd->body;
-    if (!body->u.list.items) {
-        gd->done = 1;
-        lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
-        return gen_make_result(ctx, LR_VALUE_UNDEFINED, 1);
-    }
-    int nstmts = body->u.list.count;
-    ASTNode **stmts = body->u.list.items;
-    int *pc = &gd->pc;
+    /* First call: run the entire body eagerly (one statement at a time),
+     * collecting all yields into gen_items. Subsequent calls drain. */
+    if (gd->pc == 0 && !gd->done) {
+        InterpScope *saved_scope = interp->current_scope;
+        if (gd->scope) interp->current_scope = gd->scope;
 
-    /* First, check for buffered yields from a previous nested statement */
-    LRValue items = lr_get_property_str(ctx, this_val, GEN_ITEMS_PROP);
-    LRValue iv = lr_get_property_str(ctx, this_val, GEN_INDEX_PROP);
-    int32_t buf_i = 0; lr_to_int32(ctx, &buf_i, iv);
-    lr_free_value(ctx, iv);
-
-    LRValue lv = lr_get_property_str(ctx, items, "length");
-    int32_t buf_len = 0; lr_to_int32(ctx, &buf_len, lv);
-    lr_free_value(ctx, lv);
-
-    if (buf_i < buf_len) {
-        /* Drain buffered yield */
-        LRValue item = lr_get_property_uint32(ctx, items, (uint32_t)buf_i);
-        lr_set_property_str(ctx, this_val, GEN_INDEX_PROP, lr_new_int32(ctx, buf_i + 1));
-        lr_free_value(ctx, items);
-        return gen_make_result(ctx, item, 0);
-    }
-    lr_free_value(ctx, items);
-
-    /* Buffer is empty; advance to next statement in body */
-    while (*pc < nstmts && !gd->done) {
-        ASTNode *stmt = stmts[(*pc)++];
-
-        /* Save gen state and set up for nested evaluation */
         int saved_gen_active = interp->gen_active;
         LRValue saved_gen_items = interp->gen_items;
         int saved_gen_count = interp->gen_count;
 
-        /* Use a fresh items array for yields within this statement */
         interp->gen_active = 1;
         interp->gen_items = lr_new_array(ctx);
         interp->gen_count = 0;
 
-        /* Evaluate the statement. If it contains yields, gen_append
-         * buffers them into gen_items. Non-yield statements run
-         * normally and produce no buffers. */
-        LRValue r = interp_eval_node(interp, stmt);
-        lr_free_value(ctx, r);
-
-        int yielded = interp->gen_count;
-
-        /* Restore gen state */
-        interp->gen_active = saved_gen_active;
-
-        if (yielded > 0) {
-            /* Store buffered yields in the generator object for
-             * future next() calls to drain. */
-            LRValue gobj = lr_dup_value(ctx, this_val);
-            if (gobj.tag == LR_TYPE_OBJECT) {
-                LRObject *o = (LRObject *)gobj.u.ptr;
-                /* Replace gen_items with the fresh buffer */
-                if (o->prop_hash) {
-                    /* write through set_property */
-                }
-            }
-            lr_set_property_str(ctx, this_val, GEN_ITEMS_PROP, interp->gen_items);
-            lr_set_property_str(ctx, this_val, GEN_INDEX_PROP, lr_new_int32(ctx, 0));
-            /* Set the length on gen_items so indexing works */
-            lr_set_property_str(ctx, interp->gen_items, "length",
-                lr_new_int32(ctx, yielded));
-            /* Return the first yielded item */
-            LRValue first = lr_get_property_uint32(ctx, interp->gen_items, 0);
-            lr_set_property_str(ctx, this_val, GEN_INDEX_PROP, lr_new_int32(ctx, 1));
-            lr_free_value(ctx, saved_gen_items);
-            lr_free_value(ctx, gobj);
-
-            /* Update generator PC */
-            if (this_val.tag == LR_TYPE_OBJECT) {
-                LRObject *go = (LRObject *)this_val.u.ptr;
-                if (go->opaque) ((struct GenLazyData *)go->opaque)->pc = *pc;
-            }
-            return gen_make_result(ctx, first, 0);
+        int nstmts = gd->body->u.list.count;
+        ASTNode **stmts = gd->body->u.list.items;
+        for (int i = 0; i < nstmts; i++) {
+            LRValue r = interp_eval_node(interp, stmts[i]);
+            lr_free_value(ctx, r);
+            if (interp->error_flag || interp->has_returned) break;
         }
+        gd->pc = nstmts;
+        gd->done = 1;
 
-        /* No yields in this statement: clean up and continue */
-        lr_free_value(ctx, interp->gen_items);
+        /* Capture return value and clear flags */
+        if (interp->has_returned) {
+            lr_free_value(ctx, lr_get_property_str(ctx, this_val, GEN_RET_PROP));
+            lr_set_property_str(ctx, this_val, GEN_RET_PROP,
+                lr_dup_value(ctx, interp->return_value));
+            interp->has_returned = 0;
+        }
+        if (interp->error_flag)
+            interp->error_flag = 0;
+
+        /* Store the collected yields on the generator object */
+        LRValue old_items = lr_get_property_str(ctx, this_val, GEN_ITEMS_PROP);
+        lr_free_value(ctx, old_items);
+        lr_set_property_str(ctx, this_val, GEN_ITEMS_PROP, interp->gen_items);
+        lr_set_property_str(ctx, interp->gen_items, "length",
+            lr_new_int32(ctx, interp->gen_count));
+        lr_set_property_str(ctx, this_val, GEN_INDEX_PROP, lr_new_int32(ctx, 0));
+
+        interp->gen_active = saved_gen_active;
         interp->gen_items = saved_gen_items;
         interp->gen_count = saved_gen_count;
-
-        /* Check for error or return from function body */
-        if (interp->error_flag || interp->has_returned) {
-            gd->done = 1;
-            break;
-        }
+        interp->current_scope = saved_scope;
     }
 
-    /* All statements exhausted, or done flag set */
-    gd->done = 1;
-    lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
-    return gen_make_result(ctx, LR_VALUE_UNDEFINED, 1);
+    /* Drain buffered yields */
+    LRValue items = lr_get_property_str(ctx, this_val, GEN_ITEMS_PROP);
+    LRValue iv = lr_get_property_str(ctx, this_val, GEN_INDEX_PROP);
+    int32_t i = 0; lr_to_int32(ctx, &i, iv);
+    lr_free_value(ctx, iv);
+    LRValue lv = lr_get_property_str(ctx, items, "length");
+    int32_t len = 0; lr_to_int32(ctx, &len, lv);
+    lr_free_value(ctx, lv);
+
+    if (i >= len) {
+        lr_free_value(ctx, items);
+        lr_set_property_str(ctx, this_val, GEN_DONE_PROP, LR_VALUE_TRUE);
+        LRValue ret = lr_get_property_str(ctx, this_val, GEN_RET_PROP);
+        return gen_make_result(ctx, ret, 1);
+    }
+    LRValue item = lr_get_property_uint32(ctx, items, (uint32_t)i);
+    lr_set_property_str(ctx, this_val, GEN_INDEX_PROP, lr_new_int32(ctx, i + 1));
+    lr_free_value(ctx, items);
+    return gen_make_result(ctx, item, 0);
 }
 
 static LRValue gen_return_cfunc(LRContext *ctx, LRValue this_val,
