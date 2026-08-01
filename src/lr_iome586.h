@@ -35,7 +35,7 @@
  *   │ status            u32 (1 = WRITING, 2 = ARCHIVED)          4 bytes │
  *   │ flags             u32 (strict/module/compressed/keyed)     4 bytes │
  *   │ created_at        i64 (unix time)                          8 bytes │
- *   │ source_hash       u64 (FNV-1a64 of script bytes; also the         │
+ *   │ source_hash       u64 (FNV-1a64 of script bytes; also the          │
  *   │                        archive "password" / XOR key)       8 bytes │
  *   │ source_mtime      i64                                      8 bytes │
  *   │ source_size       u64                                      8 bytes │
@@ -161,6 +161,7 @@ typedef struct LR_Iome586Manifest {
     uint8_t  *ast;      size_t ast_len;
     uint8_t  *nodes;    size_t nodes_len;
     uint8_t  *globals;  size_t globals_len;
+    uint8_t  *bytecode; size_t bytecode_len;
 } LR_Iome586Manifest;
 
 /* ── Two-phase writer (write-while-running) ─────────────────────────────── */
@@ -179,6 +180,8 @@ typedef struct LR_Iome586Writer {
     int       have_bak;
     uint8_t  *ast;           /* owned serialized AST */
     size_t    ast_len;
+    uint8_t  *bc_data;        /* serialized bytecode (set before commit) */
+    size_t    bc_len;
 } LR_Iome586Writer;
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
@@ -227,6 +230,9 @@ int  lr_iome586_begin(LR_Iome586Cache *c, const char *script_path,
 int  lr_iome586_commit(LR_Iome586Cache *c, LR_Iome586Writer *w,
                        LRContext *ctx, const ASTNode *program,
                        int64_t exec_us);
+
+/* Store bytecode for the current writer (call after compilation, before commit). */
+void lr_iome586_set_bytecode(LR_Iome586Writer *w, const uint8_t *data, size_t len);
 
 /* Abort a begun archive: removes the WRITING file and restores the previous
  * archive from ".bak" if one existed (automatic rollback). */

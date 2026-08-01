@@ -11,10 +11,23 @@
 #   make test         Build and run tests
 
 CC      ?= gcc
-CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type \
-           -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable \
-           -Wno-incompatible-pointer-types -Wno-discarded-qualifiers \
-           -fPIC
+
+# Some -Wno-* options are GCC-only (cast-function-type, unused-but-set-variable,
+# discarded-qualifiers). Clang/AppleClang would emit an -Wunknown-warning-option
+# note for every translation unit, so probe the positive form with -Werror and
+# only keep the suppressions the compiler actually understands.
+lr_probe = $(shell echo 'int main(void){return 0;}' | \
+             $(CC) -Werror -W$(1) -x c - -o /dev/null >/dev/null 2>&1 \
+             && echo -Wno-$(1))
+LR_WARN_OFF := $(call lr_probe,unused-parameter) \
+               $(call lr_probe,cast-function-type) \
+               $(call lr_probe,unused-function) \
+               $(call lr_probe,unused-variable) \
+               $(call lr_probe,unused-but-set-variable) \
+               $(call lr_probe,incompatible-pointer-types) \
+               $(call lr_probe,discarded-qualifiers)
+
+CFLAGS  ?= -O2 -g -Wall -Wextra $(LR_WARN_OFF) -fPIC
 
 # Architecture detection
 UNAME_M := $(shell uname -m 2>/dev/null || echo "x86_64")
@@ -87,6 +100,7 @@ LR_SRCS = \
 	$(SRC_DIR)/lr_canvas_webgl.c \
 	$(SRC_DIR)/lr_scheduler.c \
 	$(SRC_DIR)/lr_perf_opt.c \
+	$(SRC_DIR)/engine/lr_bytecode.c \
 	$(SRC_DIR)/lr_worker.c \
 	$(SRC_DIR)/lr_gc.c \
 	$(SRC_DIR)/lr_iome586.c \

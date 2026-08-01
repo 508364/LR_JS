@@ -137,8 +137,8 @@ LR_OSX_SDK=/path/to/MacOSX12.3.sdk ./build_macos.sh
 
 Per-architecture output (created under `releases/`):
 
-- `LR_JS-0.1.0-macos-x86_64.tar.gz`
-- `LR_JS-0.1.0-macos-arm64.tar.gz`
+- `LR_JS-0.1.1-macos-x86_64.tar.gz`
+- `LR_JS-0.1.1-macos-arm64.tar.gz`
 
 Each archive contains `lib/liblr_js.a`, `lib/liblr_js.dylib`,
 `bin/lr_js` and `lr_js.h`.

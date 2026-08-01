@@ -94,6 +94,13 @@ typedef struct {
      * then returned one-at-a-time by gen_next. */
     int           gen_lazy;      /* 1 = running generator lazily */
     int           gen_resume_pc; /* next statement index in body */
+    /* Execution timeout (ms). 0 = no limit. Checked every N statements. */
+    int           timeout_ms;
+    int           stmt_counter;
+    /* Global object property cache: small LRU of frequently-accessed
+     * global names → values, for O(1) miss in scope chain. */
+    #define GLOBAL_CACHE_SIZE 16
+    struct { const char *name; LRValue val; } global_cache[GLOBAL_CACHE_SIZE];
 } Interpreter;
 
 /* ── API ───────────────────────────────────────────────────────────────── */
@@ -111,6 +118,49 @@ void interp_free(Interpreter *interp);
 /* Re-attach the interpreter's JS-call callback to the context
  * (used by the persistent interpreter in lr_engine_eval) */
 void interp_reattach(Interpreter *interp, LRContext *ctx);
+
+/* ── Bytecode VM bridge ────────────────────────────────────────────────
+ * The bytecode VM (lr_bytecode.c) executes on top of the *same*
+ * interpreter state: one scope chain, one error/exception state, one set
+ * of closures. These entry points expose exactly the pieces of the
+ * tree-walking interpreter the VM needs, so that both execution engines
+ * share a single implementation of the JavaScript semantics.            */
+
+/* Evaluate an arbitrary AST subtree with the tree-walker (VM fallback). */
+LRValue interp_bc_eval_node(Interpreter *interp, ASTNode *node);
+
+/* Identifier read. Returns 1 on success; on failure sets a ReferenceError
+ * and returns 0 (*out is undefined). */
+int  interp_bc_load_var(Interpreter *interp, const char *name, LRValue *out);
+
+/* typeof-style read: never throws. Returns 1 if the binding exists. */
+int  interp_bc_typeof_var(Interpreter *interp, const char *name, LRValue *out);
+
+/* Assignment to an existing binding; creates an implicit global when the
+ * name is unbound (sloppy-mode semantics, same as the tree-walker). */
+void interp_bc_store_var(Interpreter *interp, const char *name, LRValue val);
+
+/* Declaration. kind: 0 = var/function, 1 = let, 2 = const. */
+void interp_bc_declare_var(Interpreter *interp, const char *name,
+                           LRValue val, int kind);
+
+/* Invoke a callable value (C function, interpreted function, class). */
+LRValue interp_bc_call(Interpreter *interp, LRValue callee, LRValue this_val,
+                       int argc, LRValue *argv);
+
+/* `new callee(...)` */
+LRValue interp_bc_construct(Interpreter *interp, LRValue callee,
+                            int argc, LRValue *argv);
+
+/* Raise a JS exception from the VM (`throw expr`). */
+void interp_bc_throw(Interpreter *interp, LRValue value);
+
+/* Lexical scope management for VM-compiled blocks. */
+void interp_bc_push_scope(Interpreter *interp);
+void interp_bc_pop_scope(Interpreter *interp);
+
+/* Cook (unescape) a raw template-literal fragment. Caller frees. */
+char *interp_bc_cook_template(const char *raw);
 
 #ifdef __cplusplus
 }

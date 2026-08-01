@@ -12,6 +12,7 @@
 #include "lr_lexer.h"
 #include "lr_ast.h"
 #include "lr_interp.h"
+#include "lr_bytecode.h"
 #include "../lr_promise.h"
 #include <stdlib.h>
 #include <string.h>
@@ -1093,60 +1094,64 @@ int lr_to_float64(LRContext *ctx, double *pres, LRValue val)
 /* ── Shape Cache for Property Access ────────────────────────────────────── */
 
 /* Lookup shape cache for a (object, property) pair.
- * Returns the cached property value pointer, or NULL if not in cache. */
+ * Returns a direct pointer to the property VALUE, or NULL on miss.
+ * On hit, verifies the cached LRProperty pointer is still valid
+ * (key==atom pointer compare, O(1)) and returns &prop->value. */
 static LRValue *shape_cache_lookup(LRContext *ctx, LRObject *obj, LRString *atom)
 {
     LRRuntime *rt = ctx->rt;
     unsigned int idx = ((uintptr_t)obj ^ (uintptr_t)atom) & (LR_SHAPE_CACHE_SIZE - 1);
     LRShapeCacheEntry *entry = &rt->shape_cache[idx];
     if (entry->valid && entry->obj == obj && entry->prop == atom) {
-        if (entry->offset >= 0 && entry->offset < 1000) {
-            /* Fast path: attempt direct access by offset through the hash chain */
-            /* Since we can't guarantee a fixed offset, just return the cached value */
-            /* We use the hash chain directly but with known key */
-            LRProperty *prop = obj->prop_hash;
-            while (prop) {
-                if (prop->key == atom) {
-                    /* Accessor properties must go through the slow path so
-                     * the getter is actually invoked. */
-                    if (prop->flags & (LR_PROP_GETTER | LR_PROP_SETTER))
-                        return NULL;
-                    return &prop->value;
-                }
-                prop = prop->next;
-            }
+        LRProperty *prop = entry->prop_ptr;
+        /* Verify the property still belongs to this object and key matches */
+        if (prop && prop->key == atom) {
+            if (prop->flags & (LR_PROP_GETTER | LR_PROP_SETTER))
+                return NULL; /* accessor: must go through slow path */
+            return &prop->value;
         }
     }
     return NULL;
 }
 
-/* Update shape cache for a (object, property) pair */
-static void shape_cache_update(LRContext *ctx, LRObject *obj, LRString *atom, int offset)
+/* Update shape cache with the found (or newly created) property pointer */
+static void shape_cache_update(LRContext *ctx, LRObject *obj, LRString *atom,
+                                LRProperty *prop)
 {
     LRRuntime *rt = ctx->rt;
     unsigned int idx = ((uintptr_t)obj ^ (uintptr_t)atom) & (LR_SHAPE_CACHE_SIZE - 1);
     LRShapeCacheEntry *entry = &rt->shape_cache[idx];
     entry->obj = obj;
     entry->prop = atom;
-    entry->offset = offset;
+    entry->prop_ptr = prop;
     entry->valid = 1;
 }
 
 /* ── Property Access ──────────────────────────────────────────────────── */
 
-/* Get property from object's own properties (not prototype chain) */
+/* Hash bucket index for property lookup */
+static int prop_bucket_idx(LRString *key) {
+    return ((key->str[0] * 31 + key->len) & (OBJ_PROP_BUCKETS - 1));
+}
+static void prop_add_bucket(LRObject *obj, LRProperty *prop) {
+    int bi = prop_bucket_idx(prop->key);
+    prop->bnext = obj->prop_buckets[bi];
+    obj->prop_buckets[bi] = prop;
+}
+
+/* Get property from object's own properties (bucketed hash lookup) */
 static LRProperty *lr_object_find_own_prop(LRObject *obj, LRString *key)
 {
-    if (!obj->prop_hash) return NULL;
-    /* Simple linear search through hash chain */
-    LRProperty *prop = obj->prop_hash;
+    if (!key) return NULL;
+    int bi = prop_bucket_idx(key);
+    /* Check bucket chain first (O(1) amortized) */
+    LRProperty *prop = obj->prop_buckets[bi];
     while (prop) {
         if (prop->key == key || (prop->key && key &&
             prop->key->len == key->len &&
-            memcmp(prop->key->str, key->str, key->len) == 0)) {
+            memcmp(prop->key->str, key->str, key->len) == 0))
             return prop;
-        }
-        prop = prop->next;
+        prop = prop->bnext;
     }
     return NULL;
 }
@@ -1205,7 +1210,7 @@ int lr_set_accessor_property(LRContext *ctx, LRValue obj, LRString *atom,
                 } else {
                     lr_free_value(ctx, setter);
                 }
-                shape_cache_update(ctx, o, atom, 1);
+                shape_cache_update(ctx, o, atom, prop);
                 return 0;
             }
             lr_free_value(ctx, prop->value);
@@ -1214,7 +1219,7 @@ int lr_set_accessor_property(LRContext *ctx, LRValue obj, LRString *atom,
             prop->setter = setter;
             prop->flags = flags;
             lr_string_dup(atom);
-            shape_cache_update(ctx, o, atom, 1);
+            shape_cache_update(ctx, o, atom, prop);
             return 0;
         }
         prop = prop->next;
@@ -1227,7 +1232,8 @@ int lr_set_accessor_property(LRContext *ctx, LRValue obj, LRString *atom,
     new_prop->flags = flags;
     new_prop->next = o->prop_hash;
     o->prop_hash = new_prop;
-    shape_cache_update(ctx, o, atom, 1);
+    prop_add_bucket(o, new_prop);
+    shape_cache_update(ctx, o, atom, new_prop);
     ctx->rt->prop_count++;
     ctx->rt->prop_size += sizeof(LRProperty);
     return 0;
@@ -1360,8 +1366,7 @@ LRValue lr_get_property(LRContext *ctx, LRValue obj, LRString *atom)
     /* Check own properties */
     LRProperty *found = lr_object_find_own_prop(o, atom);
     if (found) {
-        /* Update shape cache */
-        shape_cache_update(ctx, o, atom, 1);
+        shape_cache_update(ctx, o, atom, found);
         return lr_property_get(ctx, obj, found);
     }
 
@@ -1523,8 +1528,7 @@ int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
             lr_free_value(ctx, prop->value);
             prop->value = val; /* Takes ownership of val */
             lr_string_dup(atom); /* Keep atom alive */
-            /* Update shape cache */
-            shape_cache_update(ctx, o, atom, 1);
+            shape_cache_update(ctx, o, atom, prop);
             return 0;
         }
         prop = prop->next;
@@ -1557,9 +1561,8 @@ int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
     new_prop->flags = LR_PROP_NORMAL | LR_PROP_ENUMERABLE | LR_PROP_WRITABLE | LR_PROP_CONFIGURABLE;
     new_prop->next = o->prop_hash;
     o->prop_hash = new_prop;
-
-    /* Update shape cache */
-    shape_cache_update(ctx, o, atom, 1);
+    prop_add_bucket(o, new_prop);
+    shape_cache_update(ctx, o, atom, new_prop);
 
     ctx->rt->prop_count++;
     ctx->rt->prop_size += sizeof(LRProperty);
@@ -1615,6 +1618,7 @@ int lr_set_property_direct(LRContext *ctx, LRValue obj, LRString *atom, LRValue 
     new_prop->flags = LR_PROP_NORMAL | LR_PROP_ENUMERABLE | LR_PROP_WRITABLE | LR_PROP_CONFIGURABLE;
     new_prop->next = o->prop_hash;
     o->prop_hash = new_prop;
+    prop_add_bucket(o, new_prop);
 
     ctx->rt->prop_count++;
     ctx->rt->prop_size += sizeof(LRProperty);
@@ -2714,6 +2718,9 @@ typedef struct LREvalUnit {
     LRValue  ns;          /* module namespace object when is_module (owns a ref) */
     LRContext *ctx;
     struct LREvalUnit *next;
+    BCProgram  *bc_prog;    /* compiled bytecode (nullable; IOME586 warm-path) */
+    uint8_t    *bc_ser;     /* serialized bytecode for IOME586 */
+    size_t      bc_ser_len;
 } LREvalUnit;
 
 /* Persistent per-context interpreter state. Created on first eval and
@@ -2735,6 +2742,8 @@ static void lr_eval_unit_free(LREvalUnit *unit)
     }
     free(unit->src);
     if (unit->ns.tag == LR_TYPE_OBJECT) lr_free_value(unit->ctx, unit->ns);
+    if (unit->bc_prog) bc_free_program(unit->bc_prog);
+    free(unit->bc_ser);
     free(unit);
 }
 
@@ -2829,7 +2838,28 @@ static LRValue lr_engine_exec_unit(LRContext *ctx, LREvalUnit *unit,
         interp->module_ns = (LRObject *)unit->ns.u.ptr;
     }
 
-    LRValue result = interp_eval(interp, unit->ast);
+    /* Compile AST → bytecode for IOME586 / fast re-execution. */
+    if (!unit->bc_prog) {
+        unit->bc_prog = bc_new_program();
+        if (unit->bc_prog) {
+            if (bc_compile(unit->bc_prog, unit->ast, is_module) != 0) {
+                /* Not VM-usable → drop it and stay on the tree-walker. */
+                bc_free_program(unit->bc_prog);
+                unit->bc_prog = NULL;
+            } else {
+                /* Serialize for IOME586 archive (may be non-restorable). */
+                unit->bc_ser = bc_serialize(unit->bc_prog, &unit->bc_ser_len);
+            }
+        }
+    }
+
+    /* Execute: bytecode VM if compiled; tree-walker as fallback. */
+    LRValue result;
+    if (unit->bc_prog && unit->bc_prog->compiled) {
+        result = bc_execute(unit->bc_prog, ctx);
+    } else {
+        result = interp_eval(interp, unit->ast);
+    }
 
     interp->current_scope = saved_scope;
     interp->is_module = saved_is_module;
@@ -2851,6 +2881,30 @@ static LRValue lr_engine_exec_unit(LRContext *ctx, LREvalUnit *unit,
     /* Retain the unit so JS functions/closures keep referencing a live AST. */
     unit->next = ps->units;
     ps->units = unit;
+
+    /* Surface an uncaught error/throw to the caller. Without this the
+     * interpreter's error_flag stays internal, lr_exec_file_cached sees a
+     * plain value and returns 0, and the CLI exits silently with status 0
+     * even though the script threw. */
+    if (interp->error_flag || interp->exception_pending) {
+        lr_free_value(ctx, result);
+
+        if (interp->exception_pending) {
+            /* A JS `throw` — hand the thrown value over as the exception. */
+            ctx->current_exception = interp->exception_value;
+            interp->exception_value = LR_VALUE_UNDEFINED;
+        } else if (!ctx->error_message) {
+            /* Engine-raised error — carry its message across. */
+            ctx->error_message = strdup(interp->error_message[0]
+                                        ? interp->error_message
+                                        : "uncaught error");
+        }
+
+        interp->error_flag = 0;
+        interp->exception_pending = 0;
+        interp->error_message[0] = '\0';
+        return LR_VALUE_EXCEPTION;
+    }
 
     return result;
 }
@@ -2892,6 +2946,24 @@ LRValue lr_engine_exec_unit_handle(LRContext *ctx, void *unit_handle,
 const ASTNode *lr_engine_unit_ast_handle(void *unit_handle)
 {
     return unit_handle ? ((LREvalUnit *)unit_handle)->ast : NULL;
+}
+
+const uint8_t *lr_engine_unit_bc_data(void *unit_handle, size_t *out_len)
+{
+    if (!unit_handle) { if (out_len) *out_len = 0; return NULL; }
+    LREvalUnit *u = (LREvalUnit *)unit_handle;
+    if (out_len) *out_len = u->bc_ser_len;
+    return u->bc_ser;
+}
+
+int lr_engine_unit_load_bytecode(void *unit_handle,
+                                  const uint8_t *data, size_t len)
+{
+    if (!unit_handle || !data || !len) return -1;
+    LREvalUnit *u = (LREvalUnit *)unit_handle;
+    if (u->bc_prog) bc_free_program(u->bc_prog);
+    u->bc_prog = bc_deserialize(data, len);
+    return u->bc_prog ? 0 : -1;
 }
 
 int lr_engine_program_count(const ASTNode *program)
@@ -3861,10 +3933,22 @@ LRString *lr_new_atom(LRContext *ctx, const char *str)
 
 LRString *lr_new_atom_len(LRContext *ctx, const char *str, size_t len)
 {
-    /* Check if atom already exists */
+    /* FNV-1a 32-bit hash */
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++)
+        h = (h ^ (uint8_t)str[i]) * 16777619u;
+    int bi = (int)(h & (ATOM_HASH_SIZE - 1));
+
+    /* Check hash cache first (O(1)) */
+    LRString *cached = ctx->atom_hash[bi];
+    if (cached && cached->len == len && memcmp(cached->str, str, len) == 0)
+        return lr_string_dup(cached);
+
+    /* Fallback: linear search in atom table */
     for (uint32_t i = 0; i < ctx->atom_count; i++) {
         if (ctx->atom_table[i]->len == len &&
             memcmp(ctx->atom_table[i]->str, str, len) == 0) {
+            ctx->atom_hash[bi] = ctx->atom_table[i]; /* update cache */
             return lr_string_dup(ctx->atom_table[i]);
         }
     }
@@ -3874,13 +3958,14 @@ LRString *lr_new_atom_len(LRContext *ctx, const char *str, size_t len)
     if (!atom) return NULL;
     atom->is_atom = 1;
 
-    /* Add to atom table */
+    /* Add to atom table + hash cache */
     if (ctx->atom_count >= ctx->atom_capacity) {
         ctx->atom_capacity *= 2;
         ctx->atom_table = (LRString **)realloc(ctx->atom_table,
             ctx->atom_capacity * sizeof(LRString *));
     }
     ctx->atom_table[ctx->atom_count++] = atom;
+    ctx->atom_hash[bi] = atom;  /* cache for next lookup */
     ctx->rt->atom_count++;
     ctx->rt->atom_size += (int64_t)(sizeof(LRString) + len + 1);
 

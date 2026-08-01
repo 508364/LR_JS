@@ -326,7 +326,7 @@ LR_API void lr_terminal_result_free(LR_TerminalResult *result);
 
 #define LR_JS_VERSION_MAJOR 0
 #define LR_JS_VERSION_MINOR 1
-#define LR_JS_VERSION_PATCH 0
+#define LR_JS_VERSION_PATCH 1
 
 /* Single source of truth: LR_JS_VERSION_STRING is derived from the three
  * numbers above, so the version only needs to be bumped in one place.

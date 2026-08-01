@@ -13,6 +13,7 @@
 #include <math.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <time.h>
 
 /* ── Constants ─────────────────────────────────────────────────────────── */
 
@@ -448,11 +449,21 @@ static LRValue eval_identifier(Interpreter *interp, ASTNode *node)
         return val;
     }
 
-    /* Check global object */
+    /* Global object cache: hash the name to check if we've recently
+     * accessed this global property. Cache hit returns O(1). */
+    int gi = ((name[0] * 31 + strlen(name)) & (GLOBAL_CACHE_SIZE - 1));
+    if (interp->global_cache[gi].name == name) {
+        return lr_dup_value(interp->ctx, interp->global_cache[gi].val);
+    }
+
+    /* Check global object (slow) */
     LRValue global = lr_get_global_object(interp->ctx);
     val = lr_get_property_str(interp->ctx, global, name);
     lr_free_value(interp->ctx, global);
     if (!lr_is_undefined(val)) {
+        /* Cache the result for next time */
+        interp->global_cache[gi].name = name;
+        interp->global_cache[gi].val = val;
         return val;
     }
     lr_free_value(interp->ctx, val);
@@ -463,6 +474,14 @@ static LRValue eval_identifier(Interpreter *interp, ASTNode *node)
     interp->error_flag = 1;
     return LR_VALUE_UNDEFINED;
 }
+
+/* Fast free: only call lr_free_value for heap-allocated types (string/object).
+ * int32/float64/bool/undefined/null are value types with no heap resource,
+ * so skipping the function call saves measurable overhead in tight loops. */
+#define FREE_IF_HEAP(ctx, v) do { \
+    if ((v).tag == LR_TYPE_STRING || (v).tag == LR_TYPE_OBJECT || \
+        (v).tag == LR_TYPE_SYMBOL) lr_free_value(ctx, v); \
+} while(0)
 
 static LRValue eval_binary(Interpreter *interp, ASTNode *node)
 {
@@ -2716,6 +2735,16 @@ static LRValue gen_self_cfunc(LRContext *ctx, LRValue this_val,
     return lr_dup_value(ctx, this_val);
 }
 
+/* Free GenLazyData, releasing the scope reference. */
+static void gen_lazy_data_free(void *ptr) {
+    struct GenLazyData { ASTNode *body; InterpScope *scope; int pc; int done; };
+    struct GenLazyData *gd = (struct GenLazyData *)ptr;
+    if (gd) {
+        if (gd->scope) scope_release(gd->scope, NULL);
+        free(gd);
+    }
+}
+
 /* Build the generator object. For lazy generators, stores the body AST
  * and creation scope so gen_next can drive incremental execution. */
 static LRValue gen_build_object(Interpreter *interp, ASTNode *body, InterpScope *scope)
@@ -2738,8 +2767,10 @@ static LRValue gen_build_object(Interpreter *interp, ASTNode *body, InterpScope 
             gd->scope = scope;
             gd->pc = 0;
             gd->done = 0;
+            /* Keep the scope alive past interp_call_function's pop */
+            if (scope) scope->refcount++;
             o->opaque = gd;
-            o->opaque_free = free;
+            o->opaque_free = gen_lazy_data_free;
         }
     }
     lr_set_property_str(ctx, gen, GEN_ITEMS_PROP, lr_new_array(ctx));
@@ -4397,6 +4428,26 @@ static LRValue interp_eval_stmt(Interpreter *interp, ASTNode *node)
 {
     if (!node) return LR_VALUE_UNDEFINED;
 
+    /* Execution timeout: check every 1024 statements if a limit is set.
+     * On timeout, set error_flag so the interpreter unwinds cleanly
+     * instead of being killed by the OS. */
+    if (interp->timeout_ms > 0) {
+        if (++interp->stmt_counter >= 1024) {
+            interp->stmt_counter = 0;
+            clock_t now = clock();
+            /* clock_t may be unsigned (macOS: unsigned long); compare in a
+             * common signed 64-bit domain to avoid -Wsign-compare and any
+             * implicit conversion surprise. */
+            long long elapsed = (long long)((now * 1000) / CLOCKS_PER_SEC);
+            if (elapsed >= (long long)interp->timeout_ms) {
+                snprintf(interp->error_message, sizeof(interp->error_message),
+                    "Execution timeout exceeded (%d ms)", interp->timeout_ms);
+                interp->error_flag = 1;
+                return LR_VALUE_UNDEFINED;
+            }
+        }
+    }
+
     switch (node->type) {
     case AST_BLOCK:       return eval_block(interp, node);
     case AST_IF:          return eval_if(interp, node);
@@ -4722,6 +4773,7 @@ void interp_init(Interpreter *interp, LRContext *ctx, int is_module)
     interp->is_module = is_module;
     interp->filename = NULL;
     interp->import_meta = LR_VALUE_UNDEFINED;
+    interp->timeout_ms = ctx->timeout_ms;
 
     /* Set up the callback so C builtins can call JS functions */
     if (!ctx->call_js_function) {
@@ -4780,4 +4832,149 @@ void interp_free(Interpreter *interp)
         interp->ctx->opaque_interp = NULL;
         interp->ctx->call_js_function = NULL;
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   BYTECODE VM BRIDGE
+
+   The stack-based bytecode VM in lr_bytecode.c shares this interpreter's
+   scope chain, error/exception state and closure machinery. Everything the
+   VM cannot (or must not) reimplement is routed through these functions so
+   there is exactly one implementation of each JavaScript semantic rule.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+LRValue interp_bc_eval_node(Interpreter *interp, ASTNode *node)
+{
+    if (!interp || !node) return LR_VALUE_UNDEFINED;
+    return interp_eval_node(interp, node);
+}
+
+int interp_bc_load_var(Interpreter *interp, const char *name, LRValue *out)
+{
+    LRValue val;
+    *out = LR_VALUE_UNDEFINED;
+    if (!interp || !name) return 0;
+
+    if (scope_lookup_internal(interp->current_scope, interp->ctx, name, &val)) {
+        *out = val;
+        return 1;
+    }
+
+    LRValue global = lr_get_global_object(interp->ctx);
+    val = lr_get_property_str(interp->ctx, global, name);
+    lr_free_value(interp->ctx, global);
+    if (!lr_is_undefined(val)) {
+        *out = val;
+        return 1;
+    }
+    lr_free_value(interp->ctx, val);
+
+    snprintf(interp->error_message, sizeof(interp->error_message),
+             "'%s' is not defined", name);
+    interp->error_flag = 1;
+    return 0;
+}
+
+int interp_bc_typeof_var(Interpreter *interp, const char *name, LRValue *out)
+{
+    LRValue val;
+    *out = LR_VALUE_UNDEFINED;
+    if (!interp || !name) return 0;
+
+    if (scope_lookup_internal(interp->current_scope, interp->ctx, name, &val)) {
+        *out = val;
+        return 1;
+    }
+    LRValue global = lr_get_global_object(interp->ctx);
+    val = lr_get_property_str(interp->ctx, global, name);
+    lr_free_value(interp->ctx, global);
+    if (!lr_is_undefined(val)) {
+        *out = val;
+        return 1;
+    }
+    lr_free_value(interp->ctx, val);
+    return 0;   /* unresolvable: typeof yields "undefined", no throw */
+}
+
+void interp_bc_store_var(Interpreter *interp, const char *name, LRValue val)
+{
+    if (!interp || !name) return;
+    if (!scope_set_name(interp, name, val)) {
+        /* Assignment to a constant sets error_flag; the tree-walker clears
+         * it and falls back to creating the binding — mirror that here. */
+        interp->error_flag = 0;
+        scope_declare_name(interp, name, val, 0);
+    }
+}
+
+void interp_bc_declare_var(Interpreter *interp, const char *name,
+                           LRValue val, int kind)
+{
+    if (!interp || !name) return;
+    scope_declare_name(interp, name, val, kind);
+}
+
+LRValue interp_bc_call(Interpreter *interp, LRValue callee, LRValue this_val,
+                       int argc, LRValue *argv)
+{
+    if (!interp) return LR_VALUE_UNDEFINED;
+    if (!lr_is_function(interp->ctx, callee)) {
+        snprintf(interp->error_message, sizeof(interp->error_message),
+                 "value is not a function");
+        interp->error_flag = 1;
+        return LR_VALUE_UNDEFINED;
+    }
+    return call_value_with_args(interp, NULL, callee, this_val, argc, argv);
+}
+
+LRValue interp_bc_construct(Interpreter *interp, LRValue callee,
+                            int argc, LRValue *argv)
+{
+    if (!interp) return LR_VALUE_UNDEFINED;
+    const char *ctor_name = "";
+    if (callee.tag == LR_TYPE_OBJECT) {
+        LRObject *obj = (LRObject *)callee.u.ptr;
+        if (obj->type == LR_OBJ_CFUNCTION) {
+            LRCFunction *cf = (LRCFunction *)obj->extra;
+            if (cf && cf->name) ctor_name = cf->name;
+        }
+    }
+    lr_push_call_frame(interp->ctx, ctor_name, NULL, 0);
+    LRValue result = lr_call_constructor(interp->ctx, callee, argc, argv);
+    lr_pop_call_frame(interp->ctx);
+    if (lr_is_exception(result)) {
+        interp->exception_pending = 1;
+        interp->exception_value = lr_dup_value(interp->ctx, result);
+        snprintf(interp->error_message, sizeof(interp->error_message),
+                 "%s", lr_get_exception_str(interp->ctx));
+        interp->error_flag = 1;
+    }
+    return result;
+}
+
+void interp_bc_throw(Interpreter *interp, LRValue value)
+{
+    if (!interp) return;
+    interp->exception_pending = 1;
+    interp->exception_value = lr_dup_value(interp->ctx, value);
+    const char *str = lr_to_cstring(interp->ctx, value);
+    snprintf(interp->error_message, sizeof(interp->error_message), "%s",
+             str ? str : "uncaught exception");
+    lr_free_cstring(interp->ctx, str);
+    interp->error_flag = 1;
+}
+
+void interp_bc_push_scope(Interpreter *interp)
+{
+    if (interp) interp_push_scope(interp, 0);
+}
+
+void interp_bc_pop_scope(Interpreter *interp)
+{
+    if (interp) interp_pop_scope(interp);
+}
+
+char *interp_bc_cook_template(const char *raw)
+{
+    return template_unescape(raw ? raw : "");
 }

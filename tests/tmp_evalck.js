@@ -1,0 +1,12 @@
+console.log('direct  ??      :', (null ?? 1) === 1 && (undefined ?? 2) === 2);
+console.log('eval    ??      :', eval('(null ?? 1) === 1 && (undefined ?? 2) === 2'));
+console.log('direct  1_000_000:', 1_000_000);
+console.log('eval    1_000_000:', eval('1_000_000'));
+let a; a ??= 1;
+console.log('direct  a ??= 1 :', a);
+console.log('eval    a ??= 1 :', eval('let z; z ??= 1; z'));
+console.log('eval    1+2     :', eval('1+2'));
+console.log('eval    "x"     :', eval('"x"'));
+console.log('eval    let b=2;b:', eval('let b = 2; b'));
+console.log('typeof Symbol.iterator :', typeof Symbol.iterator);
+console.log('Symbol("t").description:', Symbol('t').description);

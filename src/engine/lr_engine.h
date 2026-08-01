@@ -107,7 +107,8 @@ struct LRProperty {
     LRValue      value;     /* value or getter function */
     LRValue      setter;    /* setter function (for accessors) */
     int32_t      flags;
-    LRProperty  *next;      /* hash chain */
+    LRProperty  *next;      /* main prop_hash chain (enumeration) */
+    LRProperty  *bnext;     /* bucket chain (fast lookup) */
 };
 
 /* ── Shape (hidden class) ─────────────────────────────────────────────── */
@@ -158,7 +159,9 @@ struct LRObject {
     uint8_t       is_exotic;      /* has special behavior */
     uint8_t       is_extensible;  /* can add new properties */
     uint8_t       finalized;      /* finalized by GC */
-    LRProperty   *prop_hash;      /* named property hash table */
+    LRProperty   *prop_hash;      /* named property linked list */
+    #define OBJ_PROP_BUCKETS 8
+    LRProperty   *prop_buckets[OBJ_PROP_BUCKETS]; /* hash-bucketed fast lookup */
     /* GC fields */
     int           gc_mark;        /* mark bit for mark-and-sweep GC */
     struct LRObject *gc_next;     /* linked list for object tracking */
@@ -351,6 +354,12 @@ struct LRContext {
     LRString       **atom_table;     /* interned string atoms */
     uint32_t         atom_count;
     uint32_t         atom_capacity;
+    /* Direct-mapped atom hash cache.  Each entry holds the most recent
+     * atom for that FNV-1a bucket. O(1) on hit, linear fallback on miss.
+     * Thread-safe: read-only after initialization; LRString never freed. */
+    #define ATOM_HASH_BITS 10
+    #define ATOM_HASH_SIZE (1 << ATOM_HASH_BITS)
+    LRString        *atom_hash[ATOM_HASH_SIZE];
     LRModuleNormalizeFunc module_normalize;
     LRModuleLoaderFunc    module_loader;
     void            *module_opaque;
@@ -368,6 +377,7 @@ struct LRContext {
     LRValue          number_proto;      /* Number.prototype */
     LRValue          function_proto;    /* Function.prototype */
     LRValue          bigint_proto;      /* BigInt.prototype */
+    int              timeout_ms;        /* execution timeout (copied from LR_Runtime config) */
     /* Callback for calling JS interpreter functions from C builtins */
     LRValue          (*call_js_function)(struct LRContext *ctx, LRValue func,
                                          LRValue this_val, int argc, LRValue *argv);
@@ -394,12 +404,12 @@ struct LRContext {
 #define LR_SHAPE_CACHE_SIZE 128
 #endif
 
-/* Shape cache entry */
+/* Shape cache entry — caches the EXACT property pointer for O(1) hit */
 typedef struct LRShapeCacheEntry {
-    int       valid;
-    void     *obj;     /* LRObject pointer */
-    LRString *prop;    /* property atom */
-    int       offset;  /* shape offset for property */
+    int         valid;
+    void       *obj;     /* LRObject pointer */
+    LRString   *prop;    /* property atom */
+    LRProperty *prop_ptr; /* cached property pointer (verified with key==atom) */
 } LRShapeCacheEntry;
 
 struct LRRuntime {
@@ -765,6 +775,13 @@ void    *lr_engine_parse_unit(LRContext *ctx, const char *input, size_t input_le
 LRValue  lr_engine_exec_unit_handle(LRContext *ctx, void *unit_handle,
                                     int is_module, const char *filename);
 const ASTNode *lr_engine_unit_ast_handle(void *unit_handle);
+
+/* Expose serialized bytecode + length for IOME586 archiving. */
+const uint8_t *lr_engine_unit_bc_data(void *unit_handle, size_t *out_len);
+
+/* Deserialize bytecode from IOME586 warm load into the eval unit. */
+int lr_engine_unit_load_bytecode(void *unit_handle,
+                                  const uint8_t *data, size_t len);
 
 /* Top-level program node inspection for IOME586 result snapshots.
  * (ASTNode internals stay private to the engine: lr_ast.h cannot be included

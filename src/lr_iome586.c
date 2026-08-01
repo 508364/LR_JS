@@ -241,7 +241,9 @@ int lr_iome586_capture_baseline(LR_Iome586Cache *c, LRContext *ctx)
     }
     uint32_t n = 0;
     for (uint32_t i = 0; i < len; i++) {
-        if (!tab[i].atom || !tab[i].atom->str) continue;
+        /* atom->str is a flexible array member, so its address is never NULL;
+         * only the atom pointer itself needs checking. */
+        if (!tab[i].atom) continue;
         c->baseline_names[n] = strdup(tab[i].atom->str);
         if (c->baseline_names[n]) n++;
     }
@@ -725,6 +727,10 @@ int lr_iome586_commit(LR_Iome586Cache *c, LR_Iome586Writer *w,
 
     entry_add_text(&payload, "state", state);
 
+    /* Bytecode: serialized BCProgram from the VM compiler */
+    if (w->bc_data && w->bc_len > 0)
+        entry_add(&payload, "bytecode", w->bc_data, w->bc_len);
+
     int rc = -1;
     pthread_mutex_lock(&c->mutex);
     if (!payload.error)
@@ -739,9 +745,17 @@ int lr_iome586_commit(LR_Iome586Cache *c, LR_Iome586Writer *w,
     pthread_mutex_unlock(&c->mutex);
 
     free(payload.data);
-    free(w->ast);
-    w->ast = NULL;
+    free(w->ast);  w->ast = NULL;
+    free(w->bc_data); w->bc_data = NULL; w->bc_len = 0;
     return rc == 0 ? 0 : -1;
+}
+
+void lr_iome586_set_bytecode(LR_Iome586Writer *w, const uint8_t *data, size_t len)
+{
+    if (!w || !data || !len) return;
+    free(w->bc_data);
+    w->bc_data = (uint8_t *)malloc(len);
+    if (w->bc_data) { memcpy(w->bc_data, data, len); w->bc_len = len; }
 }
 
 void lr_iome586_abort(LR_Iome586Cache *c, LR_Iome586Writer *w)
@@ -755,8 +769,8 @@ void lr_iome586_abort(LR_Iome586Cache *c, LR_Iome586Writer *w)
         c->revert_count++;
     }
     pthread_mutex_unlock(&c->mutex);
-    free(w->ast);
-    w->ast = NULL;
+    free(w->ast); w->ast = NULL;
+    free(w->bc_data); w->bc_data = NULL; w->bc_len = 0;
 }
 
 /* ── Load ──────────────────────────────────────────────────────────────── */
@@ -875,6 +889,9 @@ int lr_iome586_load(LR_Iome586Cache *c, const char *script_path,
             } else if (!strcmp(name, "globals")) {
                 mf->globals = malloc(dlen ? dlen : 1);
                 if (mf->globals) { memcpy(mf->globals, d, dlen); mf->globals_len = dlen; }
+            } else if (!strcmp(name, "bytecode")) {
+                mf->bytecode = malloc(dlen ? dlen : 1);
+                if (mf->bytecode) { memcpy(mf->bytecode, d, dlen); mf->bytecode_len = dlen; }
             }
         }
     }
@@ -914,6 +931,7 @@ void lr_iome586_manifest_free(LR_Iome586Manifest *mf)
     free(mf->desc);    free(mf->meta);   free(mf->path);
     free(mf->config);  free(mf->init);   free(mf->state);
     free(mf->ast);     free(mf->nodes);  free(mf->globals);
+    free(mf->bytecode);
     memset(mf, 0, sizeof(*mf));
 }
 

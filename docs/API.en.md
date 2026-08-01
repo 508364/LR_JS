@@ -405,7 +405,30 @@ Payload        variable                  (LZ4-compressed; no encryption, CRC32/S
 - **BOM baseline remap protection**: after builtins are registered, the runtime captures a baseline of pre-existing global property names and skips those engine/BOM names during restore, so cache recovery cannot pollute builtin APIs.
 
 
-**The payload contains named entries** (`u16 name_len|name|u32 data_len|data`), equivalent to multiple binary files inside the package: `meta` (meta info), `path` (interpreter path/method), `config` (configuration), `init` (init content and result), `ast` (serialized AST), `nodes` (per-node results), `globals` (global variable binding snapshot), `state` (state machine / run state).
+**The payload contains named entries** (`u16 name_len|name|u32 data_len|data`), equivalent to multiple binary files inside the package: `meta` (meta info), `path` (interpreter path/method), `config` (configuration), `init` (init content and result), `ast` (serialized AST), `nodes` (per-node results), `globals` (global variable binding snapshot), `state` (state machine / run state), `bytecode` (compiled bytecode, magic `LRBC`).
+
+#### 6.1.0 What is cached, and can it be restored directly? (v0.1.1)
+
+| Cached item | Location | Persisted | Directly restorable on a warm run |
+|-------------|----------|-----------|------------------------------------|
+| Script name | header/`meta` | ✅ | ✅ read directly |
+| Script hash (`source_hash`) | header | ✅ | ✅ read directly (hit validation) |
+| Status (writing / archived) | header `status` | ✅ | ✅ read directly; `writing` is treated as a dirty archive and discarded |
+| Time (`created_at` / source `mtime`) | header | ✅ | ✅ read directly |
+| Optimization ratio (`opt_ratio_x1e6`) | header | ✅ | ✅ read directly (15% rule) |
+| Version (container + engine FNV-1a32) | header | ✅ | ✅ read directly; mismatch invalidates the whole archive |
+| Checksum (`payload_crc32`) | header | ✅ | ✅ read and verified directly |
+| Script interpretation path | `path` | ✅ | ✅ restored directly |
+| Configuration | `config` | ✅ | ✅ restored directly |
+| Init content and result | `init` | ✅ | ✅ restored directly |
+| Per-node results | `nodes` | ✅ | ⚠️ restored as *records* (comparison/statistics), evaluation is not skipped |
+| AST | `ast` (`LRA` v3) | ✅ | ✅ restored directly, skipping lexing/parsing |
+| Bytecode | `bytecode` (`LRBC` v2) | ✅ | ⚠️ only when the program has **no AST node references**; otherwise deserialization returns `NULL` and it is recompiled from the AST (sub-millisecond) |
+| State-machine state | `state` | ✅ | ✅ restored directly |
+| Run state | `state` | ✅ | ⚠️ restored as metadata; execution still starts from the beginning (no resume) |
+| Global variable binding object | `globals` | ✅ (`snapshot_strings` on by default) | ❌ **not restored** by default (`restore_globals=0`); requires explicit `--iome586-restore-globals` |
+
+In short: **structural content (AST, bytecode, path, config, init, metadata, state-machine state) is directly restorable**, while **runtime semantic state (global bindings, execution progress) is not restored by default** and is recomputed by re-executing, to guarantee correct semantics (never observing stale/poisoned globals). A warm run therefore skips "file read + lexing + parsing + compilation", not "execution".
 
 #### 6.1.1 AST Serialization Format (magic `LRA`)
 
@@ -1318,7 +1341,7 @@ If you have no native macOS environment, you can cross-compile macOS `x86_64` / 
 LR_OSX_SDK=/path/to/MacOSX12.3.sdk ./build_macos.sh
 ```
 
-The artifact is `releases/LR_JS-0.1.0-macos-{x86_64,arm64}.tar.gz`, containing `lib/liblr_js.a`, `lib/liblr_js.dylib`, `bin/lr_js`, and `lr_js.h`.
+The artifact is `releases/LR_JS-0.1.1-macos-{x86_64,arm64}.tar.gz`, containing `lib/liblr_js.a`, `lib/liblr_js.dylib`, `bin/lr_js`, and `lr_js.h`.
 
 Implementation note: the script bypasses the `o64-clang`/`oa64-clang` launchers and calls the real architecture-targeted clang directly, extracting the precise `-target` triple (e.g. `x86_64-apple-darwin21.4`) from its file name to match the `x86_64-apple-darwin21.4-ld` linker; the SDK is auto-detected preferring the darwin version embedded in clang, falling back to the oldest available SDK.
 
@@ -1401,6 +1424,7 @@ make CC="$CC" clean && make CC="$CC"
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 0.1.1 | 2026-07 | **Full bytecode VM**: a stack VM (`lr_bytecode.c`) covering literals, identifiers, all unary/binary/compound-assignment/`**`/bitwise/comparison/`in`/`instanceof`/`typeof`/`delete` operators, `&&`/`\|\|`/`??` short-circuiting, conditional expressions, template literals (concatenated in C), array/object literals, member and computed member get/set, function/method/constructor calls, `for`/`while`/`do-while`/`for-of` (native iteration protocol)/`switch`/labelled `break`/`continue`/`return`/`throw`/block scopes. All JS arithmetic and data handling run in C (int32 fast path, string concat, abstract/strict equality, relational comparison). Closures, classes, generators, async/await, try/catch, destructuring, modules, `for-in`, and `super` are lowered via escape analysis to `BC_EVAL_NODE`, falling back to the same interpreter state so semantics stay identical with no double execution. Bytecode serialization `LRBC` v2 is embedded in the IOME586 archive (marked non-restorable when AST node references exist; the warm path recompiles from the AST). Verified across MSVC/MinGW/GCC/Clang on Windows/macOS/Linux and x86/x64/ARM. Docs add §6.1.0 on cache contents and restorability |
 | 0.1.0 | 2026-07 | Initial version: ES2022+ support, multithreaded sandbox, renderer bridge, system memory limit, generational/incremental GC, `.lrfile` bytecode cache and sandbox logging, IOME586 result cache (LZ4 archive, cache-while-running, 15% rule, BOM, rollback), AST serialization `LRA` v3 (explicit literal type tags); fixes the warm-run `true`→`false` bug. Added capabilities: top-level `var`/`function` bound to the global object in non-module Script mode (per `GlobalDeclarationInstantiation`; `let`/`const`/`class` are not mounted), `import.meta` inside modules, the `RegExp` `d` (match indices) flag, Windows console UTF-8 output; IOME586 security hardening (sensitive global-value exclusion, `snapshot_strings` on by default, self-keyed XOR removed, `restore_globals` off by default, BOM baseline remap protection), new CLI flags `--iome586-no-strings` / `--iome586-restore-globals` |
 
 ---

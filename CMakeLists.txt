@@ -14,7 +14,7 @@
 #   build/bin/  → lr_js.exe / lr_js
 
 cmake_minimum_required(VERSION 3.14)
-project(lr_js VERSION 0.1.0 LANGUAGES C)
+project(lr_js VERSION 0.1.1 LANGUAGES C)
 
 # ── C Standard ────────────────────────────────────────────────────────────
 
@@ -55,13 +55,30 @@ else()
     #                             and setter signatures to the 4-arg LRCFunctionFunc.
     #   -Wno-unused-variable /
     #   -Wno-unused-but-set-variable : a handful of leftover locals.
-    add_compile_options(-Wall -Wextra
-        -Wno-unused-parameter
-        -Wno-unused-function
-        -Wno-cast-function-type
-        -Wno-unused-variable
-        -Wno-unused-but-set-variable
-        -D_GNU_SOURCE)
+    #
+    # -Wno-cast-function-type and -Wno-unused-but-set-variable do not exist on
+    # older Clang / AppleClang, which then emits an -Wunknown-warning-option
+    # note for *every* translation unit. Probe each flag before using it.
+    # Note: we probe the *positive* form (-Wfoo) with -Werror, because Clang
+    # accepts an unknown -Wno-foo silently and only complains later, which would
+    # make the probe useless.
+    include(CheckCCompilerFlag)
+    add_compile_options(-Wall -Wextra -D_GNU_SOURCE)
+    set(_lr_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -Werror")
+    foreach(_lr_warn
+            unused-parameter
+            unused-function
+            cast-function-type
+            unused-variable
+            unused-but-set-variable)
+        string(MAKE_C_IDENTIFIER "LR_HAS_W_${_lr_warn}" _lr_flag_var)
+        check_c_compiler_flag("-W${_lr_warn}" ${_lr_flag_var})
+        if(${_lr_flag_var})
+            add_compile_options("-Wno-${_lr_warn}")
+        endif()
+    endforeach()
+    set(CMAKE_REQUIRED_FLAGS "${_lr_saved_required_flags}")
 endif()
 
 # ── Output directories ────────────────────────────────────────────────────
@@ -109,6 +126,7 @@ set(LR_RUNTIME_SRCS
     src/lr_canvas_webgl.c
     src/lr_scheduler.c
     src/lr_perf_opt.c
+    src/engine/lr_bytecode.c
     src/lr_worker.c
     src/lr_gc.c
     src/lr_iome586.c

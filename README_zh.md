@@ -100,8 +100,8 @@ LR_OSX_SDK=/path/to/MacOSX12.3.sdk ./build_macos.sh
 
 每种架构的产物（位于 `releases/` 下）：
 
-- `LR_JS-0.1.0-macos-x86_64.tar.gz`
-- `LR_JS-0.1.0-macos-arm64.tar.gz`
+- `LR_JS-0.1.1-macos-x86_64.tar.gz`
+- `LR_JS-0.1.1-macos-arm64.tar.gz`
 
 每个压缩包内含 `lib/liblr_js.a`、`lib/liblr_js.dylib`、`bin/lr_js` 以及 `lr_js.h`。
 

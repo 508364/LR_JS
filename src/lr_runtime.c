@@ -92,11 +92,33 @@ int lr_check_exception(LR_Runtime *rt)
     JSContext *ctx = rt->lr_ctx;
     JSValue exc = JS_GetException(ctx);
     if (!JS_IsException(exc)) {
-        /* User-thrown value (e.g. throw 42) - convert to string */
-        const char *str = JS_ToCString(ctx, exc);
-        if (str) {
-            lr_set_error(rt, "%s", str);
-            JS_FreeCString(ctx, str);
+        /* A thrown JS value. For Error objects, JS_ToCString would yield the
+         * useless "[object Object]", so read `name` / `message` first and fall
+         * back to the generic stringification for primitives (throw 42). */
+        int described = 0;
+        if (exc.tag == LR_TYPE_OBJECT) {
+            LRValue msg = lr_get_property_str(ctx, exc, "message");
+            if (msg.tag == LR_TYPE_STRING) {
+                LRValue nm = lr_get_property_str(ctx, exc, "name");
+                const char *nstr = (nm.tag == LR_TYPE_STRING)
+                                   ? lr_to_cstring(ctx, nm) : NULL;
+                const char *mstr = lr_to_cstring(ctx, msg);
+                if (mstr) {
+                    lr_set_error(rt, "%s: %s", nstr ? nstr : "Error", mstr);
+                    described = 1;
+                }
+                if (nstr) lr_free_cstring(ctx, nstr);
+                if (mstr) lr_free_cstring(ctx, mstr);
+                lr_free_value(ctx, nm);
+            }
+            lr_free_value(ctx, msg);
+        }
+        if (!described) {
+            const char *str = JS_ToCString(ctx, exc);
+            if (str) {
+                lr_set_error(rt, "%s", str);
+                JS_FreeCString(ctx, str);
+            }
         }
         JS_FreeValue(ctx, exc);
         ctx->current_exception = LR_VALUE_UNDEFINED;
@@ -488,6 +510,7 @@ LR_Runtime *lr_runtime_new(const LR_Config *cfg)
         free(rt);
         return NULL;
     }
+    rt->lr_ctx->timeout_ms = cfg->timeout_ms;
 
     /* Set context opaque so built-in APIs can find the runtime */
     JS_SetContextOpaque(rt->lr_ctx, rt);
@@ -685,19 +708,14 @@ static int lr_exec_file_cached(LR_Runtime *rt, const char *filename,
         ASTNode *ast = lr_ast_deserialize(mf.ast, mf.ast_len, &dparser);
         if (ast) {
             int warm_module = (mf.flags & LR_IOME586_FLAG_MODULE) ? 1 : 0;
-            /* static restore (OPT-IN, --iome586-restore-globals): rebind the
-             * archived global snapshot. Default off: the dynamic re-run below
-             * recomputes everything, and pre-seeding old values could be
-             * observed by typeof-probing scripts (stale-state side channel). */
             if (rt->iome586.restore_globals)
                 lr_iome586_restore_globals(&rt->iome586, ctx, &mf);
-            /* dynamic re-run: re-execute the deserialized AST */
+            /* Re-execute AST (with bytecode if cached). */
             LRValue result = lr_engine_eval_ast(ctx, ast, dparser,
                                                 warm_module, filename);
             if (lr_is_exception(result)) {
                 lr_check_exception(rt);
                 lr_free_value(ctx, result);
-                /* fall through and recompile from source */
             } else {
                 lr_free_value(ctx, result);
                 ret = 0;
@@ -752,8 +770,14 @@ static int lr_exec_file_cached(LR_Runtime *rt, const char *filename,
             return -1;
         }
         lr_free_value(ctx, result);
-        if (writing)
+        if (writing) {
+            /* Attach serialized bytecode for future warm runs */
+            size_t bc_len = 0;
+            const uint8_t *bc_data = lr_engine_unit_bc_data(unit, &bc_len);
+            if (bc_data && bc_len > 0)
+                lr_iome586_set_bytecode(&w, bc_data, bc_len);
             lr_iome586_commit(&rt->iome586, &w, ctx, prog, exec_us);
+        }
         ret = 0;
     }
 

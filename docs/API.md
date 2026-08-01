@@ -425,7 +425,33 @@ Payload        variable                  (LZ4 压缩；无加密，CRC32/SourceH
 **Payload 内为命名条目**（`u16 name_len|name|u32 data_len|data`），相当于压缩包内的
 多个二进制文件：`meta`（元信息）、`path`（解释路径/方法）、`config`（配置）、
 `init`（初始化内容与结果）、`ast`（序列化 AST）、`nodes`（每级节点结果）、
-`globals`（全局变量绑定快照）、`state`（状态机/运行状态）。
+`globals`（全局变量绑定快照）、`state`（状态机/运行状态）、`bytecode`（编译后的字节码，魔数 `LRBC`）。
+
+#### 6.1.0 缓存了哪些内容？能否直接恢复？（v0.1.1）
+
+| 缓存项 | 存放位置 | 是否持久化 | 暖跑能否直接恢复 |
+|--------|----------|-----------|------------------|
+| JS 脚本名称 | header/`meta` | ✅ | ✅ 直接读取 |
+| JS 脚本哈希（`source_hash`） | header | ✅ | ✅ 直接读取（用于命中校验） |
+| 状态（写入中 / 已归档） | header `status` | ✅ | ✅ 直接读取；`writing` 视为脏归档并丢弃 |
+| 时间（`created_at` / 源文件 `mtime`） | header | ✅ | ✅ 直接读取 |
+| 优化比值（`opt_ratio_x1e6`） | header | ✅ | ✅ 直接读取（15% 规则判定） |
+| 版本号（容器版本 + 引擎版本 FNV-1a32） | header | ✅ | ✅ 直接读取；不匹配即整包作废 |
+| 校验码（`payload_crc32`） | header | ✅ | ✅ 直接读取校验 |
+| JS 脚本的解释路径 | `path` | ✅ | ✅ 直接恢复 |
+| 配置 | `config` | ✅ | ✅ 直接恢复 |
+| 初始化内容与结果 | `init` | ✅ | ✅ 直接恢复 |
+| 每一级节点的结果 | `nodes` | ✅ | ⚠️ 恢复为**记录**（用于比对/统计），不直接跳过求值 |
+| AST | `ast`（`LRA` v3） | ✅ | ✅ 直接恢复，跳过词法/语法分析 |
+| 字节码 | `bytecode`（`LRBC` v2） | ✅ | ⚠️ 仅当程序**不含 AST 节点引用**时可直接恢复；否则反序列化返回 `NULL`，由 AST 重新编译（毫秒级） |
+| 状态机状态 | `state` | ✅ | ✅ 直接恢复 |
+| 运行状态 | `state` | ✅ | ⚠️ 恢复为元信息；执行仍从头开始，不做“断点续跑” |
+| 全局变量绑定对象 | `globals` | ✅（`snapshot_strings` 默认开） | ❌ 默认**不恢复**（`restore_globals=0`）；需显式 `--iome586-restore-globals` 才注入 |
+
+结论：**结构性内容（AST、字节码、路径、配置、初始化、元信息、状态机状态）可直接恢复**；
+**运行期语义状态（全局变量绑定、执行进度）默认不恢复**，而是重新执行以保证语义正确
+（避免观测到过期/被污染的全局值）。因此暖跑省掉的是「读文件 + 词法 + 语法 + 编译」，
+而非「执行」。
 
 #### 6.1.1 AST 序列化格式（魔数 `LRA`）
 
@@ -1350,7 +1376,7 @@ make clean && make -j$(sysctl -n hw.logicalcpu)
 LR_OSX_SDK=/path/to/MacOSX12.3.sdk ./build_macos.sh
 ```
 
-产物为 `releases/LR_JS-0.1.0-macos-{x86_64,arm64}.tar.gz`，内含 `lib/liblr_js.a`、`lib/liblr_js.dylib`、`bin/lr_js` 与 `lr_js.h`。
+产物为 `releases/LR_JS-0.1.1-macos-{x86_64,arm64}.tar.gz`，内含 `lib/liblr_js.a`、`lib/liblr_js.dylib`、`bin/lr_js` 与 `lr_js.h`。
 
 实现要点：脚本绕过 `o64-clang`/`oa64-clang` 启动器，直接调用真实的、带目标架构的 clang，并从其文件名提取精确 `-target` triple（如 `x86_64-apple-darwin21.4`），以匹配 `x86_64-apple-darwin21.4-ld` 链接器；SDK 自动检测优先匹配 clang 内嵌的 darwin 版本，否则回退到最旧的可用 SDK。
 
@@ -1433,6 +1459,7 @@ make CC="$CC" clean && make CC="$CC"
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| 0.1.1 | 2026-07 | **全量字节码 VM**：栈式 VM（`lr_bytecode.c`）覆盖字面量、标识符、全部一元/二元/复合赋值/`**`/位运算/比较/`in`/`instanceof`/`typeof`/`delete`、`&&`/`\|\|`/`??` 短路、条件表达式、模板字符串（C 层拼接）、数组/对象字面量、成员与计算成员读写、函数/方法/构造调用、`for`/`while`/`do-while`/`for-of`（原生迭代协议）/`switch`/带标签 `break`/`continue`/`return`/`throw`/块级作用域。JS 运算与数据解析全部在 C 层完成（int32 快路径、字符串拼接、抽象/严格相等、关系比较）。闭包、类、生成器、async/await、try/catch、解构、模块、`for-in`、`super` 等语义经逃逸分析后以 `BC_EVAL_NODE` 回落到同一解释器状态，保证语义一致且无双重执行。字节码序列化 `LRBC` v2 并入 IOME586 归档（含 AST 节点引用时标记为不可直接恢复，暖跑由 AST 重新编译）。跨平台验证：MSVC/MinGW/GCC/Clang，Windows/macOS/Linux，x86/x64/ARM。文档新增 §6.1.0 缓存内容与可恢复性说明 |
 | 0.1.0 | 2026-07 | 初始版本：ES2022+ 支持、多线程沙箱、渲染器桥接、系统内存限制、分代/增量 GC、`.lrfile` 字节码缓存与沙箱日志、IOME586 结果缓存（LZ4 归档、边运行边缓存、15% 规则、BOM、撤回）、AST 序列化 `LRA` v3（字面量显式类型标记），修复暖跑中 `true`→`false` 的 bug；追加能力：顶层 `var`/`function` 在非模块 Script 下绑定到全局对象（符合 `GlobalDeclarationInstantiation`，`let`/`const`/`class` 不挂载），模块内 `import.meta`，`RegExp` 的 `d`（match indices）标志，Windows 控制台 UTF-8 输出；IOME586 安全加固（敏感全局值排除、`snapshot_strings` 默认开启、去除自密钥 XOR、`restore_globals` 默认关闭、BOM 基线重映射保护），新增 CLI `--iome586-no-strings` / `--iome586-restore-globals` |
 
 ---
