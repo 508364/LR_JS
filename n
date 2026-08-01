@@ -1,0 +1,2 @@
+[LR_JS] Parse error: unexpected token 'error' in statement
+Error: SyntaxError: unexpected token 'error' in statement

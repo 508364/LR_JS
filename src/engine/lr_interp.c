@@ -2687,7 +2687,11 @@ static LRValue gen_next_cfunc(LRContext *ctx, LRValue this_val,
     }
 
     /* First call: run the entire body eagerly (one statement at a time),
-     * collecting all yields into gen_items. Subsequent calls drain. */
+     * collecting all yields into gen_items. Subsequent calls drain.
+     *
+     * Store gen_items on the generator object BEFORE body evaluation so
+     * the GC can see it as reachable (avoids premature collection during
+     * body execution when many objects exist in the heap). */
     if (gd->pc == 0 && !gd->done) {
         InterpScope *saved_scope = interp->current_scope;
         if (gd->scope) interp->current_scope = gd->scope;
@@ -2699,6 +2703,9 @@ static LRValue gen_next_cfunc(LRContext *ctx, LRValue this_val,
         interp->gen_active = 1;
         interp->gen_items = lr_new_array(ctx);
         interp->gen_count = 0;
+        /* Store on generator object IMMEDIATELY so GC roots can see it */
+        lr_set_property_str(ctx, this_val, GEN_ITEMS_PROP,
+                           lr_dup_value(ctx, interp->gen_items));
 
         int nstmts = gd->body->u.list.count;
         ASTNode **stmts = gd->body->u.list.items;
@@ -2720,10 +2727,9 @@ static LRValue gen_next_cfunc(LRContext *ctx, LRValue this_val,
         if (interp->error_flag)
             interp->error_flag = 0;
 
-        /* Store the collected yields on the generator object */
-        LRValue old_items = lr_get_property_str(ctx, this_val, GEN_ITEMS_PROP);
-        lr_free_value(ctx, old_items);
-        lr_set_property_str(ctx, this_val, GEN_ITEMS_PROP, interp->gen_items);
+        /* gen_items was already pinned on the generator before body eval
+         * via lr_dup_value. The body mutated the same array (refcount shared).
+         * Just update the length and index. */
         lr_set_property_str(ctx, interp->gen_items, "length",
             lr_new_int32(ctx, interp->gen_count));
         lr_set_property_str(ctx, this_val, GEN_INDEX_PROP, lr_new_int32(ctx, 0));
@@ -2785,27 +2791,9 @@ static void gen_lazy_data_free(void *ptr) {
     struct GenLazyData { ASTNode *body; InterpScope *scope; int pc; int done; LRContext *ctx; };
     struct GenLazyData *gd = (struct GenLazyData *)ptr;
     if (gd) {
-        if (gd->scope) {
-            /* Balance the parent reference that scope_new created.
-             * Without this, the parent scope leaks one refcount per
-             * generator, preventing proper cleanup. */
-            if (gd->scope->parent)
-                gd->scope->parent->refcount--;
-            /* Free scope contents with the saved (valid) ctx.
-             * This is the ONLY cleanup needed—scope_release's
-             * parent-chain cascade is intentionally skipped to avoid
-             * conflicts with the interpreter's scope management. */
-            for (int i = 0; i < gd->scope->count; i++) {
-                if (gd->scope->names[i])
-                    free(gd->scope->names[i]);
-                lr_free_value(gd->ctx, gd->scope->values[i]);
-            }
-            free(gd->scope->names);
-            free(gd->scope->values);
-            free(gd->scope->is_const);
-            free(gd->scope->is_lexical);
-            free(gd->scope);
-        }
+        /* DEBUG: just free gd, don't touch the scope at all.
+         * If this eliminates the heap corruption, the issue is in
+         * scope value cleanup. If it doesn't, the issue is elsewhere. */
         free(gd);
     }
 }
