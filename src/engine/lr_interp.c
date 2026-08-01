@@ -43,6 +43,25 @@ static LRValue eval_spread(Interpreter *interp, ASTNode *node);
 static LRValue eval_await(Interpreter *interp, ASTNode *node);
 static LRValue eval_class_expr(Interpreter *interp, ASTNode *node);
 static LRValue eval_pattern(Interpreter *interp, ASTNode *node, LRValue value);
+static LRValue eval_program(Interpreter *interp, ASTNode *node);
+
+/* Functions used by init_eval_handlers dispatch table */
+static LRValue eval_this_expr(Interpreter *interp, ASTNode *node);
+static LRValue eval_super_expr(Interpreter *interp, ASTNode *node);
+static LRValue eval_tagged_template(Interpreter *interp, ASTNode *node);
+static LRValue eval_yield_expr(Interpreter *interp, ASTNode *node);
+static LRValue eval_pattern_expr(Interpreter *interp, ASTNode *node);
+static LRValue eval_rest_expr(Interpreter *interp, ASTNode *node);
+static LRValue eval_default_val(Interpreter *interp, ASTNode *node);
+static LRValue eval_property(Interpreter *interp, ASTNode *node);
+
+/* Functions needed by interp_eval_stmt's default guard */
+typedef LRValue (*EvalHandler)(Interpreter *interp, ASTNode *node);
+static LRValue eval_statement_dispatch(Interpreter *interp, ASTNode *node);
+static EvalHandler eval_handlers[4096];
+
+static void    interp_raise_reference_error(Interpreter *interp, const char *name);
+static LRValue eval_var_declarator(Interpreter *interp, ASTNode *declarator, int kind);
 
 static LRValue interp_eval_stmt(Interpreter *interp, ASTNode *node);
 static LRValue eval_block(Interpreter *interp, ASTNode *node);
@@ -469,9 +488,7 @@ static LRValue eval_identifier(Interpreter *interp, ASTNode *node)
     lr_free_value(interp->ctx, val);
 
     /* ReferenceError for undeclared identifiers */
-    snprintf(interp->error_message, sizeof(interp->error_message),
-             "'%s' is not defined", name);
-    interp->error_flag = 1;
+    interp_raise_reference_error(interp, name);
     return LR_VALUE_UNDEFINED;
 }
 
@@ -482,6 +499,33 @@ static LRValue eval_identifier(Interpreter *interp, ASTNode *node)
     if ((v).tag == LR_TYPE_STRING || (v).tag == LR_TYPE_OBJECT || \
         (v).tag == LR_TYPE_SYMBOL) lr_free_value(ctx, v); \
 } while(0)
+
+/* Raise a ReferenceError by calling lr_throw_reference_error and adopting
+ * the returned Error object as the interpreter's exception value. */
+static void interp_raise_reference_error(Interpreter *interp, const char *name)
+{
+    LRValue err = lr_throw_reference_error(interp->ctx, "%s is not defined", name);
+    if (interp->error_flag) {
+        /* lr_throw_* sets error_flag + exception_value via the preamble */
+        interp->error_flag = 1;
+        /* Copy the real thrown value if the engine gave us one */
+        if (interp->ctx->current_exception.tag != LR_TYPE_UNDEFINED) {
+            lr_free_value(interp->ctx, interp->exception_value);
+            interp->exception_value = lr_dup_value(interp->ctx, interp->ctx->current_exception);
+            interp->exception_pending = 1;
+        } else if (err.tag != LR_TYPE_EXCEPTION && err.tag != LR_TYPE_UNDEFINED) {
+            interp->exception_value = err;
+            interp->exception_pending = 1;
+            return;
+        }
+    } else {
+        snprintf(interp->error_message, sizeof(interp->error_message),
+                 "'%s' is not defined", name);
+        interp->error_flag = 1;
+    }
+    if (err.tag != LR_TYPE_EXCEPTION && err.tag != LR_TYPE_UNDEFINED)
+        lr_free_value(interp->ctx, err);
+}
 
 static LRValue eval_binary(Interpreter *interp, ASTNode *node)
 {
@@ -2627,7 +2671,7 @@ static LRValue gen_next_cfunc(LRContext *ctx, LRValue this_val,
     if (done) return gen_make_result(ctx, LR_VALUE_UNDEFINED, 1);
 
     /* Get the GenLazyData stored in the generator object's opaque */
-    struct GenLazyData { ASTNode *body; InterpScope *scope; int pc; int done; };
+    struct GenLazyData { ASTNode *body; InterpScope *scope; int pc; int done; LRContext *ctx; };
     struct GenLazyData *gd = NULL;
     if (this_val.tag == LR_TYPE_OBJECT)
         gd = (struct GenLazyData *)((LRObject *)this_val.u.ptr)->opaque;
@@ -2735,12 +2779,33 @@ static LRValue gen_self_cfunc(LRContext *ctx, LRValue this_val,
     return lr_dup_value(ctx, this_val);
 }
 
-/* Free GenLazyData, releasing the scope reference. */
+/* Free GenLazyData, releasing the scope reference.
+ * Uses the saved ctx to ensure scope_release properly tracks the runtime. */
 static void gen_lazy_data_free(void *ptr) {
-    struct GenLazyData { ASTNode *body; InterpScope *scope; int pc; int done; };
+    struct GenLazyData { ASTNode *body; InterpScope *scope; int pc; int done; LRContext *ctx; };
     struct GenLazyData *gd = (struct GenLazyData *)ptr;
     if (gd) {
-        if (gd->scope) scope_release(gd->scope, NULL);
+        if (gd->scope) {
+            /* Balance the parent reference that scope_new created.
+             * Without this, the parent scope leaks one refcount per
+             * generator, preventing proper cleanup. */
+            if (gd->scope->parent)
+                gd->scope->parent->refcount--;
+            /* Free scope contents with the saved (valid) ctx.
+             * This is the ONLY cleanup needed—scope_release's
+             * parent-chain cascade is intentionally skipped to avoid
+             * conflicts with the interpreter's scope management. */
+            for (int i = 0; i < gd->scope->count; i++) {
+                if (gd->scope->names[i])
+                    free(gd->scope->names[i]);
+                lr_free_value(gd->ctx, gd->scope->values[i]);
+            }
+            free(gd->scope->names);
+            free(gd->scope->values);
+            free(gd->scope->is_const);
+            free(gd->scope->is_lexical);
+            free(gd->scope);
+        }
         free(gd);
     }
 }
@@ -2761,12 +2826,14 @@ static LRValue gen_build_object(Interpreter *interp, ASTNode *body, InterpScope 
             InterpScope *scope;
             int pc;
             int done;
+            LRContext *ctx;      /* needed by scope_release at cleanup */
         } *gd = (struct GenLazyData *)calloc(1, sizeof(struct GenLazyData));
         if (gd) {
             gd->body = body;     /* AST_BLOCK of function body */
             gd->scope = scope;
             gd->pc = 0;
             gd->done = 0;
+            gd->ctx = ctx;       /* save context for cleanup */
             /* Keep the scope alive past interp_call_function's pop */
             if (scope) scope->refcount++;
             o->opaque = gd;
@@ -3999,6 +4066,38 @@ finally_check:
     return result;
 }
 
+/* Evaluate a single variable declarator (used by both eval_var_decl and
+ * the AST_VAR_DECLARATOR case in interp_eval_stmt for the bytecode path). */
+static LRValue eval_var_declarator(Interpreter *interp, ASTNode *declarator,
+                                   int kind)
+{
+    if (!declarator || declarator->type != AST_VAR_DECLARATOR)
+        return LR_VALUE_UNDEFINED;
+
+    ASTNode *var_node = declarator->u.declarator.var;
+    ASTNode *init_node = declarator->u.declarator.init;
+
+    if (var_node->type == AST_IDENTIFIER) {
+        const char *name = var_node->u.ident.name;
+        if (init_node) {
+            LRValue val = interp_eval_node(interp, init_node);
+            if (interp->error_flag) return val;
+            scope_declare_name(interp, name, val, kind);
+            lr_free_value(interp->ctx, val);
+        } else {
+            scope_declare_name(interp, name, LR_VALUE_UNDEFINED, kind);
+        }
+    } else if (var_node->type == AST_PATTERN) {
+        if (init_node) {
+            LRValue val = interp_eval_node(interp, init_node);
+            if (interp->error_flag) return val;
+            eval_pattern(interp, var_node, val);
+            lr_free_value(interp->ctx, val);
+        }
+    }
+    return LR_VALUE_UNDEFINED;
+}
+
 static LRValue eval_var_decl(Interpreter *interp, ASTNode *node)
 {
     /* Determine declaration kind from token type */
@@ -4013,31 +4112,8 @@ static LRValue eval_var_decl(Interpreter *interp, ASTNode *node)
     ASTNode **vars = node->u.var_decl.vars;
 
     for (int i = 0; i < nvars; i++) {
-        ASTNode *declarator = vars[i];
-        if (declarator->type == AST_VAR_DECLARATOR) {
-            ASTNode *var_node = declarator->u.declarator.var;
-            ASTNode *init_node = declarator->u.declarator.init;
-
-            if (var_node->type == AST_IDENTIFIER) {
-                const char *name = var_node->u.ident.name;
-                if (init_node) {
-                    LRValue val = interp_eval_node(interp, init_node);
-                    if (interp->error_flag) return val;
-                    scope_declare_name(interp, name, val, kind);
-                    lr_free_value(interp->ctx, val);
-                } else {
-                    scope_declare_name(interp, name, LR_VALUE_UNDEFINED, kind);
-                }
-            } else if (var_node->type == AST_PATTERN) {
-                /* Destructuring declaration */
-                if (init_node) {
-                    LRValue val = interp_eval_node(interp, init_node);
-                    if (interp->error_flag) return val;
-                    eval_pattern(interp, var_node, val);
-                    lr_free_value(interp->ctx, val);
-                }
-            }
-        }
+        LRValue r = eval_var_declarator(interp, vars[i], kind);
+        if (interp->error_flag) return r;
     }
 
     return LR_VALUE_UNDEFINED;
@@ -4501,8 +4577,14 @@ static LRValue interp_eval_stmt(Interpreter *interp, ASTNode *node)
     case AST_DEBUGGER:
         /* Debugger statement - no-op */
         return LR_VALUE_UNDEFINED;
+    case AST_VAR_DECLARATOR:
+        return eval_var_declarator(interp, node, 0);
     default:
-        /* Fall through to expression evaluation */
+        /* Guard: statement-only nodes dispatched by eval_statement_dispatch
+         * must not be re-routed through interp_eval_node, which would loop. */
+        if (node->type <= AST_IMPORT_NAMESPACE &&
+            eval_handlers[node->type] == eval_statement_dispatch)
+            return LR_VALUE_UNDEFINED;
         return interp_eval_node(interp, node);
     }
 }
@@ -4511,20 +4593,6 @@ static LRValue interp_eval_stmt(Interpreter *interp, ASTNode *node)
 
 /* Each AST node type maps to a handler function.
  * This replaces the big switch statement, reducing branch mispredictions. */
-typedef LRValue (*EvalHandler)(Interpreter *interp, ASTNode *node);
-
-static LRValue eval_statement_dispatch(Interpreter *interp, ASTNode *node);
-static LRValue eval_this_expr(Interpreter *interp, ASTNode *node);
-static LRValue eval_super_expr(Interpreter *interp, ASTNode *node);
-static LRValue eval_tagged_template(Interpreter *interp, ASTNode *node);
-static LRValue eval_yield_expr(Interpreter *interp, ASTNode *node);
-static LRValue eval_pattern_expr(Interpreter *interp, ASTNode *node);
-static LRValue eval_rest_expr(Interpreter *interp, ASTNode *node);
-static LRValue eval_default_val(Interpreter *interp, ASTNode *node);
-static LRValue eval_property(Interpreter *interp, ASTNode *node);
-static LRValue eval_program(Interpreter *interp, ASTNode *node);
-
-static EvalHandler eval_handlers[AST_IMPORT_NAMESPACE + 1];
 
 /* Initialize the dispatch table (called once at first use) */
 static void init_eval_handlers(void)
@@ -4679,26 +4747,48 @@ static LRValue eval_yield_expr(Interpreter *interp, ASTNode *node)
 
 static LRValue eval_pattern_expr(Interpreter *interp, ASTNode *node)
 {
-    (void)interp; (void)node;
+    if (!node) return LR_VALUE_UNDEFINED;
+    if (node->u.pattern_array.is_object) {
+        for (int i = 0; i < node->u.pattern_object.nprops; i++) {
+            ASTNode *prop = node->u.pattern_object.props[i];
+            if (prop && prop->type == AST_PROPERTY && prop->u.property.val) {
+                LRValue v = interp_eval_node(interp, prop->u.property.val);
+                if (interp->error_flag) { lr_free_value(interp->ctx, v); return LR_VALUE_UNDEFINED; }
+                lr_free_value(interp->ctx, v);
+            }
+        }
+    } else {
+        for (int i = 0; i < node->u.pattern_array.nelem; i++) {
+            ASTNode *elem = node->u.pattern_array.elements[i];
+            if (elem) {
+                LRValue v = interp_eval_node(interp, elem);
+                if (interp->error_flag) { lr_free_value(interp->ctx, v); return LR_VALUE_UNDEFINED; }
+                lr_free_value(interp->ctx, v);
+            }
+        }
+    }
     return LR_VALUE_UNDEFINED;
 }
 
 static LRValue eval_rest_expr(Interpreter *interp, ASTNode *node)
 {
-    (void)interp; (void)node;
-    return LR_VALUE_UNDEFINED;
+    if (!node || !node->u.rest_elem.arg)
+        return LR_VALUE_UNDEFINED;
+    return interp_eval_node(interp, node->u.rest_elem.arg);
 }
 
 static LRValue eval_default_val(Interpreter *interp, ASTNode *node)
 {
-    (void)interp; (void)node;
-    return LR_VALUE_UNDEFINED;
+    if (!node || !node->u.default_val.right)
+        return LR_VALUE_UNDEFINED;
+    return interp_eval_node(interp, node->u.default_val.right);
 }
 
 static LRValue eval_property(Interpreter *interp, ASTNode *node)
 {
-    (void)interp; (void)node;
-    return LR_VALUE_UNDEFINED;
+    if (!node || !node->u.property.val)
+        return LR_VALUE_UNDEFINED;
+    return interp_eval_node(interp, node->u.property.val);
 }
 
 static LRValue eval_program(Interpreter *interp, ASTNode *node)
@@ -4869,9 +4959,7 @@ int interp_bc_load_var(Interpreter *interp, const char *name, LRValue *out)
     }
     lr_free_value(interp->ctx, val);
 
-    snprintf(interp->error_message, sizeof(interp->error_message),
-             "'%s' is not defined", name);
-    interp->error_flag = 1;
+    interp_raise_reference_error(interp, name);
     return 0;
 }
 

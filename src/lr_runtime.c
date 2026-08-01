@@ -701,7 +701,9 @@ static int lr_exec_file_cached(LR_Runtime *rt, const char *filename,
     LRContext *ctx = rt->lr_ctx;
     int ret = -1;
 
-    /* Warm path: IOME586 archive hit. */
+    /* Warm path: IOME586 archive hit.
+     * If the archive contains pre-compiled bytecode, restore it so we skip
+     * bc_compile entirely. Otherwise fall through to AST→compile→execute. */
     LR_Iome586Manifest mf;
     if (lr_iome586_load(&rt->iome586, filename, buf, buf_len, &mf) == 0) {
         Parser *dparser = NULL;
@@ -710,9 +712,16 @@ static int lr_exec_file_cached(LR_Runtime *rt, const char *filename,
             int warm_module = (mf.flags & LR_IOME586_FLAG_MODULE) ? 1 : 0;
             if (rt->iome586.restore_globals)
                 lr_iome586_restore_globals(&rt->iome586, ctx, &mf);
-            /* Re-execute AST (with bytecode if cached). */
-            LRValue result = lr_engine_eval_ast(ctx, ast, dparser,
-                                                warm_module, filename);
+            /* Execute with pre-compiled bytecode if available (v0.1.1+),
+             * otherwise compile from deserialized AST. */
+            LRValue result;
+            if (mf.bytecode && mf.bytecode_len > 0) {
+                result = lr_engine_eval_ast_with_bytecode(ctx, ast, dparser,
+                    warm_module, filename, mf.bytecode, mf.bytecode_len);
+            } else {
+                result = lr_engine_eval_ast(ctx, ast, dparser,
+                                            warm_module, filename);
+            }
             if (lr_is_exception(result)) {
                 lr_check_exception(rt);
                 lr_free_value(ctx, result);

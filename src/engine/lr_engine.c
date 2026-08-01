@@ -307,8 +307,15 @@ void lr_free_object(LRRuntime *rt, LRObject *obj)
             }
             obj->extra = NULL;
         } else if (obj->type == LR_OBJ_ARRAY) {
-            /* Array data is just a realloc'd buffer */
-            free(obj->extra);
+            /* Dense array data: free elements then the struct */
+            LRArrayData *ad = (LRArrayData *)obj->extra;
+            if (ad) {
+                for (uint32_t i = 0; i < ad->capacity; i++) {
+                    lr_free_value(free_ctx, ad->elements[i]);
+                }
+                free(ad->elements);
+                free(ad);
+            }
         } else if (obj->type == LR_OBJ_PROXY) {
             LRProxyData *pd = (LRProxyData *)obj->extra;
             if (pd) {
@@ -739,6 +746,16 @@ LRValue lr_new_array(LRContext *ctx)
     } else {
         obj->proto = lr_get_global_object(ctx);
     }
+    
+    /* Initialize dense array storage for O(1) indexed access */
+    LRArrayData *ad = (LRArrayData *)calloc(1, sizeof(LRArrayData));
+    if (ad) {
+        ad->length = 0;
+        ad->capacity = 8;
+        ad->elements = (LRValue *)calloc(ad->capacity, sizeof(LRValue));
+    }
+    obj->extra = ad;
+    
     v.tag = LR_TYPE_OBJECT;
     v.u.ptr = obj;
     return v;
@@ -880,9 +897,19 @@ const char *lr_to_cstring(LRContext *ctx, LRValue val)
         return strdup("null");
     case LR_TYPE_BOOL:
         return strdup(val.u.bool_val ? "true" : "false");
-    case LR_TYPE_INT32:
-        snprintf(buf, sizeof(buf), "%d", val.u.int32);
-        return strdup(buf);
+    case LR_TYPE_INT32: {
+        /* Fast integer-to-string without snprintf (hot path for concat) */
+        int32_t n = val.u.int32;
+        int neg = n < 0;
+        if (neg) n = -n;
+        char tmp[32];
+        int pos = 31;
+        tmp[31] = '\0';
+        if (n == 0) tmp[--pos] = '0';
+        else while (n > 0) { tmp[--pos] = (char)('0' + (n % 10)); n /= 10; }
+        if (neg) tmp[--pos] = '-';
+        return strdup(tmp + pos);
+    }
     case LR_TYPE_FLOAT64:
         snprintf(buf, sizeof(buf), "%.15g", val.u.float64);
         return strdup(buf);
@@ -1357,6 +1384,26 @@ LRValue lr_get_property(LRContext *ctx, LRValue obj, LRString *atom)
         }
     }
 
+    /* Dense array fast path: for LR_OBJ_ARRAY with numeric indices,
+     * read directly from the linear buffer (set by lr_set_property_uint32).
+     * Also fast-path the "length" property to avoid hash lookup. */
+    if (o->type == LR_OBJ_ARRAY) {
+        uint32_t idx;
+        if (lr_is_numeric_index(atom, &idx)) {
+            LRArrayData *ad = (LRArrayData *)o->extra;
+            if (ad && idx < ad->length &&
+                ad->elements[idx].tag != LR_TYPE_UNDEFINED) {
+                return lr_dup_value(ctx, ad->elements[idx]);
+            }
+        }
+        /* Fast-path "length" for dense arrays */
+        if (atom && strcmp(atom->str, "length") == 0) {
+            LRArrayData *ad = (LRArrayData *)o->extra;
+            if (ad)
+                return lr_new_int32(ctx, (int32_t)ad->length);
+        }
+    }
+
     /* Shape cache: fast lookup for (obj, atom) pairs we've seen before */
     LRValue *cached = shape_cache_lookup(ctx, o, atom);
     if (cached) {
@@ -1425,9 +1472,20 @@ LRValue lr_get_property_str(LRContext *ctx, LRValue obj, const char *name)
 
 LRValue lr_get_property_uint32(LRContext *ctx, LRValue obj, uint32_t idx)
 {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%u", idx);
-    return lr_get_property_str(ctx, obj, buf);
+    /* Dense array fast path: read directly from linear buffer */
+    if (obj.tag == LR_TYPE_OBJECT && ((LRObject *)obj.u.ptr)->type == LR_OBJ_ARRAY) {
+        LRObject *o = (LRObject *)obj.u.ptr;
+        LRArrayData *ad = (LRArrayData *)o->extra;
+        if (ad && idx < ad->length && ad->elements[idx].tag != LR_TYPE_UNDEFINED)
+            return lr_dup_value(ctx, ad->elements[idx]);
+        /* Index beyond length or empty slot: fall through to property lookup
+         * (prototype chain, sparse array support) */
+    }
+    {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%u", idx);
+        return lr_get_property_str(ctx, obj, buf);
+    }
 }
 
 int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
@@ -1492,6 +1550,42 @@ int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
             return 0;
         }
     }
+
+    /* Dense array: sync numeric index writes to the linear buffer */
+    if (o->type == LR_OBJ_ARRAY) {
+        uint32_t idx;
+        if (lr_is_numeric_index(atom, &idx)) {
+            LRArrayData *ad = (LRArrayData *)o->extra;
+            if (ad) {
+                if (idx >= ad->capacity) {
+                    uint32_t new_cap = ad->capacity;
+                    while (new_cap <= idx) new_cap *= 2;
+                    LRValue *new_elems = (LRValue *)realloc(ad->elements,
+                                                            new_cap * sizeof(LRValue));
+                    if (!new_elems) goto dense_fallback;
+                    memset(new_elems + ad->capacity, 0,
+                           (new_cap - ad->capacity) * sizeof(LRValue));
+                    ad->elements = new_elems;
+                    ad->capacity = new_cap;
+                }
+                if (ad->elements[idx].tag != LR_TYPE_UNDEFINED)
+                    lr_free_value(ctx, ad->elements[idx]);
+                ad->elements[idx] = lr_dup_value(ctx, val);
+                if (idx >= ad->length) ad->length = idx + 1;
+            }
+            /* Fall through to property hash for compatibility (e.g. for...in) */
+        }
+        /* Sync "length" property to dense array */
+        if (atom && strcmp(atom->str, "length") == 0) {
+            LRArrayData *ad = (LRArrayData *)o->extra;
+            if (ad) {
+                int32_t new_len = 0;
+                lr_to_int32(ctx, &new_len, val);
+                if (new_len >= 0) ad->length = (uint32_t)new_len;
+            }
+        }
+    }
+dense_fallback:
 
     /* Shape cache lookup: check if we've seen this (obj, atom) pair before */
     {
@@ -1633,9 +1727,40 @@ int lr_set_property_str(LRContext *ctx, LRValue obj, const char *name, LRValue v
 
 int lr_set_property_uint32(LRContext *ctx, LRValue obj, uint32_t idx, LRValue val)
 {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%u", idx);
-    return lr_set_property_str(ctx, obj, buf, val);
+    /* Dense array fast path: for LR_OBJ_ARRAY, write directly into the
+     * linear buffer instead of allocating a per-element LRProperty. */
+    if (obj.tag == LR_TYPE_OBJECT && ((LRObject *)obj.u.ptr)->type == LR_OBJ_ARRAY) {
+        LRObject *o = (LRObject *)obj.u.ptr;
+        LRArrayData *ad = (LRArrayData *)o->extra;
+        if (ad) {
+            /* Grow capacity if needed (double when full) */
+            if (idx >= ad->capacity) {
+                uint32_t new_cap = ad->capacity;
+                while (new_cap <= idx) new_cap *= 2;
+                LRValue *new_elems = (LRValue *)realloc(ad->elements,
+                                                        new_cap * sizeof(LRValue));
+                if (!new_elems) goto fallback;
+                memset(new_elems + ad->capacity, 0,
+                       (new_cap - ad->capacity) * sizeof(LRValue));
+                ad->elements = new_elems;
+                ad->capacity = new_cap;
+            }
+            /* Free old value at index (if any) */
+            if (ad->elements[idx].tag != LR_TYPE_UNDEFINED)
+                lr_free_value(ctx, ad->elements[idx]);
+            /* Store new value (take ownership) */
+            ad->elements[idx] = val;
+            /* Update length if index >= current length */
+            if (idx >= ad->length) ad->length = idx + 1;
+            return 0;
+        }
+    }
+fallback:
+    {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%u", idx);
+        return lr_set_property_str(ctx, obj, buf, val);
+    }
 }
 
 int lr_delete_property(LRContext *ctx, LRValue obj, LRString *atom, int flags)
@@ -2228,62 +2353,80 @@ LRValue lr_get_global_object(LRContext *ctx)
 
 /* ── Error Handling ───────────────────────────────────────────────────── */
 
-static LRValue lr_throw_error(LRContext *ctx, int tag, const char *fmt, va_list ap)
+/* Build the error object that `catch (e)` will observe.
+ *
+ * `kind` is the ECMAScript constructor name ("TypeError", "SyntaxError", …).
+ * We instantiate the real global constructor when it exists so that both
+ * `e.name` and `e instanceof TypeError` behave; if the constructor is not
+ * registered yet (errors thrown during bootstrap), fall back to a plain
+ * object carrying `name`/`message` so the value is still inspectable. */
+static LRValue lr_build_error_object(LRContext *ctx, const char *kind,
+                                     const char *msg)
+{
+    LRValue global = lr_get_global_object(ctx);
+    LRValue ctor   = lr_get_property_str(ctx, global, kind);
+
+    LRValue err = LR_VALUE_UNDEFINED;
+    if (lr_is_function(ctx, ctor)) {
+        LRValue arg = lr_new_string(ctx, msg);
+        err = lr_call_constructor(ctx, ctor, 1, &arg);
+        lr_free_value(ctx, arg);
+        /* A failed construction must not mask the original error. */
+        if (err.tag != LR_TYPE_OBJECT) {
+            ctx->current_exception = LR_VALUE_UNDEFINED;
+            err = LR_VALUE_UNDEFINED;
+        }
+    }
+
+    if (err.tag != LR_TYPE_OBJECT) {
+        err = lr_new_object(ctx);
+        if (err.tag == LR_TYPE_OBJECT) {
+            lr_set_property_str(ctx, err, "name",    lr_new_string(ctx, kind));
+            lr_set_property_str(ctx, err, "message", lr_new_string(ctx, msg));
+        }
+    }
+
+    lr_free_value(ctx, ctor);
+    lr_free_value(ctx, global);
+    return err;
+}
+
+static LRValue lr_throw_error_named(LRContext *ctx, const char *kind,
+                                    const char *fmt, va_list ap)
 {
     char buf[1024];
     vsnprintf(buf, sizeof(buf), fmt, ap);
+
+    free(ctx->error_message);
     ctx->error_message = strdup(buf);
+
+    /* Publish the thrown value so interp_capture_exception / lr_get_exception
+     * hand the caller a real error instead of a bare sentinel. */
+    ctx->current_exception = lr_build_error_object(ctx, kind, buf);
+
     LRValue exc;
-    exc.tag = tag;
+    exc.tag   = LR_TYPE_EXCEPTION;
     exc.u.ptr = NULL;
-    ctx->current_exception = exc;
     return exc;
 }
 
-LRValue lr_throw_type_error(LRContext *ctx, const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    LRValue ret = lr_throw_error(ctx, LR_TYPE_EXCEPTION, fmt, ap);
-    va_end(ap);
-    return ret;
-}
+#define LR_DEFINE_THROWER(fn, kind)                                  \
+    LRValue fn(LRContext *ctx, const char *fmt, ...)                 \
+    {                                                                \
+        va_list ap;                                                  \
+        va_start(ap, fmt);                                           \
+        LRValue ret = lr_throw_error_named(ctx, kind, fmt, ap);      \
+        va_end(ap);                                                  \
+        return ret;                                                  \
+    }
 
-LRValue lr_throw_reference_error(LRContext *ctx, const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    LRValue ret = lr_throw_error(ctx, LR_TYPE_EXCEPTION, fmt, ap);
-    va_end(ap);
-    return ret;
-}
+LR_DEFINE_THROWER(lr_throw_type_error,      "TypeError")
+LR_DEFINE_THROWER(lr_throw_reference_error, "ReferenceError")
+LR_DEFINE_THROWER(lr_throw_range_error,     "RangeError")
+LR_DEFINE_THROWER(lr_throw_syntax_error,    "SyntaxError")
+LR_DEFINE_THROWER(lr_throw_internal_error,  "InternalError")
 
-LRValue lr_throw_range_error(LRContext *ctx, const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    LRValue ret = lr_throw_error(ctx, LR_TYPE_EXCEPTION, fmt, ap);
-    va_end(ap);
-    return ret;
-}
-
-LRValue lr_throw_syntax_error(LRContext *ctx, const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    LRValue ret = lr_throw_error(ctx, LR_TYPE_EXCEPTION, fmt, ap);
-    va_end(ap);
-    return ret;
-}
-
-LRValue lr_throw_internal_error(LRContext *ctx, const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    LRValue ret = lr_throw_error(ctx, LR_TYPE_EXCEPTION, fmt, ap);
-    va_end(ap);
-    return ret;
-}
+#undef LR_DEFINE_THROWER
 
 LRValue lr_get_exception(LRContext *ctx)
 {
@@ -2730,6 +2873,19 @@ typedef struct LREvalUnit {
 typedef struct LRPersistentInterp {
     Interpreter interp;
     LREvalUnit *units;
+    /* One-shot request from lr_engine_eval_code(direct): keep the caller's
+     * lexical scope instead of resetting to the global scope. Consumed (and
+     * cleared) by lr_engine_exec_unit on entry, so nesting is safe. */
+    int         keep_caller_scope;
+    /* IOME586 warm-cache: compiled bytecode keyed by source hash. When the
+     * same source is evaluated multiple times within the same process
+     * (e.g. eval in a loop, or CLI re-runs via the IOME586 loader), we
+     * skip parsing and reuse the cached bytecode program. */
+    struct      LRCompiledCacheEntry {
+        uint64_t  hash;
+        BCProgram *prog;
+        struct LRCompiledCacheEntry *next;
+    }          *compiled_cache[64];
 } LRPersistentInterp;
 
 static void lr_eval_unit_free(LREvalUnit *unit)
@@ -2752,6 +2908,16 @@ void lr_context_free_persistent_interp(LRContext *ctx)
     LRPersistentInterp *ps = (LRPersistentInterp *)ctx->persistent_interp;
     if (!ps) return;
     interp_free(&ps->interp);
+    /* Free compiled cache entries (the BCPrograms are freed by lr_eval_unit_free) */
+    for (int i = 0; i < 64; i++) {
+        struct LRCompiledCacheEntry *ce = ps->compiled_cache[i];
+        while (ce) {
+            struct LRCompiledCacheEntry *next = ce->next;
+            free(ce);
+            ce = next;
+        }
+        ps->compiled_cache[i] = NULL;
+    }
     LREvalUnit *u = ps->units;
     while (u) {
         LREvalUnit *next = u->next;
@@ -2795,11 +2961,20 @@ static LREvalUnit *lr_engine_parse_source(LRContext *ctx, const char *input,
 
     if (!unit->ast || unit->parser->has_error) {
         const char *err_msg = parser_get_error(unit->parser, NULL, NULL);
-        if (err_msg) {
+        /* Inside eval() a SyntaxError is a normal, catchable outcome, so it
+         * must not be reported on stderr — only genuinely uncaught top-level
+         * parse failures are worth printing. */
+        if (err_msg && ctx->eval_depth == 0) {
             fprintf(stderr, "[LR_JS] Parse error: %s\n", err_msg);
         }
+        /* err_msg points into the parser, which lr_eval_unit_free destroys,
+         * so snapshot it before releasing the unit. */
+        char msg[512];
+        snprintf(msg, sizeof(msg), "%s",
+                 err_msg ? err_msg : (filename ? filename : "parse error"));
+
         lr_eval_unit_free(unit);
-        lr_throw_syntax_error(ctx, "%s: parse error", filename ? filename : "input");
+        lr_throw_syntax_error(ctx, "%s", msg);
         return NULL;
     }
     return unit;
@@ -2828,7 +3003,12 @@ static LRValue lr_engine_exec_unit(LRContext *ctx, LREvalUnit *unit,
     LRObject *saved_ns = interp->module_ns;
     const char *saved_filename = interp->filename;
     LRValue saved_meta = interp->import_meta;
-    interp->current_scope = interp->global_scope;
+    /* Direct eval keeps the caller's scope chain so the evaluated code can
+     * read and write the enclosing function's locals (ES PerformEval). */
+    int keep_scope = ps->keep_caller_scope;
+    ps->keep_caller_scope = 0;
+    if (!keep_scope)
+        interp->current_scope = interp->global_scope;
     interp->is_module = is_module;
     interp->filename = filename;
     interp->import_meta = LR_VALUE_UNDEFINED;
@@ -2838,28 +3018,63 @@ static LRValue lr_engine_exec_unit(LRContext *ctx, LREvalUnit *unit,
         interp->module_ns = (LRObject *)unit->ns.u.ptr;
     }
 
-    /* Compile AST → bytecode for IOME586 / fast re-execution. */
+    /* Compile AST → bytecode (mandatory as of v0.1.1+).
+     * The AST tree-walking interpreter is retired; the bytecode VM
+     * (direct/indirect threaded) is the sole execution engine.
+     *
+     * IOME586 warm-cache: check the compiled cache first to skip
+     * recompilation when the same source is evaluated again. */
+    LRValue result = LR_VALUE_UNDEFINED;
     if (!unit->bc_prog) {
-        unit->bc_prog = bc_new_program();
-        if (unit->bc_prog) {
-            if (bc_compile(unit->bc_prog, unit->ast, is_module) != 0) {
-                /* Not VM-usable → drop it and stay on the tree-walker. */
-                bc_free_program(unit->bc_prog);
-                unit->bc_prog = NULL;
-            } else {
-                /* Serialize for IOME586 archive (may be non-restorable). */
+        /* Check the compiled cache (keyed by source hash) */
+        uint64_t src_hash = lr_iome586_hash64((const uint8_t *)unit->src,
+                                              strlen(unit->src));
+        uint32_t bucket = (uint32_t)(src_hash & 63);
+        struct LRCompiledCacheEntry *ce = ps->compiled_cache[bucket];
+        while (ce) {
+            if (ce->hash == src_hash) {
+                unit->bc_prog = ce->prog;
+                break;
+            }
+            ce = ce->next;
+        }
+
+        if (!unit->bc_prog) {
+            unit->bc_prog = bc_new_program();
+            if (unit->bc_prog) {
+                if (bc_compile(unit->bc_prog, unit->ast, is_module) != 0) {
+                    bc_free_program(unit->bc_prog);
+                    unit->bc_prog = NULL;
+                    interp->error_flag = 1;
+                    snprintf(interp->error_message, sizeof(interp->error_message),
+                             "bytecode compilation failed");
+                    goto exec_done;
+                }
+                /* Serialize for IOME586 archive. */
                 unit->bc_ser = bc_serialize(unit->bc_prog, &unit->bc_ser_len);
+                /* Store in compiled cache for warm re-use. */
+                ce = (struct LRCompiledCacheEntry *)calloc(1,
+                    sizeof(struct LRCompiledCacheEntry));
+                if (ce) {
+                    ce->hash = src_hash;
+                    ce->prog = unit->bc_prog;
+                    ce->next = ps->compiled_cache[bucket];
+                    ps->compiled_cache[bucket] = ce;
+                }
             }
         }
     }
 
-    /* Execute: bytecode VM if compiled; tree-walker as fallback. */
-    LRValue result;
+    /* Execute: bytecode VM only (direct/indirect threaded as of v0.1.1+). */
     if (unit->bc_prog && unit->bc_prog->compiled) {
         result = bc_execute(unit->bc_prog, ctx);
     } else {
-        result = interp_eval(interp, unit->ast);
+        interp->error_flag = 1;
+        snprintf(interp->error_message, sizeof(interp->error_message),
+                 "bytecode program not available");
     }
+
+exec_done:
 
     interp->current_scope = saved_scope;
     interp->is_module = saved_is_module;
@@ -3011,6 +3226,35 @@ LRValue lr_engine_eval_ast(LRContext *ctx, ASTNode *ast, Parser *parser,
     unit->ast = ast;
     unit->parser = parser;
     unit->src = NULL;
+    /* bc_prog stays NULL → lr_engine_exec_unit will compile the AST */
+    return lr_engine_exec_unit(ctx, unit, is_module, filename);
+}
+
+/* Evaluate an already-parsed AST with pre-compiled bytecode (IOME586 warm path).
+ * When bc_data/bc_len is provided, skips bc_compile entirely. */
+LRValue lr_engine_eval_ast_with_bytecode(LRContext *ctx, ASTNode *ast,
+                                          Parser *parser, int is_module,
+                                          const char *filename,
+                                          const uint8_t *bc_data, size_t bc_len)
+{
+    LREvalUnit *unit = (LREvalUnit *)calloc(1, sizeof(LREvalUnit));
+    if (!unit) return lr_throw_internal_error(ctx, "eval: out of memory");
+    unit->ast = ast;
+    unit->parser = parser;
+    unit->src = NULL;
+    /* Deserialize bytecode from IOME586 archive so we skip compilation */
+    if (bc_data && bc_len > 0) {
+        unit->bc_prog = bc_deserialize(bc_data, bc_len);
+        if (unit->bc_prog) {
+            unit->bc_prog->compiled = 1;
+            /* Keep serialized copy for the archive */
+            unit->bc_ser = (uint8_t *)malloc(bc_len);
+            if (unit->bc_ser) {
+                memcpy(unit->bc_ser, bc_data, bc_len);
+                unit->bc_ser_len = bc_len;
+            }
+        }
+    }
     return lr_engine_exec_unit(ctx, unit, is_module, filename);
 }
 
@@ -3100,6 +3344,123 @@ LRValue lr_engine_build_function(LRContext *ctx, int nparams,
     /* The result of evaluating (function(...){...}) is the function object.
      * Errors are already set on the context. */
     return r;
+}
+
+/* ── eval() with a per-call runtime sandbox ─────────────────────────────
+ *
+ * Each eval() gets its own sandbox frame. The frame is what makes evaluating
+ * attacker-supplied source safe(r) than splicing it into the host script:
+ *
+ *   - nesting depth is capped, so eval("eval(...)") recursion cannot blow
+ *     the C stack;
+ *   - a wall-clock budget is installed on the interpreter, so a runaway
+ *     loop inside eval terminates even when the host script had no timeout;
+ *   - the interpreter's control-flow accounting (break/continue/return,
+ *     statement counter) is snapshotted on entry and restored on exit, so a
+ *     malformed fragment cannot leave the host interpreter in a torn state;
+ *   - frames are linked, so nested evals inherit the tightest deadline.
+ */
+typedef struct LREvalSandbox {
+    struct LREvalSandbox *parent;
+    int      depth;
+    /* interpreter state captured on entry */
+    int      saved_timeout_ms;
+    int      saved_stmt_counter;
+    int      saved_break_target;
+    int      saved_continue_target;
+    int      saved_return_target;
+    int      saved_has_returned;
+} LREvalSandbox;
+
+static int lr_eval_sandbox_enter(LRContext *ctx, Interpreter *interp,
+                                 LREvalSandbox *sb)
+{
+    int max_depth = ctx->max_eval_depth > 0 ? ctx->max_eval_depth
+                                            : LR_EVAL_MAX_DEPTH_DEFAULT;
+    if (ctx->eval_depth >= max_depth)
+        return -1;
+
+    sb->parent                = (LREvalSandbox *)ctx->eval_sandbox;
+    sb->depth                 = ctx->eval_depth + 1;
+    sb->saved_timeout_ms      = interp->timeout_ms;
+    sb->saved_stmt_counter    = interp->stmt_counter;
+    sb->saved_break_target    = interp->break_target;
+    sb->saved_continue_target = interp->continue_target;
+    sb->saved_return_target   = interp->return_target;
+    sb->saved_has_returned    = interp->has_returned;
+
+    /* Install the sandbox deadline: the tightest of the host timeout and the
+     * configured eval budget. 0 on both sides means "no limit". */
+    int budget = ctx->eval_timeout_ms > 0 ? ctx->eval_timeout_ms
+                                          : interp->timeout_ms;
+    if (interp->timeout_ms > 0 && budget > interp->timeout_ms)
+        budget = interp->timeout_ms;
+    interp->timeout_ms  = budget;
+    interp->stmt_counter = 0;
+
+    /* A fresh fragment must not inherit a pending break/continue/return. */
+    interp->break_target    = 0;
+    interp->continue_target = 0;
+    interp->return_target   = 0;
+    interp->has_returned    = 0;
+
+    ctx->eval_sandbox = sb;
+    ctx->eval_depth   = sb->depth;
+    return 0;
+}
+
+static void lr_eval_sandbox_leave(LRContext *ctx, Interpreter *interp,
+                                  LREvalSandbox *sb)
+{
+    interp->timeout_ms      = sb->saved_timeout_ms;
+    interp->stmt_counter    = sb->saved_stmt_counter;
+    interp->break_target    = sb->saved_break_target;
+    interp->continue_target = sb->saved_continue_target;
+    interp->return_target   = sb->saved_return_target;
+    interp->has_returned    = sb->saved_has_returned;
+
+    ctx->eval_sandbox = sb->parent;
+    ctx->eval_depth   = sb->depth - 1;
+}
+
+LRValue lr_engine_eval_code(LRContext *ctx, const char *src, size_t src_len,
+                            int direct)
+{
+    if (!ctx || !src)
+        return LR_VALUE_UNDEFINED;
+
+    if (ctx->eval_disabled)
+        return lr_throw_type_error(ctx, "eval is disabled in this context");
+
+    /* eval() needs a live interpreter: without one there is no caller scope
+     * to share and nothing has been executed yet, so fall back to a plain
+     * global-scope evaluation. */
+    LRPersistentInterp *ps = (LRPersistentInterp *)ctx->persistent_interp;
+    if (!ps)
+        return lr_engine_eval_source(ctx, src, src_len, 0, "<eval>", NULL, NULL);
+
+    Interpreter *interp = &ps->interp;
+
+    LREvalSandbox sb;
+    if (lr_eval_sandbox_enter(ctx, interp, &sb) != 0)
+        return lr_throw_range_error(ctx, "maximum eval nesting depth exceeded");
+
+    /* Parse first: a SyntaxError must not disturb the caller's scope. */
+    LREvalUnit *unit = lr_engine_parse_source(ctx, src, src_len, 0, "<eval>");
+    if (!unit) {
+        lr_eval_sandbox_leave(ctx, interp, &sb);
+        return LR_VALUE_EXCEPTION;   /* parse_source already threw */
+    }
+
+    /* Direct eval shares the caller's scope chain; indirect eval does not. */
+    ps->keep_caller_scope = direct ? 1 : 0;
+
+    /* eval_program returns the last statement's value, which is exactly the
+     * script completion value eval() must produce. */
+    LRValue result = lr_engine_exec_unit(ctx, unit, 0, "<eval>");
+
+    lr_eval_sandbox_leave(ctx, interp, &sb);
+    return result;
 }
 
 int lr_engine_detect_module(const char *input, size_t input_len)

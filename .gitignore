@@ -66,3 +66,4 @@ Project-Record/
 /.codebuddy
 TASKS.md
 build_log.txt
+/tests

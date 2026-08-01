@@ -122,6 +122,18 @@ struct LRShape {
     uint32_t   hash;
 };
 
+/* ── Dense Array Storage ────────────────────────────────────────────────── */
+
+/* Dense linear storage for array elements. Used as LRObject.extra for
+ * LR_OBJ_ARRAY. Elements are stored contiguously at indices [0..length).
+ * The capacity doubles when needed. This avoids the per-element LRProperty
+ * allocation and hash lookup overhead of the generic property system. */
+typedef struct LRArrayData {
+    uint32_t  length;      /* logical length (number of elements) */
+    uint32_t  capacity;    /* allocated capacity of elements[] */
+    LRValue  *elements;    /* flat array of length values */
+} LRArrayData;
+
 /* ── Object ────────────────────────────────────────────────────────────── */
 
 typedef enum {
@@ -391,6 +403,16 @@ struct LRContext {
     /* Resolved-module registry (LRModuleCacheEntry list), per context.
      * Managed by the module loader; freed in lr_free_context. */
     void             *module_registry;
+    /* ── eval sandbox ──────────────────────────────────────────────────
+     * Every eval() call runs inside a freshly allocated sandbox frame that
+     * caps nesting depth and execution time and restores the interpreter's
+     * accounting state on exit. `eval_sandbox` is the top of the frame
+     * stack (LREvalSandbox *, private to lr_engine.c). */
+    void             *eval_sandbox;
+    int               eval_depth;      /* current eval nesting depth */
+    int               max_eval_depth;  /* 0 → LR_EVAL_MAX_DEPTH_DEFAULT */
+    int               eval_timeout_ms; /* 0 → inherit ctx->timeout_ms */
+    int               eval_disabled;   /* non-zero → eval() throws EvalError */
 };
 
 /* ── Runtime ───────────────────────────────────────────────────────────── */
@@ -747,6 +769,11 @@ LRValue lr_engine_eval_source(LRContext *ctx, const char *input, size_t input_le
 /* Execute an already-parsed AST (e.g. one loaded from the bytecode cache). */
 LRValue lr_engine_eval_ast(LRContext *ctx, ASTNode *ast, Parser *parser,
                 int is_module, const char *filename);
+/* Execute AST with pre-compiled bytecode (IOME586 warm path: skips bc_compile).
+ * bc_data/bc_len may be NULL/0; falls through to compile-from-AST. */
+LRValue lr_engine_eval_ast_with_bytecode(LRContext *ctx, ASTNode *ast,
+                Parser *parser, int is_module, const char *filename,
+                const uint8_t *bc_data, size_t bc_len);
 /* Execute a compiled-script object produced by lr_engine_eval with
  * JS_EVAL_FLAG_COMPILE_ONLY. */
 LRValue lr_engine_eval_function(LRContext *ctx, LRValue func_obj);
@@ -758,6 +785,25 @@ LRValue lr_engine_run_module(LRContext *ctx, const char *input, size_t input_len
 /* Build a Function object from param names + body string (new Function()). */
 LRValue lr_engine_build_function(LRContext *ctx, int nparams,
                                   const char **params, const char *body);
+
+/* ── eval() ─────────────────────────────────────────────────────────────
+ * Runs `src` inside a freshly allocated eval sandbox frame (depth + time
+ * limits, interpreter accounting restored on exit) and returns the script
+ * completion value, exactly as the ES `eval` intrinsic requires.
+ *
+ *   direct != 0 → direct eval: the code observes and mutates the *caller's*
+ *                 lexical scope chain (the current interpreter scope).
+ *   direct == 0 → indirect eval: the code runs in global scope.
+ *
+ * Non-string arguments must be passed through unchanged by the caller; this
+ * entry point always treats `src` as source text. */
+LRValue lr_engine_eval_code(LRContext *ctx, const char *src, size_t src_len,
+                            int direct);
+
+/* Default cap on eval() nesting; override via ctx->max_eval_depth. */
+#ifndef LR_EVAL_MAX_DEPTH_DEFAULT
+#define LR_EVAL_MAX_DEPTH_DEFAULT 64
+#endif
 /* AST (de)serialization used by the IOME586 result cache. */
 uint8_t  *lr_ast_serialize(ASTNode *root, size_t *out_len);
 ASTNode  *lr_ast_deserialize(const uint8_t *buf, size_t len, Parser **out_parser);

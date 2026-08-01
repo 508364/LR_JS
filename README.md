@@ -2,6 +2,24 @@
 
 Pure C, ES2022-compatible JavaScript engine with browser APIs.
 
+**v0.1.1+**: Execution engine is a **direct/indirect threaded bytecode VM** (computed goto on GCC/Clang, switch-based dispatch on MSVC). The AST tree-walking interpreter is retired. Features dense array storage (O(1) indexed access), IOME586 bytecode warm-cache, and optimized string concatenation.
+
+## Performance (vs Node.js v22, Windows x64)
+
+| Test | LR_JS | Node.js | Ratio |
+|------|-------|---------|-------|
+| Class 5000×10 deep | 317 ms | 8 ms | 40× |
+| Map/Set 5000 | 26 ms | 5 ms | 5× |
+| Closure 5000 + 1000 calls | 22 ms | 2 ms | 11× |
+| Recursion fact(200) | 2 ms | 0 ms | — |
+| Destructuring 2000 | 24 ms | 1 ms | 24× |
+| Regex 500 | 5 ms | 0 ms | — |
+| Try/catch 50×5deep | 2 ms | 1 ms | 2× |
+| Array 100k push+reduce | 316 ms | 12 ms | 26× |
+| Arrow 10k + default | 36 ms | 1 ms | 36× |
+| String 10k concat | 83 ms | 1 ms | 83× |
+| **Total** | **834 ms** | **50 ms** | **17×**
+
 ## Features
 
 - **ES2022+ JavaScript**: Classes, arrow functions, Promises, Proxies, Reflect, modules, etc.

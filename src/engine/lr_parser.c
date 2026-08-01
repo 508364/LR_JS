@@ -732,44 +732,40 @@ static ASTNode *parse_primary_expr(Parser *parser)
 
         /* Check for arrow function (expr) => ... */
         if (peek_token(parser, TOK_ARROW)) {
-            /* This is an arrow function with a single parenthesized expression parameter */
-            /* But we already parsed the expression. We need to backtrack or handle differently */
-            /* For simplicity, we'll re-parse this as arrow function params */
-            /* Actually, for a single-param arrow like (x) => x+1, we can just use the identifier */
-            if (expr->type == AST_IDENTIFIER) {
-                lexer_skip(parser->lexer); /* consume => */
-                ASTNode *body = parse_arrow_body(parser);
-                ASTNode *arrow = ast_alloc(AST_ARROW);
-                if (arrow) {
-                    arrow->u.arrow.params = (ASTNode **)p_malloc(sizeof(ASTNode *));
-                    arrow->u.arrow.params[0] = expr;
-                    arrow->u.arrow.nparams = 1;
-                    arrow->u.arrow.body = body;
-                    arrow->u.arrow.is_async = 0;
-                }
-                return arrow;
-            }
-            /* Multi-param: (a, b) => ... */
-            /* We need to reconstruct from the sequence expression */
             lexer_skip(parser->lexer); /* consume => */
             ASTNode *body = parse_arrow_body(parser);
 
             ASTNode *arrow = ast_alloc(AST_ARROW);
             if (arrow) {
-                /* Count the params from the sequence */
-                ASTNode *seq = expr;
-                int nparams = 0;
-                if (seq->type == AST_SEQUENCE) {
-                    nparams = seq->u.sequence.count;
+                if (expr->type == AST_IDENTIFIER) {
+                    /* Single param: (x) => ... */
+                    arrow->u.arrow.params = (ASTNode **)p_malloc(sizeof(ASTNode *));
+                    arrow->u.arrow.params[0] = expr;
+                    arrow->u.arrow.nparams = 1;
+                } else if (expr->type == AST_ASSIGN &&
+                           expr->u.assign.target &&
+                           expr->u.assign.target->type == AST_IDENTIFIER) {
+                    /* Default param: (n = 1) => ... */
+                    arrow->u.arrow.params = (ASTNode **)p_malloc(sizeof(ASTNode *));
+                    arrow->u.arrow.params[0] = expr;
+                    arrow->u.arrow.nparams = 1;
+                } else if (expr->type == AST_SEQUENCE) {
+                    /* Multi-param: (a, b) => ... */
+                    int nparams = expr->u.sequence.count;
                     arrow->u.arrow.params = (ASTNode **)p_malloc(nparams * sizeof(ASTNode *));
                     for (int i = 0; i < nparams; i++) {
-                        arrow->u.arrow.params[i] = seq->u.sequence.exprs[i];
+                        arrow->u.arrow.params[i] = expr->u.sequence.exprs[i];
                     }
-                    seq->u.sequence.exprs = NULL;
-                    seq->u.sequence.count = 0;
-                    ast_free_ex(seq, parser);
+                    expr->u.sequence.exprs = NULL;
+                    expr->u.sequence.count = 0;
+                    ast_free_ex(expr, parser);
+                    arrow->u.arrow.nparams = nparams;
+                } else {
+                    /* Single complex param: ((x)) => ... or other */
+                    arrow->u.arrow.params = (ASTNode **)p_malloc(sizeof(ASTNode *));
+                    arrow->u.arrow.params[0] = expr;
+                    arrow->u.arrow.nparams = 1;
                 }
-                arrow->u.arrow.nparams = nparams;
                 arrow->u.arrow.body = body;
                 arrow->u.arrow.is_async = 0;
             }
@@ -865,6 +861,8 @@ static ASTNode *parse_primary_expr(Parser *parser)
                             }
                             args[argc++] = arg;
                             if (!match_token(parser, TOK_COMMA)) break;
+                            /* ES2017 trailing comma: new Foo(a, b,) */
+                            if (peek_token(parser, TOK_RPAREN)) break;
                         }
                     }
                     expect_token(parser, TOK_RPAREN);
@@ -1110,6 +1108,8 @@ static ASTNode *parse_postfix_expr(Parser *parser, ASTNode *left)
                         }
                         args[argc++] = arg;
                         if (!match_token(parser, TOK_COMMA)) break;
+                        /* ES2017 trailing comma: f?.(a, b,) */
+                        if (peek_token(parser, TOK_RPAREN)) break;
                     }
                 }
                 expect_token(parser, TOK_RPAREN);
@@ -1181,6 +1181,8 @@ static ASTNode *parse_postfix_expr(Parser *parser, ASTNode *left)
                     }
                     args[argc++] = arg;
                     if (!match_token(parser, TOK_COMMA)) break;
+                    /* ES2017 trailing comma: f(a, b,) */
+                    if (peek_token(parser, TOK_RPAREN)) break;
                 }
             }
             expect_token(parser, TOK_RPAREN);
@@ -1875,6 +1877,8 @@ static ASTNode **parse_params(Parser *parser)
         params[count++] = param;
 
         if (!match_token(parser, TOK_COMMA)) break;
+        /* ES2017 trailing comma in the parameter list: function f(a, b,) {} */
+        if (peek_token(parser, TOK_RPAREN)) break;
     }
 
     expect_token(parser, TOK_RPAREN);

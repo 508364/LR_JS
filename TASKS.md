@@ -1,6 +1,17 @@
 # L/R_JS 任务列表 (Task List)
 
-纯 C 实现的 ES2022 JS 引擎 (QuickJS 兼容 `JS_*` API；AST 树遍历解释器)。
+纯 C 实现的 ES2022 JS 引擎。**v0.1.1+**：执行引擎为直接/间接线程式字节码 VM，AST 树遍历解释器已退役。
+
+## v0.1.1 性能基线 (vs Node.js v22, Windows x64)
+
+| 测试项 | LR_JS | Node.js | 倍数 |
+|--------|-------|---------|------|
+| Class 5000×10 | 332 ms | 8 ms | 42× |
+| Map/Set 5000 | 26 ms | 6 ms | 4× |
+| Closure 5000 | 21 ms | 2 ms | 11× |
+| Array 100k | 320 ms | 12 ms | 27× |
+| String 10k | 85 ms | 1 ms | 85× |
+| **Total (10项)** | **852 ms** | **49 ms** | **17×** |
 
 ## 状态图例
 - [x] 已完成并验证

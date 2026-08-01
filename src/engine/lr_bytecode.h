@@ -1,27 +1,19 @@
 /*
- * LR_JS — Bytecode VM (stack based)
+ * LR_JS — Bytecode VM (stack based) — Direct/Indirect Threaded Interpreter
  *
- * The compiler lowers the whole AST to a linear opcode stream. Every
- * JavaScript construct is covered:
+ * As of v0.1.1, this is the **sole** execution engine. The AST tree-walking
+ * interpreter has been retired; every JavaScript construct is compiled to
+ * a linear opcode stream and executed by this VM.
  *
- *   • Constructs with a native opcode  → executed by the C dispatch loop
- *     (arithmetic, comparisons, string concatenation, property/element
- *      access, calls, `new`, objects/arrays, template literals, control
- *      flow, loops, switch, for-of, inc/dec, logical short-circuit, …).
+ * Threading model:
+ *   - Direct  threading (computed goto / labels-as-values)  → GCC, Clang
+ *   - Indirect threading (switch-based)                      → MSVC, others
+ *   Selection is automatic via the LR_THREADED_CODE preprocessor guard.
  *
- *   • Constructs whose semantics live in the tree-walking interpreter
- *     (functions/closures, classes, generators, async/await, try/catch,
- *      destructuring, with, import/export) → lowered to BC_EVAL_NODE,
- *     which calls back into the interpreter for that single subtree.
- *
- * Both paths run on the *same* interpreter state (scope chain, error and
- * exception flags), so mixing them is transparent and never re-executes
- * a statement twice.
- *
- * The compiler performs an escape analysis before delegating a subtree:
- * if a delegated subtree could transfer control out of itself
- * (break/continue/return/yield/await), compilation of the whole unit
- * fails and the engine falls back to the tree-walking interpreter.
+ * The compiler covers ALL AST nodes. There is no longer a fallback to
+ * AST evaluation (the `emit_eval` / `escapes` mechanism and the
+ * BC_EVAL_NODE opcode are removed). Functions, classes, try/catch,
+ * destructuring, and all other constructs have native bytecode lowering.
  */
 #ifndef LR_BYTECODE_H
 #define LR_BYTECODE_H

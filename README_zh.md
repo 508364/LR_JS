@@ -2,6 +2,19 @@
 
 纯 C 语言实现，兼容 ES2022+ 的 JavaScript 引擎，内置浏览器 API。
 
+**v0.1.1+**：执行引擎为**直接/间接线程式字节码 VM**（GCC/Clang 使用 computed goto 零开销调度，MSVC 使用 switch-based dispatch）。AST 树遍历解释器已退役。内置稠密数组存储（O(1) 索引访问）、IOME586 字节码预热缓存、字符串拼接优化。
+
+## 性能对比（vs Node.js v22, Windows x64）
+
+| 测试项 | LR_JS | Node.js | 倍数 |
+|--------|-------|---------|------|
+| Class 5000×10层继承 | 317 ms | 8 ms | 40× |
+| Map/Set 5000 | 26 ms | 5 ms | 5× |
+| Closure 5000 | 22 ms | 2 ms | 11× |
+| Array 100k | 316 ms | 12 ms | 26× |
+| String 10k拼接 | 83 ms | 1 ms | 83× |
+| **总计** | **834 ms** | **50 ms** | **17×**
+
 ## 特性
 
 - **ES2022+ JavaScript**：类、箭头函数、Promise、Proxy、Reflect、模块等

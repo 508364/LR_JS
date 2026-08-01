@@ -30,6 +30,14 @@ typedef struct BoundFunctionData {
 
 static int32_t get_array_length(JSContext *ctx, JSValue arr)
 {
+    /* Dense array fast path: read from LRArrayData */
+    if (JS_VALUE_GET_TAG(arr) == LR_TYPE_OBJECT) {
+        LRObject *o = (LRObject *)arr.u.ptr;
+        if (o->type == LR_OBJ_ARRAY && o->extra) {
+            LRArrayData *ad = (LRArrayData *)o->extra;
+            return (int32_t)ad->length;
+        }
+    }
     JSValue len_val = JS_GetPropertyStr(ctx, arr, "length");
     if (JS_IsException(len_val)) return 0;
     int32_t len;
@@ -42,6 +50,14 @@ static int32_t get_array_length(JSContext *ctx, JSValue arr)
 
 static void set_array_length(JSContext *ctx, JSValue arr, int32_t len)
 {
+    /* Sync dense array data */
+    if (JS_VALUE_GET_TAG(arr) == LR_TYPE_OBJECT) {
+        LRObject *o = (LRObject *)arr.u.ptr;
+        if (o->type == LR_OBJ_ARRAY && o->extra) {
+            LRArrayData *ad = (LRArrayData *)o->extra;
+            ad->length = (uint32_t)len;
+        }
+    }
     JS_SetPropertyStr(ctx, arr, "length", JS_NewInt32(ctx, len));
 }
 
@@ -4012,6 +4028,34 @@ static JSValue js_function_constructor(JSContext *ctx, JSValue this_val,
     return result;
 }
 
+/* ── eval ──────────────────────────────────────────────────────────────── */
+
+static JSValue js_global_eval(JSContext *ctx, JSValue this_val,
+                              int argc, JSValue *argv)
+{
+    (void)this_val;
+
+    if (argc < 1)
+        return JS_UNDEFINED;
+
+    /* Per spec, eval() returns any non-string argument unchanged. */
+    if (argv[0].tag != LR_TYPE_STRING)
+        return JS_DupValue(ctx, argv[0]);
+
+    const char *src = JS_ToCString(ctx, argv[0]);
+    if (!src)
+        return JS_EXCEPTION;
+
+    /* Calls that reach here went through the `eval` binding while the
+     * interpreter still sits in the caller's scope, so this is a direct
+     * eval: the fragment observes and mutates the enclosing locals. The
+     * engine allocates a fresh sandbox frame (depth + time budget) for it. */
+    JSValue result = lr_engine_eval_code(ctx, src, strlen(src), 1);
+
+    JS_FreeCString(ctx, src);
+    return result;
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
    8. INITIALIZATION
    ══════════════════════════════════════════════════════════════════════════ */
@@ -4159,6 +4203,12 @@ void lr_builtins_core_init(LR_Runtime *rt)
         /* Register Function as a global */
         JS_SetPropertyStr(ctx, global, "Function", func_ctor);
     }
+
+    /* ── eval ──────────────────────────────────────────────────────────
+     * Registered last so it is present regardless of which constructors
+     * above were already installed. */
+    JS_SetPropertyStr(ctx, global, "eval",
+                      JS_NewCFunction(ctx, js_global_eval, "eval", 1));
 
     JS_FreeValue(ctx, global);
 

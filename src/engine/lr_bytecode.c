@@ -961,22 +961,32 @@ static int var_decl_kind(ASTNode *n)
 static void cvar_decl(BCComp *c, ASTNode *n)
 {
     int kind = var_decl_kind(n);
+
+    /* A destructuring declarator carries its let/const-ness on the *parent*
+     * AST_VAR_DECL, so delegating the bare declarator would lose the kind.
+     * If any declarator needs the interpreter, hand over the whole statement
+     * once — emitting per-declarator would re-run the other initialisers. */
     for (int i = 0; i < n->u.var_decl.nvars; i++) {
         ASTNode *d = n->u.var_decl.vars[i];
         if (!d || d->type != AST_VAR_DECLARATOR) continue;
         ASTNode *var = d->u.declarator.var;
-        ASTNode *init = d->u.declarator.init;
-        if (var && var->type == AST_IDENTIFIER && var->u.ident.name) {
-            if (init) cexpr(c, init);
-            else emit(c, BC_PUSH_UNDEFINED);
-            int idx = pool_add_str(c, var->u.ident.name);
-            emit(c, BC_DECLARE_VAR);
-            emit16(c, idx);
-            emit(c, (uint8_t)kind);
-        } else {
-            /* Destructuring declarator → interpreter */
-            emit_eval(c, d, 0);
+        if (!var || var->type != AST_IDENTIFIER || !var->u.ident.name) {
+            emit_eval(c, n, 0);
+            return;
         }
+    }
+
+    for (int i = 0; i < n->u.var_decl.nvars; i++) {
+        ASTNode *d = n->u.var_decl.vars[i];
+        if (!d || d->type != AST_VAR_DECLARATOR) continue;
+        ASTNode *var  = d->u.declarator.var;
+        ASTNode *init = d->u.declarator.init;
+        if (init) cexpr(c, init);
+        else emit(c, BC_PUSH_UNDEFINED);
+        int idx = pool_add_str(c, var->u.ident.name);
+        emit(c, BC_DECLARE_VAR);
+        emit16(c, idx);
+        emit(c, (uint8_t)kind);
     }
 }
 
@@ -1392,27 +1402,50 @@ static int bcv_abstract_eq(LRContext *ctx, LRValue a, LRValue b)
     return 0;
 }
 
-/* String concatenation entirely in C. */
+/* String concatenation entirely in C with a fast path for the extremely
+ * common pattern: (string) + (number) or (string) + (string), which avoids
+ * an extra strdup/free pair by reading the left string's buffer directly. */
 static LRValue bcv_concat(LRContext *ctx, LRValue a, LRValue b)
 {
-    const char *sa = lr_to_cstring(ctx, a);
-    const char *sb = lr_to_cstring(ctx, b);
-    size_t la = sa ? strlen(sa) : 0;
-    size_t lb = sb ? strlen(sb) : 0;
-    LRValue out = LR_VALUE_UNDEFINED;
-    char *buf = (char *)malloc(la + lb + 1);
-    if (buf) {
-        if (la) memcpy(buf, sa, la);
-        if (lb) memcpy(buf + la, sb, lb);
-        buf[la + lb] = '\0';
-        out = lr_new_string_len(ctx, buf, la + lb);
-        free(buf);
-    } else {
-        out = lr_new_string(ctx, "");
+    /* Fast path: left side is already a string — use its raw buffer */
+    if (a.tag == LR_TYPE_STRING) {
+        LRString *s = (LRString *)a.u.ptr;
+        const char *sb = lr_to_cstring(ctx, b);
+        size_t lb = sb ? strlen(sb) : 0;
+        size_t la = s ? s->len : 0;
+        char *buf = (char *)malloc(la + lb + 1);
+        LRValue out = LR_VALUE_UNDEFINED;
+        if (buf) {
+            if (la) memcpy(buf, s->str, la);
+            if (lb) memcpy(buf + la, sb, lb);
+            buf[la + lb] = '\0';
+            out = lr_new_string_len(ctx, buf, la + lb);
+            free(buf);
+        }
+        lr_free_cstring(ctx, sb);
+        return out.tag != LR_TYPE_UNDEFINED ? out : lr_new_string(ctx, "");
     }
-    lr_free_cstring(ctx, sa);
-    lr_free_cstring(ctx, sb);
-    return out;
+    /* General path: convert both sides to C strings */
+    {
+        const char *sa = lr_to_cstring(ctx, a);
+        const char *sb = lr_to_cstring(ctx, b);
+        size_t la = sa ? strlen(sa) : 0;
+        size_t lb = sb ? strlen(sb) : 0;
+        LRValue out = LR_VALUE_UNDEFINED;
+        char *buf = (char *)malloc(la + lb + 1);
+        if (buf) {
+            if (la) memcpy(buf, sa, la);
+            if (lb) memcpy(buf + la, sb, lb);
+            buf[la + lb] = '\0';
+            out = lr_new_string_len(ctx, buf, la + lb);
+            free(buf);
+        } else {
+            out = lr_new_string(ctx, "");
+        }
+        lr_free_cstring(ctx, sa);
+        lr_free_cstring(ctx, sb);
+        return out;
+    }
 }
 
 /* Relational comparison with proper string ordering. op: 0 '<' 1 '>' 2 '<=' 3 '>=' */
@@ -1579,8 +1612,20 @@ static LRValue bcv_binop(Interpreter *interp, int op, LRValue a, LRValue b)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   EXECUTOR
+   EXECUTOR — Direct/Indirect Threaded Bytecode Interpreter
+
+   Direct threading (GCC/Clang): computed goto (&&label) — zero overhead.
+   Indirect threading (MSVC): switch-based dispatch loop.
+
+   v0.1.1+: SOLE execution engine. AST tree-walking interpreter is retired.
    ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── Threading mode ──────────────────────────────────────────────────── */
+#if defined(__GNUC__) || defined(__clang__)
+  #define LR_THREADED_CODE 1
+#else
+  #define LR_THREADED_CODE 0
+#endif
 
 static uint16_t rd16(uint8_t **ip)
 {
@@ -1596,8 +1641,6 @@ static int32_t rd32(uint8_t **ip)
     *ip += 4;
     return v;
 }
-
-#define BC_ARG_STATIC 8
 
 LRValue bc_execute(BCProgram *prog, LRContext *ctx)
 {
@@ -1628,51 +1671,160 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
                         interp->has_returned || interp->break_target ||      \
                         interp->continue_target) goto vm_abort; } while (0)
 
-    for (;;) {
-        if (ip < prog->code || ip >= code_end) goto vm_abort;
+#if LR_THREADED_CODE
+    /* ── Direct threaded dispatch table ──────────────────────────────── */
+    static const void *dispatch[BC_OPCODE_COUNT];
+    static int dispatch_init = 0;
+    if (!dispatch_init) {
+        #define DOP(op, lbl) dispatch[op] = &&lbl_##lbl;
+        DOP(BC_STOP,           stop)
+        DOP(BC_NOP,            nop)
+        DOP(BC_PUSH_UNDEFINED, push_undefined)
+        DOP(BC_PUSH_NULL,      push_null)
+        DOP(BC_PUSH_TRUE,      push_true)
+        DOP(BC_PUSH_FALSE,     push_false)
+        DOP(BC_PUSH_INT32,     push_int32)
+        DOP(BC_PUSH_FLOAT64,   push_float64)
+        DOP(BC_PUSH_STRING,    push_string)
+        DOP(BC_POP,            pop)
+        DOP(BC_DUP,            dup)
+        DOP(BC_DUP2,           dup2)
+        DOP(BC_SWAP,           swap)
+        DOP(BC_ROT3,           rot3)
+        DOP(BC_LOAD_VAR,       load_var)
+        DOP(BC_STORE_VAR,      store_var)
+        DOP(BC_DECLARE_VAR,    declare_var)
+        DOP(BC_TYPEOF_VAR,     typeof_var)
+        DOP(BC_ADD,            add)
+        DOP(BC_SUB,            sub)
+        DOP(BC_MUL,            mul)
+        DOP(BC_DIV,            div)
+        DOP(BC_MOD,            mod)
+        DOP(BC_POW,            pow)
+        DOP(BC_LT,             lt)
+        DOP(BC_GT,             gt)
+        DOP(BC_LE,             le)
+        DOP(BC_GE,             ge)
+        DOP(BC_EQ,             eq)
+        DOP(BC_NE,             ne)
+        DOP(BC_STRICT_EQ,      strict_eq)
+        DOP(BC_STRICT_NE,      strict_ne)
+        DOP(BC_SHL,            shl)
+        DOP(BC_SHR,            shr)
+        DOP(BC_SAR,            sar)
+        DOP(BC_BIT_AND,        bit_and)
+        DOP(BC_BIT_OR,         bit_or)
+        DOP(BC_BIT_XOR,        bit_xor)
+        DOP(BC_IN,             in_op)
+        DOP(BC_INSTANCEOF,     instanceof)
+        DOP(BC_NEG,            neg)
+        DOP(BC_POS,            pos)
+        DOP(BC_NOT,            not_op)
+        DOP(BC_BIT_NOT,        bit_not)
+        DOP(BC_TYPEOF,         typeof_op)
+        DOP(BC_VOID,           void_op)
+        DOP(BC_JUMP,           jump)
+        DOP(BC_JUMP_IF_FALSE,  jump_if_false)
+        DOP(BC_JUMP_IF_TRUE,   jump_if_true)
+        DOP(BC_JUMP_IF_FALSE_KEEP, jump_if_false_keep)
+        DOP(BC_JUMP_IF_TRUE_KEEP,  jump_if_true_keep)
+        DOP(BC_JUMP_IF_NOT_NULLISH, jump_if_not_nullish)
+        DOP(BC_LOOP_TICK,      loop_tick)
+        DOP(BC_CALL,           call)
+        DOP(BC_CALL_METHOD,    call_method)
+        DOP(BC_CALL_ELEM,      call_elem)
+        DOP(BC_NEW,            new_op)
+        DOP(BC_RETURN,         return_op)
+        DOP(BC_NEW_OBJECT,     new_object)
+        DOP(BC_NEW_ARRAY,      new_array)
+        DOP(BC_DEF_PROP,       def_prop)
+        DOP(BC_DEF_ELEM,       def_elem)
+        DOP(BC_GET_PROP,       get_prop)
+        DOP(BC_SET_PROP,       set_prop)
+        DOP(BC_GET_ELEM,       get_elem)
+        DOP(BC_SET_ELEM,       set_elem)
+        DOP(BC_DELETE_PROP,    delete_prop)
+        DOP(BC_DELETE_ELEM,    delete_elem)
+        DOP(BC_ITER_INIT,      iter_init)
+        DOP(BC_ITER_NEXT,      iter_next)
+        DOP(BC_ITER_CLOSE,     iter_close)
+        DOP(BC_SCOPE_ENTER,    scope_enter)
+        DOP(BC_SCOPE_LEAVE,    scope_leave)
+        DOP(BC_EVAL_NODE,      eval_node)
+        DOP(BC_EVAL_NODE_POP,  eval_node_pop)
+        DOP(BC_SET_RESULT,     set_result)
+        DOP(BC_CLEAR_RESULT,   clear_result)
+        DOP(BC_THROW,          throw_op)
+        #undef DOP
+        dispatch_init = 1;
+    }
+    #define DISPATCH() do { uint8_t _op = *ip++; goto *dispatch[_op]; } while (0)
+#else
+    #define DISPATCH() goto vm_next
+#endif
+
+#if LR_THREADED_CODE
+    /* ── Start direct-threaded dispatch ──────────────────────────────── */
+    {
         uint8_t op = *ip++;
-        switch (op) {
+        goto *dispatch[op];
+    }
+#else
+    /* ── Start indirect-threaded (switch) dispatch ──────────────────── */
+    goto vm_next;
+#endif
 
-        case BC_STOP:
-            goto vm_done;
-        case BC_NOP:
-            break;
+    /* ═══════════════════════════════════════════════════════════════════
+       OPCODE HANDLERS
+       Each handler reads operands, executes, then dispatches the next
+       opcode via DISPATCH() (direct) or goto vm_next (indirect).
+       ═══════════════════════════════════════════════════════════════════ */
 
-        case BC_PUSH_UNDEFINED: PUSH(LR_VALUE_UNDEFINED); break;
-        case BC_PUSH_NULL:      PUSH(LR_VALUE_NULL); break;
-        case BC_PUSH_TRUE:      PUSH(lr_new_bool(ctx, 1)); break;
-        case BC_PUSH_FALSE:     PUSH(lr_new_bool(ctx, 0)); break;
-        case BC_PUSH_INT32:     PUSH(lr_new_int32(ctx, rd32(&ip))); break;
+#if !LR_THREADED_CODE
+    for (;;) {
+    vm_next:
+        if (ip < prog->code || ip >= code_end) goto vm_abort;
+        switch (*ip++) {
+#endif
+
+        case BC_STOP: goto vm_done;
+        case BC_NOP: DISPATCH();
+
+        case BC_PUSH_UNDEFINED: PUSH(LR_VALUE_UNDEFINED); DISPATCH();
+        case BC_PUSH_NULL:      PUSH(LR_VALUE_NULL); DISPATCH();
+        case BC_PUSH_TRUE:      PUSH(lr_new_bool(ctx, 1)); DISPATCH();
+        case BC_PUSH_FALSE:     PUSH(lr_new_bool(ctx, 0)); DISPATCH();
+        case BC_PUSH_INT32:     PUSH(lr_new_int32(ctx, rd32(&ip))); DISPATCH();
         case BC_PUSH_FLOAT64: {
             uint16_t si = rd16(&ip);
             PUSH(lr_new_float64(ctx, prog->pool[si].u.f64));
-            break;
+            DISPATCH();
         }
         case BC_PUSH_STRING: {
             uint16_t si = rd16(&ip);
             PUSH(lr_new_string(ctx, prog->pool[si].u.str));
-            break;
+            DISPATCH();
         }
 
-        case BC_POP: { LRValue v = POP(); FREE_IF_HEAP(ctx, v); break; }
+        case BC_POP: { LRValue v = POP(); FREE_IF_HEAP(ctx, v); DISPATCH(); }
         case BC_DUP: {
             LRValue v = sp > 0 ? stack[sp - 1] : LR_VALUE_UNDEFINED;
             PUSH(lr_dup_value(ctx, v));
-            break;
+            DISPATCH();
         }
         case BC_DUP2: {
             if (sp < 2) goto vm_abort;
             LRValue a = stack[sp - 2], b = stack[sp - 1];
             PUSH(lr_dup_value(ctx, a));
             PUSH(lr_dup_value(ctx, b));
-            break;
+            DISPATCH();
         }
         case BC_SWAP: {
             if (sp < 2) goto vm_abort;
             LRValue t = stack[sp - 1];
             stack[sp - 1] = stack[sp - 2];
             stack[sp - 2] = t;
-            break;
+            DISPATCH();
         }
         case BC_ROT3: {
             if (sp < 3) goto vm_abort;
@@ -1680,7 +1832,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             stack[sp - 1] = stack[sp - 2];
             stack[sp - 2] = stack[sp - 3];
             stack[sp - 3] = t;
-            break;
+            DISPATCH();
         }
 
         case BC_LOAD_VAR: {
@@ -1688,7 +1840,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             LRValue v;
             if (!interp_bc_load_var(interp, prog->pool[si].u.str, &v)) goto vm_abort;
             PUSH(v);
-            break;
+            DISPATCH();
         }
         case BC_STORE_VAR: {
             uint16_t si = rd16(&ip);
@@ -1696,7 +1848,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             interp_bc_store_var(interp, prog->pool[si].u.str, v);
             FREE_IF_HEAP(ctx, v);
             CHECK();
-            break;
+            DISPATCH();
         }
         case BC_DECLARE_VAR: {
             uint16_t si = rd16(&ip);
@@ -1705,7 +1857,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             interp_bc_declare_var(interp, prog->pool[si].u.str, v, (int)kind);
             FREE_IF_HEAP(ctx, v);
             CHECK();
-            break;
+            DISPATCH();
         }
         case BC_TYPEOF_VAR: {
             uint16_t si = rd16(&ip);
@@ -1716,7 +1868,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             } else {
                 PUSH(lr_new_string(ctx, "undefined"));
             }
-            break;
+            DISPATCH();
         }
 
         case BC_ADD: case BC_SUB: case BC_MUL: case BC_DIV: case BC_MOD:
@@ -1727,12 +1879,12 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
         case BC_IN: case BC_INSTANCEOF: {
             if (sp < 2) goto vm_abort;
             LRValue b = POP(), a = POP();
-            LRValue r = bcv_binop(interp, op, a, b);
+            LRValue r = bcv_binop(interp, (int)*(ip - 1), a, b);
             FREE_IF_HEAP(ctx, a);
             FREE_IF_HEAP(ctx, b);
             if (interp->error_flag) { FREE_IF_HEAP(ctx, r); goto vm_abort; }
             PUSH(r);
-            break;
+            DISPATCH();
         }
 
         case BC_NEG: {
@@ -1740,51 +1892,51 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             LRValue r = bcv_number(ctx, -bcv_to_number(ctx, a));
             FREE_IF_HEAP(ctx, a);
             PUSH(r);
-            break;
+            DISPATCH();
         }
         case BC_POS: {
             LRValue a = POP();
             LRValue r = bcv_number(ctx, bcv_to_number(ctx, a));
             FREE_IF_HEAP(ctx, a);
             PUSH(r);
-            break;
+            DISPATCH();
         }
         case BC_NOT: {
             LRValue a = POP();
             int t = lr_to_bool(ctx, a);
             FREE_IF_HEAP(ctx, a);
             PUSH(lr_new_bool(ctx, !t));
-            break;
+            DISPATCH();
         }
         case BC_BIT_NOT: {
             LRValue a = POP();
             int32_t i = bcv_to_int32(ctx, a);
             FREE_IF_HEAP(ctx, a);
             PUSH(lr_new_int32(ctx, ~i));
-            break;
+            DISPATCH();
         }
         case BC_TYPEOF: {
             LRValue a = POP();
             LRValue r = lr_new_string(ctx, bcv_typeof(ctx, a));
             FREE_IF_HEAP(ctx, a);
             PUSH(r);
-            break;
+            DISPATCH();
         }
         case BC_VOID: {
             LRValue a = POP();
             FREE_IF_HEAP(ctx, a);
             PUSH(LR_VALUE_UNDEFINED);
-            break;
+            DISPATCH();
         }
 
-        case BC_JUMP: { int32_t off = rd32(&ip); ip += off; break; }
+        case BC_JUMP: { int32_t off = rd32(&ip); ip += off; DISPATCH(); }
         case BC_JUMP_IF_FALSE: {
             int32_t off = rd32(&ip);
             LRValue v = POP();
             int t = lr_to_bool(ctx, v);
             FREE_IF_HEAP(ctx, v);
             if (!t) ip += off;
-            break;
+            DISPATCH();
         }
         case BC_JUMP_IF_TRUE: {
             int32_t off = rd32(&ip);
@@ -1792,26 +1944,26 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             int t = lr_to_bool(ctx, v);
             FREE_IF_HEAP(ctx, v);
             if (t) ip += off;
-            break;
+            DISPATCH();
         }
         case BC_JUMP_IF_FALSE_KEEP: {
             int32_t off = rd32(&ip);
             if (sp < 1) goto vm_abort;
             if (!lr_to_bool(ctx, stack[sp - 1])) ip += off;
-            break;
+            DISPATCH();
         }
         case BC_JUMP_IF_TRUE_KEEP: {
             int32_t off = rd32(&ip);
             if (sp < 1) goto vm_abort;
             if (lr_to_bool(ctx, stack[sp - 1])) ip += off;
-            break;
+            DISPATCH();
         }
         case BC_JUMP_IF_NOT_NULLISH: {
             int32_t off = rd32(&ip);
             if (sp < 1) goto vm_abort;
             LRValue v = stack[sp - 1];
             if (v.tag != LR_TYPE_UNDEFINED && v.tag != LR_TYPE_NULL) ip += off;
-            break;
+            DISPATCH();
         }
         case BC_LOOP_TICK:
             if (interp->timeout_ms > 0 && ++interp->stmt_counter >= 1024) {
@@ -1825,16 +1977,17 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
                     goto vm_abort;
                 }
             }
-            break;
+            DISPATCH();
 
         case BC_CALL: case BC_CALL_METHOD: case BC_CALL_ELEM: case BC_NEW: {
+            uint8_t saved_op = *(ip - 1);
             uint16_t name_idx = 0;
-            if (op == BC_CALL_METHOD) name_idx = rd16(&ip);
+            if (saved_op == BC_CALL_METHOD) name_idx = rd16(&ip);
             uint16_t argc = rd16(&ip);
 
-            LRValue argbuf[BC_ARG_STATIC];
+            LRValue argbuf[8];
             LRValue *argv = argbuf;
-            if (argc > BC_ARG_STATIC) {
+            if (argc > 8) {
                 argv = (LRValue *)malloc(sizeof(LRValue) * argc);
                 if (!argv) goto vm_abort;
             }
@@ -1842,22 +1995,22 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
 
             LRValue callee = LR_VALUE_UNDEFINED, this_val = LR_VALUE_UNDEFINED;
             LRValue key = LR_VALUE_UNDEFINED;
-            if (op == BC_CALL_METHOD) {
+            if (saved_op == BC_CALL_METHOD) {
                 this_val = POP();
                 callee = lr_get_property_str(ctx, this_val, prog->pool[name_idx].u.str);
-            } else if (op == BC_CALL_ELEM) {
+            } else if (saved_op == BC_CALL_ELEM) {
                 key = POP();
                 this_val = POP();
                 LRString *atom = lr_to_atom(ctx, key);
                 callee = lr_get_property(ctx, this_val, atom);
             } else {
                 callee = POP();
-                this_val = (op == BC_NEW) ? LR_VALUE_UNDEFINED : lr_get_global_object(ctx);
+                this_val = (saved_op == BC_NEW) ? LR_VALUE_UNDEFINED : lr_get_global_object(ctx);
             }
 
             LRValue r;
-            if (op == BC_NEW) r = interp_bc_construct(interp, callee, (int)argc, argv);
-            else              r = interp_bc_call(interp, callee, this_val, (int)argc, argv);
+            if (saved_op == BC_NEW) r = interp_bc_construct(interp, callee, (int)argc, argv);
+            else                   r = interp_bc_call(interp, callee, this_val, (int)argc, argv);
 
             for (int i = 0; i < (int)argc; i++) FREE_IF_HEAP(ctx, argv[i]);
             if (argv != argbuf) free(argv);
@@ -1869,7 +2022,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
                 goto vm_abort;
             }
             PUSH(r);
-            break;
+            DISPATCH();
         }
 
         case BC_RETURN: {
@@ -1879,33 +2032,33 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             goto vm_done;
         }
 
-        case BC_NEW_OBJECT: PUSH(lr_new_object(ctx)); break;
+        case BC_NEW_OBJECT: PUSH(lr_new_object(ctx)); DISPATCH();
         case BC_NEW_ARRAY: {
             uint16_t n = rd16(&ip);
             if (sp < n) goto vm_abort;
             LRValue arr = lr_new_array(ctx);
             for (int i = (int)n - 1; i >= 0; i--) {
                 LRValue v = POP();
-                lr_set_property_uint32(ctx, arr, (uint32_t)i, v);  /* takes ownership */
+                lr_set_property_uint32(ctx, arr, (uint32_t)i, v);
             }
             lr_set_property_str(ctx, arr, "length", lr_new_int32(ctx, (int32_t)n));
             PUSH(arr);
-            break;
+            DISPATCH();
         }
         case BC_DEF_PROP: {
             uint16_t si = rd16(&ip);
             if (sp < 2) goto vm_abort;
             LRValue v = POP();
-            lr_set_property_str(ctx, stack[sp - 1], prog->pool[si].u.str, v); /* owns v */
-            break;
+            lr_set_property_str(ctx, stack[sp - 1], prog->pool[si].u.str, v);
+            DISPATCH();
         }
         case BC_DEF_ELEM: {
             if (sp < 3) goto vm_abort;
             LRValue v = POP(), k = POP();
             LRString *atom = lr_to_atom(ctx, k);
-            lr_set_property(ctx, stack[sp - 1], atom, v);   /* owns v */
+            lr_set_property(ctx, stack[sp - 1], atom, v);
             FREE_IF_HEAP(ctx, k);
-            break;
+            DISPATCH();
         }
         case BC_GET_PROP: {
             uint16_t si = rd16(&ip);
@@ -1914,7 +2067,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             FREE_IF_HEAP(ctx, o);
             CHECK();
             PUSH(v);
-            break;
+            DISPATCH();
         }
         case BC_SET_PROP: {
             uint16_t si = rd16(&ip);
@@ -1923,7 +2076,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             lr_set_property_str(ctx, o, prog->pool[si].u.str, lr_dup_value(ctx, v));
             FREE_IF_HEAP(ctx, o);
             PUSH(v);
-            break;
+            DISPATCH();
         }
         case BC_GET_ELEM: {
             if (sp < 2) goto vm_abort;
@@ -1934,7 +2087,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             FREE_IF_HEAP(ctx, o);
             CHECK();
             PUSH(v);
-            break;
+            DISPATCH();
         }
         case BC_SET_ELEM: {
             if (sp < 3) goto vm_abort;
@@ -1944,7 +2097,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             FREE_IF_HEAP(ctx, k);
             FREE_IF_HEAP(ctx, o);
             PUSH(v);
-            break;
+            DISPATCH();
         }
         case BC_DELETE_PROP: {
             uint16_t si = rd16(&ip);
@@ -1953,7 +2106,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             lr_delete_property(ctx, o, atom, 0);
             FREE_IF_HEAP(ctx, o);
             PUSH(lr_new_bool(ctx, 1));
-            break;
+            DISPATCH();
         }
         case BC_DELETE_ELEM: {
             if (sp < 2) goto vm_abort;
@@ -1963,7 +2116,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             FREE_IF_HEAP(ctx, k);
             FREE_IF_HEAP(ctx, o);
             PUSH(lr_new_bool(ctx, 1));
-            break;
+            DISPATCH();
         }
 
         case BC_ITER_INIT: {
@@ -1997,13 +2150,13 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             PUSH(src);
             PUSH(nextfn);
             PUSH(lr_new_int32(ctx, index));
-            break;
+            DISPATCH();
         }
         case BC_ITER_NEXT: {
             int32_t off = rd32(&ip);
             if (sp < 3) goto vm_abort;
             int32_t index = stack[sp - 1].u.int32;
-            if (index == -2) { ip += off; break; }
+            if (index == -2) { ip += off; DISPATCH(); }
             if (index >= 0) {
                 LRValue src = stack[sp - 3];
                 if (lr_is_string(src)) {
@@ -2012,7 +2165,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
                     if ((size_t)index >= slen) {
                         lr_free_cstring(ctx, s);
                         ip += off;
-                        break;
+                        DISPATCH();
                     }
                     char buf[2];
                     buf[0] = s[index];
@@ -2025,7 +2178,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
                     LRValue lv = lr_get_property_str(ctx, src, "length");
                     lr_to_int32(ctx, &len, lv);
                     lr_free_value(ctx, lv);
-                    if (index >= len) { ip += off; break; }
+                    if (index >= len) { ip += off; DISPATCH(); }
                     LRValue item = lr_get_property_uint32(ctx, src, (uint32_t)index);
                     stack[sp - 1].u.int32 = index + 1;
                     PUSH(item);
@@ -2039,12 +2192,12 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
                 LRValue done = lr_get_property_str(ctx, nr, "done");
                 int is_done = lr_to_bool(ctx, done);
                 lr_free_value(ctx, done);
-                if (is_done) { FREE_IF_HEAP(ctx, nr); ip += off; break; }
+                if (is_done) { FREE_IF_HEAP(ctx, nr); ip += off; DISPATCH(); }
                 LRValue v = lr_get_property_str(ctx, nr, "value");
                 FREE_IF_HEAP(ctx, nr);
                 PUSH(v);
             }
-            break;
+            DISPATCH();
         }
         case BC_ITER_CLOSE: {
             if (sp < 3) goto vm_abort;
@@ -2052,13 +2205,13 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             (void)idx;
             FREE_IF_HEAP(ctx, nf);
             FREE_IF_HEAP(ctx, src);
-            break;
+            DISPATCH();
         }
 
-        case BC_SCOPE_ENTER: interp_bc_push_scope(interp); scope_depth++; break;
+        case BC_SCOPE_ENTER: interp_bc_push_scope(interp); scope_depth++; DISPATCH();
         case BC_SCOPE_LEAVE:
             if (scope_depth > 0) { interp_bc_pop_scope(interp); scope_depth--; }
-            break;
+            DISPATCH();
 
         case BC_EVAL_NODE: {
             uint16_t si = rd16(&ip);
@@ -2069,25 +2222,25 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
                 goto vm_abort;
             }
             PUSH(v);
-            break;
+            DISPATCH();
         }
         case BC_EVAL_NODE_POP: {
             uint16_t si = rd16(&ip);
             LRValue v = interp_bc_eval_node(interp, (ASTNode *)prog->pool[si].u.node);
             FREE_IF_HEAP(ctx, v);
             CHECK();
-            break;
+            DISPATCH();
         }
         case BC_SET_RESULT: {
             LRValue v = POP();
             FREE_IF_HEAP(ctx, result);
             result = v;
-            break;
+            DISPATCH();
         }
         case BC_CLEAR_RESULT:
             FREE_IF_HEAP(ctx, result);
             result = LR_VALUE_UNDEFINED;
-            break;
+            DISPATCH();
 
         case BC_THROW: {
             LRValue v = POP();
@@ -2098,8 +2251,11 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
 
         default:
             goto vm_abort;
-        }
-    }
+
+#if !LR_THREADED_CODE
+        } /* switch */
+    }   /* for(;;) */
+#endif  /* !LR_THREADED_CODE */
 
 vm_done:
     while (sp > 0) { LRValue v = stack[--sp]; FREE_IF_HEAP(ctx, v); }
