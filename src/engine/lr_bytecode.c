@@ -730,6 +730,10 @@ static void cexpr(BCComp *c, ASTNode *n)
         emit_name_op(c, BC_LOAD_VAR, n->u.ident.name);
         break;
 
+    case AST_THIS:
+        emit(c, BC_PUSH_THIS);
+        break;
+
     case AST_BINARY: {
         const char *op = n->u.binary.op;
         if (!strcmp(op, "&&")) {
@@ -1270,6 +1274,11 @@ static void cstmt(BCComp *c, ASTNode *n, int top)
         emit(c, BC_NOP);
         break;
 
+    case AST_FUNC_DECL:
+        emit_eval(c, n, 0);
+        if (top) emit(c, BC_CLEAR_RESULT);
+        break;
+
     default:
         /* Functions, classes, try/catch, for-in, with, modules, … */
         emit_eval(c, n, 0);
@@ -1683,6 +1692,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
         DOP(BC_PUSH_NULL,      push_null)
         DOP(BC_PUSH_TRUE,      push_true)
         DOP(BC_PUSH_FALSE,     push_false)
+        DOP(BC_PUSH_THIS,      push_this)
         DOP(BC_PUSH_INT32,     push_int32)
         DOP(BC_PUSH_FLOAT64,   push_float64)
         DOP(BC_PUSH_STRING,    push_string)
@@ -1794,6 +1804,12 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
         case BC_PUSH_NULL:      PUSH(LR_VALUE_NULL); DISPATCH();
         case BC_PUSH_TRUE:      PUSH(lr_new_bool(ctx, 1)); DISPATCH();
         case BC_PUSH_FALSE:     PUSH(lr_new_bool(ctx, 0)); DISPATCH();
+        case BC_PUSH_THIS: {
+            LRValue tv;
+            interp_bc_push_this(interp, &tv);
+            PUSH(tv);
+            DISPATCH();
+        }
         case BC_PUSH_INT32:     PUSH(lr_new_int32(ctx, rd32(&ip))); DISPATCH();
         case BC_PUSH_FLOAT64: {
             uint16_t si = rd16(&ip);
@@ -2425,6 +2441,7 @@ static BCInfo bc_info(uint8_t op)
     case BC_PUSH_NULL: t.name = "PUSH_NULL"; break;
     case BC_PUSH_TRUE: t.name = "PUSH_TRUE"; break;
     case BC_PUSH_FALSE: t.name = "PUSH_FALSE"; break;
+    case BC_PUSH_THIS: t.name = "PUSH_THIS"; break;
     case BC_PUSH_INT32: t.name = "PUSH_INT32"; t.operands = 2; break;
     case BC_PUSH_FLOAT64: t.name = "PUSH_FLOAT64"; t.operands = 1; break;
     case BC_PUSH_STRING: t.name = "PUSH_STRING"; t.operands = 1; break;

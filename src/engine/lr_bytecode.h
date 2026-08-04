@@ -39,6 +39,7 @@ typedef enum {
     BC_PUSH_NULL,
     BC_PUSH_TRUE,
     BC_PUSH_FALSE,
+    BC_PUSH_THIS,         /* push current `this` value                    */
     BC_PUSH_INT32,        /* i32                                          */
     BC_PUSH_FLOAT64,      /* u16 pool                                     */
     BC_PUSH_STRING,       /* u16 pool                                     */

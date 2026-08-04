@@ -294,7 +294,10 @@ void lr_free_object(LRRuntime *rt, LRObject *obj)
     }
     /* Free extra data */
     if (obj->extra) {
-        if (obj->type == LR_OBJ_CFUNCTION) {
+        if (obj->type == LR_OBJ_FUNCTION) {
+            /* AST owned by LREvalUnit, just NULL the pointer */
+            obj->extra = NULL;
+        } else if (obj->type == LR_OBJ_CFUNCTION) {
             LRCFunction *cf = (LRCFunction *)obj->extra;
             if (cf) {
                 free((void *)cf->name);
@@ -2908,6 +2911,17 @@ void lr_context_free_persistent_interp(LRContext *ctx)
     LRPersistentInterp *ps = (LRPersistentInterp *)ctx->persistent_interp;
     if (!ps) return;
     interp_free(&ps->interp);
+
+    /* Before freeing AST units, NULL all LR_OBJ_FUNCTION->extra pointers
+     * that point into those ASTs, preventing dangling pointer access. */
+    LRObject *o = ctx->rt->obj_list;
+    while (o) {
+        if (o->type == LR_OBJ_FUNCTION && o->extra) {
+            o->extra = NULL;
+        }
+        o = o->gc_next;
+    }
+
     /* Free compiled cache entries (the BCPrograms are freed by lr_eval_unit_free) */
     for (int i = 0; i < 64; i++) {
         struct LRCompiledCacheEntry *ce = ps->compiled_cache[i];
@@ -3341,8 +3355,54 @@ LRValue lr_engine_build_function(LRContext *ctx, int nparams,
     snprintf(buf + off, sizeof(buf) - off, "){%s})", body ? body : "");
     LRValue r = lr_engine_eval_source(ctx, buf, strlen(buf), 0,
                                       "<anonymous>", NULL, NULL);
-    /* The result of evaluating (function(...){...}) is the function object.
-     * Errors are already set on the context. */
+    if (r.tag != LR_TYPE_OBJECT) return r;
+
+    LRObject *obj = (LRObject *)r.u.ptr;
+    if (obj->type != LR_OBJ_FUNCTION) return r;
+
+    /* new Function() always runs in global scope, never captures a lexical
+     * closure. Clear def_scope so the interpreter doesn't try to use it. */
+    if (obj->def_scope && lr_closure_scope_release) {
+        lr_closure_scope_release(obj->def_scope, ctx);
+        obj->def_scope = NULL;
+    }
+
+    /* Eagerly compile the function body into a BCProgram so the function
+     * can execute independently of the eval unit's AST. Store it in
+     * obj->opaque; the interpreter's function-call path checks opaque
+     * for a BCProgram before falling back to the AST via obj->extra. */
+    ASTNode *func_ast = (ASTNode *)obj->extra;
+    if (func_ast) {
+        BCProgram *prog = bc_new_program();
+        if (prog && bc_compile(prog, func_ast->u.func.body, 0) == 0) {
+            obj->opaque = prog;
+            obj->opaque_free = (void (*)(void *))bc_free_program;
+        } else if (prog) {
+            bc_free_program(prog);
+        }
+    }
+
+    /* Break the AST dependency: new Function objects must not hold
+     * pointers into the eval unit's AST, which will be freed below. */
+    obj->extra = NULL;
+
+    /* Immediately unlink and free the eval unit so it does not accumulate
+     * in the persistent interpreter's unit list. The BCProgram in
+     * obj->opaque is the only thing the function needs. */
+    LRPersistentInterp *ps = (LRPersistentInterp *)ctx->persistent_interp;
+    if (ps) {
+        LREvalUnit **pp = &ps->units;
+        while (*pp) {
+            LREvalUnit *u = *pp;
+            /* Find the unit that owns this function's AST. Since
+             * lr_engine_eval_source creates exactly one unit for this
+             * source, we free the most recently appended unit (head). */
+            *pp = u->next;
+            lr_eval_unit_free(u);
+            break;  /* one unit per new Function call */
+        }
+    }
+
     return r;
 }
 

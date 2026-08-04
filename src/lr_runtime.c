@@ -9,6 +9,11 @@
 #include "lr_runtime.h"
 #include "lr_renderer.h"
 
+/* Forward-declare interp functions (cannot include lr_interp.h on Windows
+ * due to TokenType collision with winnt.h). */
+void interp_precompile_all_bodies(struct ASTNode *ast);
+int  interp_precompile_bodies_cas(struct ASTNode *ast);
+
 /* ── Global renderer bridge (shared across all Canvas instances) ───────── */
 
 LR_RendererBridge *g_lr_renderer_bridge = NULL;
@@ -712,6 +717,12 @@ static int lr_exec_file_cached(LR_Runtime *rt, const char *filename,
             int warm_module = (mf.flags & LR_IOME586_FLAG_MODULE) ? 1 : 0;
             if (rt->iome586.restore_globals)
                 lr_iome586_restore_globals(&rt->iome586, ctx, &mf);
+            /* Eagerly pre-compile all function bodies before execution.
+             * Uses CAS-safe cache insertion; for small scripts (<8 bodies)
+             * this is a net win because lazy compilation overhead is
+             * eliminated. */
+            interp_precompile_bodies_cas(ast);
+
             /* Execute with pre-compiled bytecode if available (v0.1.1+),
              * otherwise compile from deserialized AST. */
             LRValue result;

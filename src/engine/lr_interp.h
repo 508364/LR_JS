@@ -133,6 +133,9 @@ LRValue interp_bc_eval_node(Interpreter *interp, ASTNode *node);
  * and returns 0 (*out is undefined). */
 int  interp_bc_load_var(Interpreter *interp, const char *name, LRValue *out);
 
+/* Push `this` from the current scope chain onto the stack. */
+void interp_bc_push_this(Interpreter *interp, LRValue *out);
+
 /* typeof-style read: never throws. Returns 1 if the binding exists. */
 int  interp_bc_typeof_var(Interpreter *interp, const char *name, LRValue *out);
 
@@ -161,6 +164,13 @@ void interp_bc_pop_scope(Interpreter *interp);
 
 /* Cook (unescape) a raw template-literal fragment. Caller frees. */
 char *interp_bc_cook_template(const char *raw);
+
+/* ── Parallel body precompilation (IOME586 CAS work-stealing) ─────────── */
+
+void interp_precompile_all_bodies(ASTNode *ast);
+int  interp_precompile_bodies_cas(ASTNode *ast);
+int  interp_collect_all_bodies(ASTNode *ast, ASTNode ***bodies_out, int *count_out);
+void *interp_compile_body_cas(ASTNode *body);
 
 #ifdef __cplusplus
 }

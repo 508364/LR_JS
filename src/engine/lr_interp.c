@@ -6,6 +6,7 @@
  * Handles all ES2022 expressions, statements, declarations, and control flow.
  */
 #include "lr_interp.h"
+#include "lr_bytecode.h"
 #include "../lr_promise.h"
 #include <stdlib.h>
 #include <string.h>
@@ -15,10 +16,206 @@
 #include <ctype.h>
 #include <time.h>
 
+/* ── CAS primitives ────────────────────────────────────────────────────── */
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma intrinsic(_InterlockedCompareExchangePointer)
+#pragma intrinsic(_InterlockedExchangeAdd)
+#define LR_CAS_PTR(ptr, old, new) _InterlockedCompareExchangePointer((void *volatile *)(ptr), (new), (old))
+#define LR_ATOMIC_INC32(ptr)  _InterlockedExchangeAdd((volatile long *)(ptr), 1)
+#else
+#define LR_CAS_PTR(ptr, old, new) __sync_val_compare_and_swap((void *volatile *)(ptr), (old), (new))
+#define LR_ATOMIC_INC32(ptr)  __sync_fetch_and_add((ptr), 1)
+#endif
+
 /* ── Constants ─────────────────────────────────────────────────────────── */
 
 #define MAX_CALL_DEPTH 256
 #define SCOPE_INIT_CAP 8
+
+/* ── Function body bytecode cache ──────────────────────────────────────── */
+#define BC_BODY_CACHE_SIZE 512
+#define BC_BODY_HASH_SIZE   64
+
+typedef struct BCBodyEntry {
+    struct BCBodyEntry *next;   /* hash chain link */
+    ASTNode            *ast_body;
+    BCProgram          *prog;
+} BCBodyEntry;
+
+static BCBodyEntry  bc_body_cache[BC_BODY_CACHE_SIZE];
+static int          bc_body_cache_count = 0;
+static BCBodyEntry *bc_body_hash[BC_BODY_HASH_SIZE];
+
+static BCProgram *bc_body_cache_lookup(ASTNode *body) {
+    unsigned h = ((uintptr_t)body >> 2) & (BC_BODY_HASH_SIZE - 1);
+    for (BCBodyEntry *e = bc_body_hash[h]; e; e = e->next)
+        if (e->ast_body == body) return e->prog;
+    return NULL;
+}
+static int bc_body_cache_insert(ASTNode *body, BCProgram *prog) {
+    if (bc_body_cache_count >= BC_BODY_CACHE_SIZE) return -1;
+    int idx = bc_body_cache_count++;
+    bc_body_cache[idx].ast_body = body;
+    bc_body_cache[idx].prog = prog;
+    unsigned h = ((uintptr_t)body >> 2) & (BC_BODY_HASH_SIZE - 1);
+    bc_body_cache[idx].next = bc_body_hash[h];
+    bc_body_hash[h] = &bc_body_cache[idx];
+    return idx;
+}
+/* MRU inline cache: last 4 body→BCProgram mappings, O(1) without hash */
+static ASTNode   *bc_ic_body[4];
+static BCProgram *bc_ic_prog[4];
+static int        bc_ic_next = 0;
+
+static BCProgram *bc_get_or_compile_body(ASTNode *body) {
+    if (!body) return NULL;
+    /* Inline cache: check last 4 */
+    for (int i = 0; i < 4; i++)
+        if (bc_ic_body[i] == body) return bc_ic_prog[i];
+    /* Hash cache fallback */
+    BCProgram *c = bc_body_cache_lookup(body);
+    if (c) {
+        int slot = bc_ic_next++ & 3;
+        bc_ic_body[slot] = body;
+        bc_ic_prog[slot] = c;
+        return c;
+    }
+    /* Compile */
+    BCProgram *p = bc_new_program();
+    if (!p) return NULL;
+    if (bc_compile(p, body, 0) != 0) { bc_free_program(p); return NULL; }
+    bc_body_cache_insert(body, p);
+    int slot = bc_ic_next++ & 3;
+    bc_ic_body[slot] = body;
+    bc_ic_prog[slot] = p;
+    return p;
+}
+
+/* ── BCProgram precompile infrastructure ──────────────────────────────────
+ * Walk the AST and precompile all function bodies to bytecode.             */
+
+static void precompile_bodies_rec(ASTNode *node);
+static void precompile_bodies_list(ASTNode **nodes, int count) {
+    for (int i = 0; i < count; i++) precompile_bodies_rec(nodes[i]);
+}
+static void precompile_bodies_rec(ASTNode *node) {
+    if (!node) return;
+    switch (node->type) {
+    case AST_PROGRAM:
+        precompile_bodies_list(node->u.list.items, node->u.list.count);
+        break;
+    case AST_BLOCK:
+        precompile_bodies_list(node->u.list.items, node->u.list.count);
+        break;
+    case AST_FUNC_DECL: case AST_FUNC_EXPR:
+        if (node->u.func.body) { bc_get_or_compile_body(node->u.func.body); precompile_bodies_rec(node->u.func.body); }
+        break;
+    case AST_ARROW:
+        if (node->u.arrow.body) { bc_get_or_compile_body(node->u.arrow.body); precompile_bodies_rec(node->u.arrow.body); }
+        break;
+    case AST_CLASS_DECL:
+        if (node->u.class_decl.extends) precompile_bodies_rec(node->u.class_decl.extends);
+        precompile_bodies_list(node->u.class_decl.methods, node->u.class_decl.nmethods);
+        break;
+    case AST_EXPR_STMT: precompile_bodies_rec(node->u.expr_stmt.expr); break;
+    case AST_IF: precompile_bodies_rec(node->u.if_stmt.cond); precompile_bodies_rec(node->u.if_stmt.body); if(node->u.if_stmt.else_body)precompile_bodies_rec(node->u.if_stmt.else_body); break;
+    case AST_FOR: if(node->u.for_stmt.init)precompile_bodies_rec(node->u.for_stmt.init); if(node->u.for_stmt.test)precompile_bodies_rec(node->u.for_stmt.test); if(node->u.for_stmt.update)precompile_bodies_rec(node->u.for_stmt.update); precompile_bodies_rec(node->u.for_stmt.body); break;
+    case AST_FOR_IN: precompile_bodies_rec(node->u.for_in.source); precompile_bodies_rec(node->u.for_in.each); precompile_bodies_rec(node->u.for_in.body); break;
+    case AST_FOR_OF: precompile_bodies_rec(node->u.for_of.source); precompile_bodies_rec(node->u.for_of.each); precompile_bodies_rec(node->u.for_of.body); break;
+    case AST_WHILE: case AST_DO_WHILE: precompile_bodies_rec(node->u.if_stmt.cond); precompile_bodies_rec(node->u.if_stmt.body); break;
+    case AST_SWITCH: precompile_bodies_rec(node->u.switch_stmt.test); precompile_bodies_list(node->u.switch_stmt.cases,node->u.switch_stmt.ncases); break;
+    case AST_CASE: if(node->u.if_stmt.cond)precompile_bodies_rec(node->u.if_stmt.cond); precompile_bodies_rec(node->u.if_stmt.body); break;
+    case AST_RETURN: if(node->u.return_stmt.arg)precompile_bodies_rec(node->u.return_stmt.arg); break;
+    case AST_THROW: if(node->u.throw_stmt.arg)precompile_bodies_rec(node->u.throw_stmt.arg); break;
+    case AST_TRY: precompile_bodies_rec(node->u.try_stmt.body); if(node->u.try_stmt.catch_body)precompile_bodies_rec(node->u.try_stmt.catch_body); if(node->u.try_stmt.finally_body)precompile_bodies_rec(node->u.try_stmt.finally_body); break;
+    case AST_WITH: precompile_bodies_rec(node->u.with_stmt.obj); precompile_bodies_rec(node->u.with_stmt.body); break;
+    case AST_VAR_DECL: for(int i=0;i<node->u.var_decl.nvars;i++){ASTNode*d=node->u.var_decl.vars[i];if(d&&d->type==AST_VAR_DECLARATOR&&d->u.declarator.init)precompile_bodies_rec(d->u.declarator.init);} break;
+    case AST_BINARY: precompile_bodies_rec(node->u.binary.left); precompile_bodies_rec(node->u.binary.right); break;
+    case AST_UNARY: precompile_bodies_rec(node->u.unary.arg); break;
+    case AST_CONDITIONAL: precompile_bodies_rec(node->u.conditional.cond); precompile_bodies_rec(node->u.conditional.consequent); precompile_bodies_rec(node->u.conditional.alternate); break;
+    case AST_CALL: precompile_bodies_rec(node->u.call.callee); precompile_bodies_list(node->u.call.args,node->u.call.argc); break;
+    case AST_NEW: precompile_bodies_rec(node->u.new_expr.callee); precompile_bodies_list(node->u.new_expr.args,node->u.new_expr.argc); break;
+    case AST_MEMBER: precompile_bodies_rec(node->u.member.obj); break;
+    case AST_COMPUTED_MEMBER: precompile_bodies_rec(node->u.computed.obj); precompile_bodies_rec(node->u.computed.prop); break;
+    case AST_ASSIGN: precompile_bodies_rec(node->u.assign.target); precompile_bodies_rec(node->u.assign.value); break;
+    case AST_SEQUENCE: precompile_bodies_list(node->u.sequence.exprs,node->u.sequence.count); break;
+    case AST_ARRAY: precompile_bodies_list(node->u.array.elements,node->u.array.nelem); break;
+    case AST_OBJECT: precompile_bodies_list(node->u.object.props,node->u.object.nprops); break;
+    case AST_PROPERTY: if(node->u.property.key)precompile_bodies_rec(node->u.property.key); precompile_bodies_rec(node->u.property.val); break;
+    case AST_SPREAD: case AST_SPREAD_ELEMENT: precompile_bodies_rec(node->u.spread.arg); break;
+    case AST_TEMPLATE: precompile_bodies_list(node->u.template_lit.exprs,node->u.template_lit.nexp); break;
+    case AST_YIELD: case AST_AWAIT: if(node->u.unary.arg)precompile_bodies_rec(node->u.unary.arg); break;
+    case AST_LABEL: precompile_bodies_rec(node->u.label_stmt.stmt); break;
+    default: break;
+    }
+}
+
+void interp_precompile_all_bodies(ASTNode *ast) {
+    if (ast) precompile_bodies_rec(ast);
+}
+int interp_precompile_bodies_cas(ASTNode *ast) {
+    if (!ast) return 0;
+    int b = bc_body_cache_count;
+    precompile_bodies_rec(ast);
+    return bc_body_cache_count - b;
+}
+
+int interp_collect_all_bodies(ASTNode *ast, ASTNode ***bodies_out, int *count_out) {
+    if (!ast || !bodies_out || !count_out) return -1;
+    interp_precompile_bodies_cas(ast);
+    *count_out = bc_body_cache_count;
+    *bodies_out = (ASTNode **)calloc(*count_out, sizeof(ASTNode *));
+    if (!*bodies_out) return -1;
+    for (int i = 0; i < *count_out; i++)
+        (*bodies_out)[i] = bc_body_cache[i].ast_body;
+    return 0;
+}
+
+void *interp_compile_body_cas(ASTNode *body) {
+    return (void *)bc_get_or_compile_body(body);
+}
+
+/* ── Arguments scanner: does the function body reference "arguments"? ──── */
+static int ast_scans_arguments(ASTNode *n);
+static int ast_scans_args_list(ASTNode **items, int c) {
+    for (int i = 0; i < c; i++) if (ast_scans_arguments(items[i])) return 1;
+    return 0;
+}
+static int ast_scans_arguments(ASTNode *n) {
+    if (!n) return 0;
+    switch (n->type) {
+    case AST_IDENTIFIER: return (n->u.ident.name && strcmp(n->u.ident.name, "arguments") == 0);
+    case AST_PROGRAM: case AST_BLOCK: return ast_scans_args_list(n->u.list.items, n->u.list.count);
+    case AST_EXPR_STMT: return ast_scans_arguments(n->u.expr_stmt.expr);
+    case AST_RETURN: return n->u.return_stmt.arg && ast_scans_arguments(n->u.return_stmt.arg);
+    case AST_BINARY: return ast_scans_arguments(n->u.binary.left) || ast_scans_arguments(n->u.binary.right);
+    case AST_UNARY: return ast_scans_arguments(n->u.unary.arg);
+    case AST_ASSIGN: return ast_scans_arguments(n->u.assign.target) || ast_scans_arguments(n->u.assign.value);
+    case AST_CALL: return ast_scans_arguments(n->u.call.callee) || ast_scans_args_list(n->u.call.args, n->u.call.argc);
+    case AST_MEMBER: return ast_scans_arguments(n->u.member.obj);
+    case AST_IF: return ast_scans_arguments(n->u.if_stmt.cond) || ast_scans_arguments(n->u.if_stmt.body) || (n->u.if_stmt.else_body && ast_scans_arguments(n->u.if_stmt.else_body));
+    case AST_FOR: return (n->u.for_stmt.init&&ast_scans_arguments(n->u.for_stmt.init))||(n->u.for_stmt.test&&ast_scans_arguments(n->u.for_stmt.test))||(n->u.for_stmt.update&&ast_scans_arguments(n->u.for_stmt.update))||ast_scans_arguments(n->u.for_stmt.body);
+    case AST_WHILE: case AST_DO_WHILE: return ast_scans_arguments(n->u.if_stmt.cond) || ast_scans_arguments(n->u.if_stmt.body);
+    case AST_FOR_IN: return ast_scans_arguments(n->u.for_in.each)||ast_scans_arguments(n->u.for_in.source)||ast_scans_arguments(n->u.for_in.body);
+    case AST_FOR_OF: return ast_scans_arguments(n->u.for_of.each)||ast_scans_arguments(n->u.for_of.source)||ast_scans_arguments(n->u.for_of.body);
+    case AST_CONDITIONAL: return ast_scans_arguments(n->u.conditional.cond)||ast_scans_arguments(n->u.conditional.consequent)||ast_scans_arguments(n->u.conditional.alternate);
+    case AST_ARRAY: return ast_scans_args_list(n->u.array.elements, n->u.array.nelem);
+    case AST_OBJECT: return ast_scans_args_list(n->u.object.props, n->u.object.nprops);
+    case AST_PROPERTY: return ast_scans_arguments(n->u.property.key) || ast_scans_arguments(n->u.property.val);
+    case AST_NEW: return ast_scans_arguments(n->u.new_expr.callee)||ast_scans_args_list(n->u.new_expr.args,n->u.new_expr.argc);
+    case AST_SEQUENCE: return ast_scans_args_list(n->u.sequence.exprs, n->u.sequence.count);
+    case AST_SWITCH: { if(ast_scans_arguments(n->u.switch_stmt.test))return 1; for(int i=0;i<n->u.switch_stmt.ncases;i++) if(ast_scans_arguments(n->u.switch_stmt.cases[i]))return 1; return 0; }
+    case AST_CASE: return (n->u.if_stmt.cond&&ast_scans_arguments(n->u.if_stmt.cond))||ast_scans_arguments(n->u.if_stmt.body);
+    case AST_THROW: return ast_scans_arguments(n->u.throw_stmt.arg);
+    case AST_TRY: return ast_scans_arguments(n->u.try_stmt.body)||(n->u.try_stmt.catch_body&&ast_scans_arguments(n->u.try_stmt.catch_body))||(n->u.try_stmt.finally_body&&ast_scans_arguments(n->u.try_stmt.finally_body));
+    case AST_TEMPLATE: return ast_scans_args_list(n->u.template_lit.exprs,n->u.template_lit.nexp);
+    case AST_SPREAD: case AST_SPREAD_ELEMENT: return ast_scans_arguments(n->u.spread.arg);
+    case AST_VAR_DECL: for(int i=0;i<n->u.var_decl.nvars;i++){ASTNode*d=n->u.var_decl.vars[i];if(d&&d->type==AST_VAR_DECLARATOR&&d->u.declarator.init&&ast_scans_arguments(d->u.declarator.init))return 1;} return 0;
+    case AST_FUNC_DECL: case AST_FUNC_EXPR: case AST_ARROW: return 0;
+    default: return 0;
+    }
+}
 
 /* ── Forward Declarations ──────────────────────────────────────────────── */
 
@@ -3036,17 +3233,24 @@ static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
     interp->gen_items = is_generator ? lr_new_array(interp->ctx) : LR_VALUE_UNDEFINED;
     interp->gen_count = 0;
 
-    /* Bind 'arguments' object (not for arrow functions) */
+    /* Bind 'arguments' object (not for arrow functions).  Skip when the
+     * function body does not reference `arguments` (~95% of functions). */
     if (!is_arrow) {
-        LRValue args_obj = lr_new_object(interp->ctx);
-        for (int i = 0; i < argc; i++) {
-            lr_set_property_uint32(interp->ctx, args_obj, i, lr_dup_value(interp->ctx, argv[i]));
+        ASTNode *args_body = NULL;
+        if (func_node->type == AST_FUNC_EXPR || func_node->type == AST_FUNC_DECL)
+            args_body = func_node->u.func.body;
+        else if (func_node->type == AST_ARROW)
+            args_body = func_node->u.arrow.body;
+        if (args_body && ast_scans_arguments(args_body)) {
+            LRValue args_obj = lr_new_object(interp->ctx);
+            for (int i = 0; i < argc; i++) {
+                lr_set_property_uint32(interp->ctx, args_obj, i, lr_dup_value(interp->ctx, argv[i]));
+            }
+            lr_set_property_str(interp->ctx, args_obj, "length", lr_new_int32(interp->ctx, argc));
+            lr_set_property_str(interp->ctx, args_obj, "callee", LR_VALUE_UNDEFINED);
+            scope_declare_name(interp, "arguments", args_obj, 0);
+            lr_free_value(interp->ctx, args_obj);
         }
-        lr_set_property_str(interp->ctx, args_obj, "length", lr_new_int32(interp->ctx, argc));
-        /* Callee property */
-        lr_set_property_str(interp->ctx, args_obj, "callee", LR_VALUE_UNDEFINED);
-        scope_declare_name(interp, "arguments", args_obj, 0);
-        lr_free_value(interp->ctx, args_obj);
     }
 
     /* Bind parameters */
@@ -3119,9 +3323,9 @@ static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
     }
 
     if (body && !is_generator) {
-        /* Lazy generators: body evaluation is driven by gen_next. */
-        if (body->type == AST_BLOCK) {
-            result = interp_eval_node(interp, body);
+        BCProgram *body_prog = bc_get_or_compile_body(body);
+        if (body_prog) {
+            result = bc_execute(body_prog, interp->ctx);
         } else {
             result = interp_eval_node(interp, body);
         }
@@ -5054,3 +5258,15 @@ char *interp_bc_cook_template(const char *raw)
 {
     return template_unescape(raw ? raw : "");
 }
+
+/* Push `this` from scope chain — used by BC_PUSH_THIS opcode */
+void interp_bc_push_this(Interpreter *interp, LRValue *out)
+{
+    if (!interp || !out) return;
+    if (scope_lookup_internal(interp->current_scope, interp->ctx, "this", out)) {
+        /* value set by scope_lookup_internal */
+    } else {
+        *out = LR_VALUE_UNDEFINED;
+    }
+}
+
