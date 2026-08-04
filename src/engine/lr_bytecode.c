@@ -1279,6 +1279,17 @@ static void cstmt(BCComp *c, ASTNode *n, int top)
         if (top) emit(c, BC_CLEAR_RESULT);
         break;
 
+    /* Arrow function expression body: compile as expression with result */
+    case AST_LITERAL: case AST_IDENTIFIER: case AST_BINARY: case AST_UNARY:
+    case AST_CONDITIONAL: case AST_CALL: case AST_NEW: case AST_MEMBER:
+    case AST_COMPUTED_MEMBER: case AST_ASSIGN: case AST_SEQUENCE:
+    case AST_ARRAY: case AST_OBJECT: case AST_TEMPLATE: case AST_TAGGED_TEMPLATE:
+    case AST_THIS: case AST_SUPER: case AST_SPREAD: case AST_SPREAD_ELEMENT:
+    case AST_OPTIONAL_CALL: case AST_OPTIONAL_MEMBER:
+        cexpr(c, n);
+        emit(c, top ? BC_SET_RESULT : BC_POP);
+        break;
+
     default:
         /* Functions, classes, try/catch, for-in, with, modules, … */
         emit_eval(c, n, 0);
@@ -1416,38 +1427,60 @@ static int bcv_abstract_eq(LRContext *ctx, LRValue a, LRValue b)
  * an extra strdup/free pair by reading the left string's buffer directly. */
 static LRValue bcv_concat(LRContext *ctx, LRValue a, LRValue b)
 {
-    /* Fast path: left side is already a string — use its raw buffer */
+    /* Optimized: build LRString directly, avoiding intermediate buffer.
+     * For string+string: 1 malloc + 2 memcpy (was 2 malloc + 3 memcpy). */
     if (a.tag == LR_TYPE_STRING) {
-        LRString *s = (LRString *)a.u.ptr;
+        LRString *as = (LRString *)a.u.ptr;
+        size_t la = as ? as->len : 0;
+
+        if (b.tag == LR_TYPE_STRING) {
+            LRString *bs = (LRString *)b.u.ptr;
+            size_t lb = bs ? bs->len : 0;
+            size_t total = la + lb;
+            LRString *os = (LRString *)malloc(sizeof(LRString) + total + 1);
+            if (!os) return lr_new_string(ctx, "");
+            if (la) memcpy(os->str, as->str, la);
+            if (lb) memcpy(os->str + la, bs->str, lb);
+            os->str[total] = '\0';
+            os->len = (uint32_t)total;
+            os->ref_count = 1;
+            os->is_atom = 0;
+            LRValue r; r.tag = LR_TYPE_STRING; r.u.ptr = os; return r;
+        }
+
         const char *sb = lr_to_cstring(ctx, b);
         size_t lb = sb ? strlen(sb) : 0;
-        size_t la = s ? s->len : 0;
-        char *buf = (char *)malloc(la + lb + 1);
+        size_t total = la + lb;
+        LRString *os = (LRString *)malloc(sizeof(LRString) + total + 1);
         LRValue out = LR_VALUE_UNDEFINED;
-        if (buf) {
-            if (la) memcpy(buf, s->str, la);
-            if (lb) memcpy(buf + la, sb, lb);
-            buf[la + lb] = '\0';
-            out = lr_new_string_len(ctx, buf, la + lb);
-            free(buf);
+        if (os) {
+            if (la) memcpy(os->str, as->str, la);
+            if (lb) memcpy(os->str + la, sb, lb);
+            os->str[total] = '\0';
+            os->len = (uint32_t)total;
+            os->ref_count = 1;
+            os->is_atom = 0;
+            out.tag = LR_TYPE_STRING; out.u.ptr = os;
         }
         lr_free_cstring(ctx, sb);
         return out.tag != LR_TYPE_UNDEFINED ? out : lr_new_string(ctx, "");
     }
-    /* General path: convert both sides to C strings */
     {
         const char *sa = lr_to_cstring(ctx, a);
         const char *sb = lr_to_cstring(ctx, b);
         size_t la = sa ? strlen(sa) : 0;
         size_t lb = sb ? strlen(sb) : 0;
+        size_t total = la + lb;
+        LRString *os = (LRString *)malloc(sizeof(LRString) + total + 1);
         LRValue out = LR_VALUE_UNDEFINED;
-        char *buf = (char *)malloc(la + lb + 1);
-        if (buf) {
-            if (la) memcpy(buf, sa, la);
-            if (lb) memcpy(buf + la, sb, lb);
-            buf[la + lb] = '\0';
-            out = lr_new_string_len(ctx, buf, la + lb);
-            free(buf);
+        if (os) {
+            if (la) memcpy(os->str, sa, la);
+            if (lb) memcpy(os->str + la, sb, lb);
+            os->str[total] = '\0';
+            os->len = (uint32_t)total;
+            os->ref_count = 1;
+            os->is_atom = 0;
+            out.tag = LR_TYPE_STRING; out.u.ptr = os;
         } else {
             out = lr_new_string(ctx, "");
         }
@@ -1788,7 +1821,15 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
        OPCODE HANDLERS
        Each handler reads operands, executes, then dispatches the next
        opcode via DISPATCH() (direct) or goto vm_next (indirect).
-       ═══════════════════════════════════════════════════════════════════ */
+
+       BC_CASE macro: defines a named label for computed-goto AND a switch
+       case. Direct threading jumps to &&lbl_XXX; indirect falls through.  */
+
+#if LR_THREADED_CODE
+#define BC_CASE(lbl, op) lbl_##lbl: case op
+#else
+#define BC_CASE(lbl, op) case op
+#endif
 
 #if !LR_THREADED_CODE
     for (;;) {

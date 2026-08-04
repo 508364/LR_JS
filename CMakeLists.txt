@@ -191,6 +191,10 @@ target_compile_definitions(lr_js_static PUBLIC LR_JS_BUILD_STATIC)
 # On MSVC, link ws2_32 for sockets
 if(LR_PLATFORM_WINDOWS)
     target_link_libraries(lr_js_static PUBLIC ws2_32 ntdll)
+    if(NOT LR_COMPILER_MSVC)
+        # MinGW: uses libwinpthread and needs explicit -lm
+        target_link_libraries(lr_js_static PUBLIC pthread m)
+    endif()
 endif()
 
 # ── Public shared/DLL library: lr_js_shared ───────────────────────────────
@@ -204,6 +208,9 @@ target_compile_definitions(lr_js_shared PRIVATE LR_JS_BUILD_DLL)
 target_compile_definitions(lr_js_shared PUBLIC LR_JS_USE_DLL)
 if(LR_PLATFORM_WINDOWS)
     target_link_libraries(lr_js_shared PUBLIC ws2_32 ntdll)
+    if(NOT LR_COMPILER_MSVC)
+        target_link_libraries(lr_js_shared PUBLIC pthread m)
+    endif()
 endif()
 
 # Set output name
@@ -220,6 +227,9 @@ target_include_directories(lr_js PRIVATE ${LR_INCLUDE_DIRS})
 target_link_libraries(lr_js PRIVATE lr_js_static)
 if(LR_PLATFORM_WINDOWS)
     target_link_libraries(lr_js PRIVATE ws2_32 ntdll)
+    if(NOT LR_COMPILER_MSVC)
+        target_link_libraries(lr_js PRIVATE pthread m)
+    endif()
 endif()
 
 # On MSVC, set the executable output name

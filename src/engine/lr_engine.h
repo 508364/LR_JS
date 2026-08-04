@@ -113,13 +113,22 @@ struct LRProperty {
 
 /* ── Shape (hidden class) ─────────────────────────────────────────────── */
 
+/* Shape flat-hash: O(1) slot lookup for up to 16 entries. */
+#define SHAPE_FLAT_BITS  4
+#define SHAPE_FLAT_SIZE  (1 << SHAPE_FLAT_BITS)
+#define SHAPE_FLAT_MASK  (SHAPE_FLAT_SIZE - 1)
+#define SHAPE_FLAT_EMPTY 0xFFFF
+
 struct LRShape {
     int32_t    ref_count;
-    LRString  *prop_name;   /* property added at this transition */
-    LRShape   *prev;        /* previous shape in chain */
-    LRShape   *next;        /* next in hash chain */
-    uint32_t   slot_index;  /* property slot index */
+    LRString  *prop_name;
+    LRShape   *prev;
+    LRShape   *next;
+    uint32_t   slot_index;
     uint32_t   hash;
+    LRString  *flat_keys[SHAPE_FLAT_SIZE];
+    uint16_t   flat_slots[SHAPE_FLAT_SIZE];
+    uint8_t    flat_count;
 };
 
 /* ── Dense Array Storage ────────────────────────────────────────────────── */

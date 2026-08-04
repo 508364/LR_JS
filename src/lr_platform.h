@@ -153,9 +153,15 @@ static __inline struct tm *gmtime_r(const time_t *t, struct tm *result)
 #define lr_stat       _stat
 #define lr_unlink     _unlink
 #define lr_access     _access
+#ifndef R_OK
 #define R_OK          4
+#endif
+#ifndef W_OK
 #define W_OK          2
+#endif
+#ifndef X_OK
 #define X_OK          0   /* Windows doesn't have execute permission check */
+#endif
 
 /* Socket operations */
 #define lr_socket_close(s)  closesocket(s)
@@ -224,9 +230,10 @@ static __inline struct tm *gmtime_r(const time_t *t, struct tm *result)
 
 #endif /* LR_PLATFORM_WINDOWS */
 
-/* ── clock_gettime for MSVC (Windows 7+) ────────────────────────────────── */
+/* ── clock_gettime for MSVC (Windows 7+) ──────────────────────────────────
+ * MinGW's winpthreads already provides clock_gettime / nanosleep.      */
 
-#if LR_PLATFORM_WINDOWS
+#if LR_PLATFORM_WINDOWS && LR_COMPILER_MSVC
 
 /* clockid_t for MSVC */
 typedef int clockid_t;
@@ -296,7 +303,7 @@ LR_INLINE int nanosleep(const struct timespec *req, struct timespec *rem)
     return 0;
 }
 
-#endif /* LR_PLATFORM_WINDOWS (clock_gettime) */
+#endif /* LR_PLATFORM_WINDOWS && LR_COMPILER_MSVC (clock_gettime) */
 
 /* ── Time helpers (cross-platform) ─────────────────────────────────────── */
 

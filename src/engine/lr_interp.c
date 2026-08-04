@@ -34,8 +34,34 @@
 #define SCOPE_INIT_CAP 8
 
 /* ── Function body bytecode cache ──────────────────────────────────────── */
-#define BC_BODY_CACHE_SIZE 512
-#define BC_BODY_HASH_SIZE   64
+#define BC_BODY_CACHE_SIZE 1024
+#define BC_BODY_HASH_SIZE   128
+
+/* ── Extends resolution cache ──────────────────────────────────────────
+ * Caches (extends_AST_node → resolved_parent_class) so constructors
+ * don't re-evaluate the extends clause on every `new` call. The AST
+ * node lives for the lifetime of the program; the cache holds a dup'd
+ * reference. Simple direct-mapped hash, collisions just overwrite. */
+#define EXTENDS_CACHE_BITS 8
+#define EXTENDS_CACHE_SIZE (1 << EXTENDS_CACHE_BITS)
+static struct { ASTNode *key; LRValue val; } extends_cache[EXTENDS_CACHE_SIZE];
+
+static LRValue extends_cache_get(ASTNode *ext_ast) {
+    if (!ext_ast) return LR_VALUE_UNDEFINED;
+    unsigned h = ((uintptr_t)ext_ast >> 3) & (EXTENDS_CACHE_SIZE - 1);
+    if (extends_cache[h].key == ext_ast)
+        return extends_cache[h].val;
+    return LR_VALUE_UNDEFINED;
+}
+static void extends_cache_set(LRContext *ctx, ASTNode *ext_ast, LRValue parent) {
+    if (!ext_ast) return;
+    unsigned h = ((uintptr_t)ext_ast >> 3) & (EXTENDS_CACHE_SIZE - 1);
+    /* Free old entry if overwriting */
+    if (extends_cache[h].key && extends_cache[h].val.tag != LR_TYPE_UNDEFINED)
+        lr_free_value(ctx, extends_cache[h].val);
+    extends_cache[h].key = ext_ast;
+    extends_cache[h].val = lr_dup_value(ctx, parent);
+}
 
 typedef struct BCBodyEntry {
     struct BCBodyEntry *next;   /* hash chain link */
@@ -2541,6 +2567,9 @@ static LRValue eval_class_expr(Interpreter *interp, ASTNode *node)
             lr_free_value(ctx, parent);
             return LR_VALUE_UNDEFINED;
         }
+        /* Cache resolved parent for fast super() dispatch */
+        if (lr_is_object(parent))
+            extends_cache_set(ctx, node->u.class_decl.extends, parent);
     }
 
     /* Create the prototype object (inherits from parent.prototype) */
@@ -3223,24 +3252,33 @@ static LRValue interp_call_function(Interpreter *interp, ASTNode *func_node,
     /* Bind 'this' */
     scope_declare_name(interp, "this", this_val, 1); /* const-like */
 
-    /* Bind super references for class methods (derived classes) */
+    /* Bind super references for class methods (derived classes).
+     * Check extends_cache first: avoids re-evaluating extends AST every call. */
     if ((func_node->type == AST_FUNC_EXPR || func_node->type == AST_FUNC_DECL) &&
         func_node->u.func.class_node &&
         func_node->u.func.class_node->u.class_decl.extends) {
-        LRValue parent = interp_eval_node(interp,
-            func_node->u.func.class_node->u.class_decl.extends);
-        if (interp->error_flag) {
-            /* Parent class not resolvable at call time: ignore, super unusable */
-            interp->error_flag = 0;
-            lr_free_value(interp->ctx, parent);
-        } else if (lr_is_object(parent)) {
-            scope_declare_name(interp, "%superctor%", parent, 1);
-            LRValue sproto = lr_get_property_str(interp->ctx, parent, "prototype");
+        ASTNode *ext = func_node->u.func.class_node->u.class_decl.extends;
+        LRValue cached = extends_cache_get(ext);
+        if (lr_is_object(cached)) {
+            scope_declare_name(interp, "%superctor%", lr_dup_value(interp->ctx, cached), 1);
+            LRValue sproto = lr_get_property_str(interp->ctx, cached, "prototype");
             scope_declare_name(interp, "%superproto%", sproto, 1);
             lr_free_value(interp->ctx, sproto);
-            lr_free_value(interp->ctx, parent);
         } else {
-            lr_free_value(interp->ctx, parent);
+            /* Cache miss: re-evaluate extends */
+            LRValue parent = interp_eval_node(interp, ext);
+            if (interp->error_flag) {
+                interp->error_flag = 0;
+                lr_free_value(interp->ctx, parent);
+            } else if (lr_is_object(parent)) {
+                scope_declare_name(interp, "%superctor%", parent, 1);
+                LRValue sproto = lr_get_property_str(interp->ctx, parent, "prototype");
+                scope_declare_name(interp, "%superproto%", sproto, 1);
+                lr_free_value(interp->ctx, sproto);
+                lr_free_value(interp->ctx, parent);
+            } else {
+                lr_free_value(interp->ctx, parent);
+            }
         }
     }
 

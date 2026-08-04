@@ -19,6 +19,10 @@
 #include <stdio.h>
 #include <math.h>
 
+/* Forward declaration to avoid pulling in lr_iome586.h which
+ * transitively includes <windows.h> → winnt.h → TokenType collision. */
+uint64_t lr_iome586_hash64(const uint8_t *data, size_t len);
+
 /* ── Memory Allocation ────────────────────────────────────────────────── */
 
 static void *lr_malloc(LRRuntime *rt, size_t size)
@@ -277,9 +281,11 @@ void lr_free_object(LRRuntime *rt, LRObject *obj)
         }
         obj->prop_hash = NULL;
     }
-    /* Free shape */
+    /* Free shape chain */
     if (obj->shape) {
-        obj->shape->ref_count--;
+        LRShape *s = obj->shape;
+        while (s) { LRShape *prev = s->prev; free(s); s = prev; }
+        obj->shape = NULL;
     }
     /* Free class */
     if (obj->class_def) {
@@ -1319,6 +1325,10 @@ static LRValue lr_primitive_proto_get(LRContext *ctx, const char *ctor_name,
     return result;
 }
 
+/* Forward declarations for shape helpers (defined below after lr_property_get) */
+static int  shape_get_slot(LRObject *o, LRString *atom);
+static void shape_add_prop(LRObject *o, LRString *atom, LRValue val);
+
 LRValue lr_get_property(LRContext *ctx, LRValue obj, LRString *atom)
 {
     /* Primitive values delegate to their wrapper prototypes */
@@ -1407,6 +1417,15 @@ LRValue lr_get_property(LRContext *ctx, LRValue obj, LRString *atom)
         }
     }
 
+    /* Shape flat-hash O(1) read: direct props[] access */
+    if (o->shape && o->props) {
+        int slot = shape_get_slot(o, atom);
+        if (slot >= 0 && (uint32_t)slot < o->prop_count) {
+            LRValue *v = &o->props[slot];
+            if (v->tag != LR_TYPE_UNDEFINED) return lr_dup_value(ctx, *v);
+        }
+    }
+
     /* Shape cache: fast lookup for (obj, atom) pairs we've seen before */
     LRValue *cached = shape_cache_lookup(ctx, o, atom);
     if (cached) {
@@ -1491,25 +1510,78 @@ LRValue lr_get_property_uint32(LRContext *ctx, LRValue obj, uint32_t idx)
     }
 }
 
-/* Shape fast path helper: walk shape chain to find property slot index.
- * Returns >=0 on success, -1 if not found. O(n) in shape chain length. */
+/* ── Shape flat-hash O(1) slot lookup + transition cache ─────────────── */
+
 static int shape_get_slot(LRObject *o, LRString *atom) {
     if (!o || !o->shape || !atom) return -1;
     LRShape *s = o->shape;
+    if (!s->flat_count) {
+        while (s) { if (s->prop_name == atom) return (int)s->slot_index; s = s->prev; }
+        return -1;
+    }
+    unsigned h = ((uintptr_t)atom) & SHAPE_FLAT_MASK;
+    for (unsigned i = 0; i < SHAPE_FLAT_SIZE; i++) {
+        unsigned idx = (h + i) & SHAPE_FLAT_MASK;
+        if (s->flat_keys[idx] == atom) return (int)s->flat_slots[idx];
+        if (!s->flat_keys[idx]) return -1;
+    }
     while (s) { if (s->prop_name == atom) return (int)s->slot_index; s = s->prev; }
     return -1;
 }
-/* Lazy shape init: add new property to shape+props inline. */
+
+#define SHAPE_TRANS_CACHE_SIZE 256
+typedef struct { LRShape *old_shape; LRString *key; LRShape *new_shape; uint32_t slot_index; } ShapeTransEntry;
+static ShapeTransEntry shape_trans_cache[SHAPE_TRANS_CACHE_SIZE];
+static int shape_trans_next = 0;
+
 static void shape_add_prop(LRObject *o, LRString *atom, LRValue val) {
     if (!o || !atom) return;
+    LRShape *old_shape = o->shape;
+    for (int i = 0; i < SHAPE_TRANS_CACHE_SIZE; i++) {
+        ShapeTransEntry *e = &shape_trans_cache[i];
+        if (e->old_shape == old_shape && e->key == atom) {
+            uint32_t slot = e->slot_index, nc = slot + 1;
+            if (nc > o->prop_count) {
+                LRValue *np = (LRValue *)realloc(o->props, nc * sizeof(LRValue));
+                if (!np) return;
+                o->props = np; o->prop_count = nc;
+            }
+            o->props[slot] = val;
+            o->shape = e->new_shape;
+            if (e->new_shape) e->new_shape->ref_count++;
+            return;
+        }
+    }
     LRShape *s = (LRShape *)calloc(1, sizeof(LRShape));
-    s->prop_name = atom; s->prev = o->shape;
-    s->slot_index = o->prop_count;
+    if (!s) return;
+    s->prop_name = atom; s->prev = old_shape;
+    s->slot_index = o->prop_count; s->ref_count = 1;
+    if (old_shape && old_shape->flat_count) {
+        memcpy(s->flat_keys, old_shape->flat_keys, sizeof(s->flat_keys));
+        memcpy(s->flat_slots, old_shape->flat_slots, sizeof(s->flat_slots));
+        s->flat_count = old_shape->flat_count;
+    }
+    if (s->flat_count < SHAPE_FLAT_SIZE) {
+        unsigned h = ((uintptr_t)atom) & SHAPE_FLAT_MASK;
+        for (unsigned i = 0; i < SHAPE_FLAT_SIZE; i++) {
+            unsigned idx = (h + i) & SHAPE_FLAT_MASK;
+            if (!s->flat_keys[idx]) {
+                s->flat_keys[idx] = atom;
+                s->flat_slots[idx] = (uint16_t)s->slot_index;
+                s->flat_count++; break;
+            }
+        }
+    }
     uint32_t nc = o->prop_count + 1;
     LRValue *np = (LRValue *)realloc(o->props, nc * sizeof(LRValue));
     if (!np) { free(s); return; }
     o->props = np; o->props[o->prop_count] = val;
     o->prop_count = nc; o->shape = s;
+    int si = shape_trans_next++ % SHAPE_TRANS_CACHE_SIZE;
+    shape_trans_cache[si].old_shape = old_shape;
+    shape_trans_cache[si].key = atom;
+    shape_trans_cache[si].new_shape = s;
+    shape_trans_cache[si].slot_index = s->slot_index;
 }
 
 int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
@@ -3003,6 +3075,11 @@ static LREvalUnit *lr_engine_parse_source(LRContext *ctx, const char *input,
     parser_init(unit->parser, &lex);
 
     unit->ast = parse_program(unit->parser);
+
+    /* Eager precompile: compile all function bodies to bytecode after parse.
+     * One-time cost; every function call thereafter hits the bytecode cache. */
+    if (unit->ast)
+        interp_precompile_all_bodies(unit->ast);
 
     if (!unit->ast || unit->parser->has_error) {
         const char *err_msg = parser_get_error(unit->parser, NULL, NULL);
