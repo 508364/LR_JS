@@ -982,6 +982,15 @@ void lr_set_can_block(LRRuntime *rt, int can_block);
 #define JS_NewContext(rt)             lr_new_context(rt)
 #define JS_FreeContext(ctx)           lr_free_context(ctx)
 
+/* ── AST dependency-based parallel split ────────────────────────────────
+ * Splits source into independent chunks by analyzing AST def/use chains.
+ * Returns NULL-terminated array of chunk strings. caller frees with
+ * lr_engine_free_split_chunks. */
+char **lr_engine_split_source(LRContext *ctx, const char *input, size_t input_len,
+                               int num_threads, int *out_count,
+                               size_t *out_prefix_len);
+void  lr_engine_free_split_chunks(char **chunks);
+
 #define JS_SetMemoryLimit(rt, l)      lr_set_memory_limit(rt, l)
 #define JS_SetGCThreshold(rt, t)       lr_set_gc_threshold(rt, t)
 #define JS_SetMaxStackSize(rt, s)     lr_set_max_stack_size(rt, s)

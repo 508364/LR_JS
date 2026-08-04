@@ -8,7 +8,7 @@
 
 L/R_JS 是一个用纯 C 语言实现的轻量级浏览器 JavaScript 运行器，支持 ES2022+ 特性，提供多线程、多任务、异步沙箱执行环境，内建高性能 JS 引擎。
 
-**v0.1.1+**：执行引擎采用直接/间接线程式栈字节码 VM（GCC/Clang: computed goto 零开销调度，MSVC: switch-based dispatch），AST 树遍历解释器已退役。内置稠密数组存储（O(1) 索引读写）、IOME586 字节码预热缓存，支持 `--iome586 <dir>` 持久化。
+**v0.1.1+**：执行引擎为直接/间接线程式字节码 VM，AST 树遍历已退役。函数体字节码执行（bc_body_cache MRU O(1)），arguments 惰性创建，Array reduce C 直读，BC_PUSH_THIS opcode，AST 依赖分析并行拆分（`--parallel N` 1-16），IOME586 字节码预热缓存 + CAS 预编译。基准 2796→1861ms (-33%)，vs V8 45×。
 
 ### 1.1 支持平台
 

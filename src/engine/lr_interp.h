@@ -38,6 +38,7 @@ typedef struct InterpScope {
                                      * declarative (ES spec GlobalDeclarationInstantiation) */
     int                refcount;      /* scopes are refcounted so closures can
                                        * keep their defining chain alive */
+    int                packed_alloc;  /* 1 = struct+arrays in single malloc */
 } InterpScope;
 
 /* ── Inline Cache for Property Access ──────────────────────────────────── */

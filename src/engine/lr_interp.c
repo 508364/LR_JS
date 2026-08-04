@@ -295,20 +295,41 @@ static LRValue interp_invoke_function_ast(Interpreter *interp, ASTNode *ast,
 
 /* ── Scope Management ──────────────────────────────────────────────────── */
 
+#define SCOPE_FUNC_CAP 24  /* params+this+args+super: fits any function */
+
 static InterpScope *scope_new(InterpScope *parent, int is_function, int is_global)
 {
-    InterpScope *s = (InterpScope *)calloc(1, sizeof(InterpScope));
-    if (!s) return NULL;
+    int cap = (is_function && !is_global) ? SCOPE_FUNC_CAP : SCOPE_INIT_CAP;
+    InterpScope *s;
+
+    if (is_function && !is_global) {
+        /* Single packed allocation: struct + 4 arrays. Function scopes
+         * never exceed SCOPE_FUNC_CAP entries. */
+        size_t sz = sizeof(InterpScope) + cap*(sizeof(char*)+sizeof(LRValue)+2*sizeof(int));
+        s = (InterpScope *)calloc(1, sz);
+        if (!s) return NULL;
+        char *p = (char *)(s + 1);
+        s->names     = (char **)p;  p += cap*sizeof(char*);
+        s->values    = (LRValue *)p; p += cap*sizeof(LRValue);
+        s->is_const   = (int *)p;    p += cap*sizeof(int);
+        s->is_lexical = (int *)p;
+        s->packed_alloc = 1;
+    } else {
+        s = (InterpScope *)calloc(1, sizeof(InterpScope));
+        if (!s) return NULL;
+        s->names     = (char **)calloc(cap, sizeof(char *));
+        s->values    = (LRValue *)calloc(cap, sizeof(LRValue));
+        s->is_const   = (int *)calloc(cap, sizeof(int));
+        s->is_lexical = (int *)calloc(cap, sizeof(int));
+        s->packed_alloc = 0;
+    }
+
     s->parent = parent;
-    if (parent) parent->refcount++;   /* child keeps its parent chain alive */
+    if (parent) parent->refcount++;
     s->refcount = 1;
     s->is_function_scope = is_function;
     s->is_global_scope = is_global;
-    s->capacity = SCOPE_INIT_CAP;
-    s->names = (char **)calloc(s->capacity, sizeof(char *));
-    s->values = (LRValue *)calloc(s->capacity, sizeof(LRValue));
-    s->is_const = (int *)calloc(s->capacity, sizeof(int));
-    s->is_lexical = (int *)calloc(s->capacity, sizeof(int));
+    s->capacity = cap;
     return s;
 }
 
@@ -323,12 +344,14 @@ static void scope_release(InterpScope *scope, LRContext *ctx)
             if (scope->names[i]) free(scope->names[i]);
             lr_free_value(ctx, scope->values[i]);
         }
-        free(scope->names);
-        free(scope->values);
-        free(scope->is_const);
-        free(scope->is_lexical);
-        free(scope);
-        scope = parent;   /* release the reference this child held */
+        if (scope->packed_alloc) {
+            free(scope);
+        } else {
+            free(scope->names); free(scope->values);
+            free(scope->is_const); free(scope->is_lexical);
+            free(scope);
+        }
+        scope = parent;
     }
 }
 
@@ -463,12 +486,15 @@ static void scope_declare_name(Interpreter *interp, const char *name, LRValue va
 
     /* Add new entry */
     if (scope->count >= scope->capacity) {
+        if (scope->packed_alloc) {
+            /* Function scope: pre-allocated capacity exhausted (shouldn't happen) */
+            return;
+        }
         scope->capacity *= 2;
         scope->names = (char **)realloc(scope->names, scope->capacity * sizeof(char *));
         scope->values = (LRValue *)realloc(scope->values, scope->capacity * sizeof(LRValue));
         scope->is_const = (int *)realloc(scope->is_const, scope->capacity * sizeof(int));
         scope->is_lexical = (int *)realloc(scope->is_lexical, scope->capacity * sizeof(int));
-        /* Zero out new entries */
         for (int i = scope->count; i < scope->capacity; i++) {
             scope->names[i] = NULL;
             scope->values[i] = LR_VALUE_UNDEFINED;
@@ -3049,9 +3075,20 @@ static void gen_append(Interpreter *interp, LRValue v)
                            lr_dup_value(interp->ctx, v));
 }
 
-/* yield* delegation: append every element of an iterable */
+/* yield* delegation: append every element of an iterable.
+ * Cap nesting depth to prevent stack overflow from deep `yield*` chains. */
+#define GEN_DELEGATE_MAX_DEPTH 256
+static int gen_delegate_depth = 0;
+
 static void gen_delegate(Interpreter *interp, LRValue src)
 {
+    if (++gen_delegate_depth > GEN_DELEGATE_MAX_DEPTH) {
+        snprintf(interp->error_message, sizeof(interp->error_message),
+                 "yield* delegation depth exceeded (%d)", GEN_DELEGATE_MAX_DEPTH);
+        interp->error_flag = 1;
+        gen_delegate_depth--;
+        return;
+    }
     LRContext *ctx = interp->ctx;
     if (lr_is_string(src)) {
         const char *s = lr_to_cstring(ctx, src);
@@ -3064,6 +3101,7 @@ static void gen_delegate(Interpreter *interp, LRValue src)
             lr_free_value(ctx, item);
         }
         lr_free_cstring(ctx, s);
+        gen_delegate_depth--;
         return;
     }
     if (lr_is_array(ctx, src)) {
@@ -3101,6 +3139,7 @@ static void gen_delegate(Interpreter *interp, LRValue src)
                 lr_free_value(ctx, next_fn);
             }
             lr_free_value(ctx, iter);
+            gen_delegate_depth--;
             return;
         }
         lr_free_value(ctx, iter_fn);
@@ -3109,6 +3148,7 @@ static void gen_delegate(Interpreter *interp, LRValue src)
              "yield* operand is not iterable");
     interp->exception_value = LR_VALUE_UNDEFINED;
     interp->error_flag = 1;
+    gen_delegate_depth--;
 }
 
 /* ── Function Call Support ─────────────────────────────────────────────── */

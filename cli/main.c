@@ -13,6 +13,8 @@
 #endif
 #include "../src/lr_platform.h"
 #include "../src/lr_runtime.h"
+#include "../src/lr_thread_pool.h"
+#include "../src/engine/lr_engine.h"
 
 /* ── Global runtime for signal handling ────────────────────────────────── */
 
@@ -166,6 +168,7 @@ int main(int argc, char *argv[])
     const char *eval_code = NULL;
     const char *script_file = NULL;
     int is_module = 0;
+    int parallel_threads = 0;
     int interactive = 0;
     int print_gc_stats = 0;
     int print_bytecode_stats = 0;
@@ -191,6 +194,13 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--eval") == 0) {
             if (i + 1 < argc) eval_code = argv[++i];
             else { fprintf(stderr, "Error: -e requires an argument\n"); return 1; }
+        } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--parallel") == 0) {
+            parallel_threads = 8;
+            if (i + 1 < argc && argv[i+1][0] >= '1' && argv[i+1][0] <= '9') {
+                parallel_threads = atoi(argv[++i]);
+                if (parallel_threads < 1) parallel_threads = 1;
+                if (parallel_threads > 16) parallel_threads = 16;
+            }
         } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--module") == 0) {
             is_module = 1;
         } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--strict") == 0) {
@@ -355,7 +365,53 @@ int main(int argc, char *argv[])
                 is_module = 1;
         }
         /* Evaluate script file */
-        if (is_module) {
+        if (parallel_threads > 0 && !is_module) {
+            size_t buf_len;
+            uint8_t *buf = lr_load_file(g_rt, script_file, &buf_len);
+            if (buf) {
+                int chunk_count = 0;
+                size_t prefix_len = 0;
+                char **chunks = lr_engine_split_source(g_rt->lr_ctx,
+                    (const char *)buf, buf_len, parallel_threads,
+                    &chunk_count, &prefix_len);
+                if (chunks && chunk_count > 0) {
+                    /* Execute prefix on main thread */
+                    char *prefix = (char *)malloc(prefix_len + 1);
+                    if (prefix) {
+                        memcpy(prefix, buf, prefix_len);
+                        prefix[prefix_len] = 0;
+                        exit_code = lr_eval(g_rt, prefix, prefix_len, script_file);
+                        free(prefix);
+                    }
+                    /* Distribute chunks to thread pool */
+                    LR_ThreadPool *pool = lr_thread_pool_create(parallel_threads);
+                    if (pool) {
+                        LR_Task **tasks = (LR_Task **)calloc(chunk_count, sizeof(LR_Task *));
+                        for (int ci = 0; ci < chunk_count && tasks; ci++) {
+                            tasks[ci] = lr_task_create(LR_TASK_EVAL, LR_TASK_PRIORITY_NORMAL);
+                            if (tasks[ci] && chunks[ci]) {
+                                tasks[ci]->source = chunks[ci]; /* task takes ownership */
+                                tasks[ci]->source_len = strlen(chunks[ci]);
+                                tasks[ci]->filename = strdup(script_file);
+                                chunks[ci] = NULL; /* moved ownership */
+                                lr_thread_pool_submit(pool, tasks[ci]);
+                            }
+                        }
+                        lr_thread_pool_wait_all(pool);
+                        for (int ci = 0; ci < chunk_count; ci++)
+                            if (tasks[ci]) lr_task_free(tasks[ci]);
+                        free(tasks);
+                        lr_thread_pool_destroy(pool);
+                    }
+                    lr_engine_free_split_chunks(chunks);
+                } else {
+                    exit_code = is_module ?
+                        lr_eval_module(g_rt, (const char *)buf, buf_len, script_file) :
+                        lr_eval(g_rt, (const char *)buf, buf_len, script_file);
+                }
+                free(buf);
+            }
+        } else if (is_module) {
             size_t buf_len;
             uint8_t *buf = lr_load_file(g_rt, script_file, &buf_len);
             if (buf) {

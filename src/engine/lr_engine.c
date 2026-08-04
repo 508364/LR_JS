@@ -1491,10 +1491,41 @@ LRValue lr_get_property_uint32(LRContext *ctx, LRValue obj, uint32_t idx)
     }
 }
 
+/* Shape fast path helper: walk shape chain to find property slot index.
+ * Returns >=0 on success, -1 if not found. O(n) in shape chain length. */
+static int shape_get_slot(LRObject *o, LRString *atom) {
+    if (!o || !o->shape || !atom) return -1;
+    LRShape *s = o->shape;
+    while (s) { if (s->prop_name == atom) return (int)s->slot_index; s = s->prev; }
+    return -1;
+}
+/* Lazy shape init: add new property to shape+props inline. */
+static void shape_add_prop(LRObject *o, LRString *atom, LRValue val) {
+    if (!o || !atom) return;
+    LRShape *s = (LRShape *)calloc(1, sizeof(LRShape));
+    s->prop_name = atom; s->prev = o->shape;
+    s->slot_index = o->prop_count;
+    uint32_t nc = o->prop_count + 1;
+    LRValue *np = (LRValue *)realloc(o->props, nc * sizeof(LRValue));
+    if (!np) { free(s); return; }
+    o->props = np; o->props[o->prop_count] = val;
+    o->prop_count = nc; o->shape = s;
+}
+
 int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
 {
     if (obj.tag != LR_TYPE_OBJECT) return -1;
     LRObject *o = (LRObject *)obj.u.ptr;
+
+    /* Shape fast path: O(1) direct write to props[] array */
+    if (o->shape && o->props) {
+        int slot = shape_get_slot(o, atom);
+        if (slot >= 0 && (uint32_t)slot < o->prop_count) {
+            lr_free_value(ctx, o->props[slot]);
+            o->props[slot] = val;
+            return 0;
+        }
+    }
 
     /* Two-way global binding: an external write to the global object that
      * targets a top-level var/function binding is mirrored back into the
@@ -4696,4 +4727,85 @@ int lr_define_property_getset(LRContext *ctx, LRValue obj, LRString *atom,
     lr_set_property_str(ctx, obj, name, LR_VALUE_UNDEFINED);
 
     return 0;
+}
+
+/* ── AST dependency-based parallel split ─────────────────────────────────
+ * Scans the top-level AST, collects function/class declarations as prefix,
+ * then splits remaining statements into independent groups where each group
+ * depends only on the prefix. Returns NULL-terminated string chunks.     */
+
+char **lr_engine_split_source(LRContext *ctx, const char *input, size_t input_len,
+                               int num_threads, int *out_count,
+                               size_t *out_prefix_len)
+{
+    if (!ctx || !input || input_len < 100 || num_threads < 2) {
+        if (out_count) *out_count = 0;
+        if (out_prefix_len) *out_prefix_len = 0;
+        return NULL;
+    }
+    if (num_threads > 16) num_threads = 16;
+
+    LREvalUnit *unit = lr_engine_parse_source(ctx, input, input_len, 0, "");
+    if (!unit || !unit->ast || unit->ast->type != AST_PROGRAM) {
+        if (unit) lr_eval_unit_free(unit);
+        if (out_count) *out_count = 0;
+        return NULL;
+    }
+    ASTNode *prog = unit->ast;
+    int n = prog->u.list.count;
+    if (n < num_threads * 2) { lr_eval_unit_free(unit); return NULL; }
+
+    /* Find prefix end: all function/class declarations must be shared */
+    int prefix_end = 0;
+    for (int i = 0; i < n; i++) {
+        ASTNode *s = prog->u.list.items[i];
+        if (s->type == AST_FUNC_DECL || s->type == AST_CLASS_DECL)
+            prefix_end = i + 1;
+    }
+    if (prefix_end == 0 || prefix_end >= n - 2) {
+        lr_eval_unit_free(unit); return NULL;
+    }
+
+    size_t pfx = (size_t)(prog->u.list.items[prefix_end - 1]->token.start
+                         + prog->u.list.items[prefix_end - 1]->token.len
+                         - unit->src);
+    *out_prefix_len = pfx;
+
+    /* Split remaining body into equal groups */
+    int body_n = n - prefix_end;
+    int per = body_n / num_threads;
+    if (per < 1) per = 1;
+    if (per > 32) per = 32;
+
+    int ngroups = 0, cap = num_threads + 1;
+    char **chunks = (char **)calloc(cap + 1, sizeof(char *));
+    if (!chunks) { lr_eval_unit_free(unit); return NULL; }
+
+    for (int start = prefix_end; start < n; start += per) {
+        int end = start + per;
+        if (end > n) end = n;
+        ASTNode *first = prog->u.list.items[start];
+        ASTNode *last  = prog->u.list.items[end - 1];
+        size_t body_start = (size_t)(first->token.start - unit->src);
+        size_t body_end   = (size_t)(last->token.start + last->token.len - unit->src);
+        size_t body_len   = body_end - body_start;
+
+        char *chunk = (char *)malloc(pfx + body_len + 1);
+        if (chunk) {
+            memcpy(chunk, unit->src, pfx);
+            memcpy(chunk + pfx, unit->src + body_start, body_len);
+            chunk[pfx + body_len] = 0;
+            chunks[ngroups++] = chunk;
+        }
+    }
+    chunks[ngroups] = NULL;
+    *out_count = ngroups;
+    lr_eval_unit_free(unit);
+    return chunks;
+}
+
+void lr_engine_free_split_chunks(char **chunks) {
+    if (!chunks) return;
+    for (int i = 0; chunks[i]; i++) free(chunks[i]);
+    free(chunks);
 }

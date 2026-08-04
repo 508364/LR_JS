@@ -41,6 +41,35 @@ void lr_task_free(LR_Task *task)
     free(task);
 }
 
+/* ── Shared results pool ──────────────────────────────────────────────── */
+
+LR_SharedResults *lr_shared_results_create(int capacity) {
+    if (capacity < 1) capacity = 64;
+    LR_SharedResults *sr = (LR_SharedResults *)calloc(1, sizeof(LR_SharedResults));
+    if (!sr) return NULL;
+    sr->capacity = capacity;
+    sr->entries = (char **)calloc(capacity, sizeof(char *));
+    if (!sr->entries) { free(sr); return NULL; }
+    sr->write_idx = 0;
+    return sr;
+}
+
+int lr_shared_results_append(LR_SharedResults *sr, const char *str) {
+    if (!sr || !str) return -1;
+    int idx = LR_ATOMIC_INC((volatile int32_t *)&sr->write_idx) - 1;
+    if (idx >= sr->capacity) return -1;
+    sr->entries[idx] = str ? strdup(str) : NULL;
+    return idx;
+}
+
+void lr_shared_results_free(LR_SharedResults *sr) {
+    if (!sr) return;
+    for (int i = 0; i < sr->write_idx && i < sr->capacity; i++)
+        free(sr->entries[i]);
+    free(sr->entries);
+    free(sr);
+}
+
 /* ── Worker thread function ────────────────────────────────────────────── */
 
 static void *lr_worker_thread(void *arg)

@@ -4,21 +4,24 @@ Pure C, ES2022-compatible JavaScript engine with browser APIs.
 
 **v0.1.1+**: Execution engine is a **direct/indirect threaded bytecode VM** (computed goto on GCC/Clang, switch-based dispatch on MSVC). The AST tree-walking interpreter is retired. Features dense array storage (O(1) indexed access), IOME586 bytecode warm-cache, and optimized string concatenation.
 
-## Performance (vs Node.js v22, Windows x64)
+## Performance (vs Node.js v22, Windows x64, MSVC)
 
-| Test | LR_JS | Node.js | Ratio |
-|------|-------|---------|-------|
-| Class 5000×10 deep | 317 ms | 8 ms | 40× |
-| Map/Set 5000 | 26 ms | 5 ms | 5× |
-| Closure 5000 + 1000 calls | 22 ms | 2 ms | 11× |
-| Recursion fact(200) | 2 ms | 0 ms | — |
-| Destructuring 2000 | 24 ms | 1 ms | 24× |
-| Regex 500 | 5 ms | 0 ms | — |
-| Try/catch 50×5deep | 2 ms | 1 ms | 2× |
-| Array 100k push+reduce | 316 ms | 12 ms | 26× |
-| Arrow 10k + default | 36 ms | 1 ms | 36× |
-| String 10k concat | 83 ms | 1 ms | 83× |
-| **Total** | **834 ms** | **50 ms** | **17×**
+| Test | V8 (Node) | LR_JS | LR+IOME(热) | LR全开(热+16p) | vs V8 |
+|------|-----------|-------|------------|---------------|-------|
+| Simple loop 100k | 3 ms | 82 ms | 82 ms | 83 ms | 27× |
+| Function call 50k | 2 ms | 187 ms | 186 ms | 182 ms | 91× |
+| Object create 50k (3 props) | 6 ms | 151 ms | 153 ms | 153 ms | 26× |
+| **Array 100k push+reduce** | 8 ms | **121 ms** | 121 ms | 120 ms | **15×** |
+| Class constructor 50k (2 props) | 4 ms | 281 ms | 289 ms | **232 ms** | 58× |
+| String concat 50k | 4 ms | 331 ms | 269 ms | 265 ms | 66× |
+| If/else function 50k | 3 ms | 231 ms | 234 ms | 231 ms | 77× |
+| Local vars function 50k | 2 ms | 241 ms | 244 ms | 241 ms | 121× |
+| Nested function 50k (2 calls/iter) | 2 ms | 333 ms | 341 ms | 336 ms | 168× |
+| Map/Set 5000 | 7 ms | 18 ms | 18 ms | 18 ms | 3× |
+| **Total (10项)** | **41 ms** | **1977 ms** | **1937 ms** | **1861 ms** | **45×** |
+
+> LR全开 = `--iome586 <dir>` + `--parallel 16`. Baseline improved 2796→1861ms (-33%).
+> Dense array + reduce C fast path: only 15× vs V8. IOME586 warm cache: 100% hit rate.
 
 ## Features
 

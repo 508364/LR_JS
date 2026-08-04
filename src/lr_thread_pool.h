@@ -137,4 +137,25 @@ void lr_task_free(LR_Task *task);
 void lr_thread_pool_stats(LR_ThreadPool *pool,
                           int *out_pending, int64_t *out_completed);
 
+/* ── Shared results pool for parallel execution ────────────────────────
+ * Multiple sandbox threads write string results to a CAS-protected
+ * shared buffer; the main thread reads them after all sandboxes finish. */
+
+typedef struct {
+    char  **entries;         /* result strings (NULL-terminated array) */
+    int     count;
+    int     capacity;
+    volatile int write_idx;  /* CAS-protected write index */
+} LR_SharedResults;
+
+/* Create a shared results buffer with room for `capacity` entries. */
+LR_SharedResults *lr_shared_results_create(int capacity);
+
+/* CAS-append a result string. Caller retains ownership of `str`.
+ * Returns slot index or -1 if full. */
+int lr_shared_results_append(LR_SharedResults *sr, const char *str);
+
+/* Free the shared results buffer and all entries. */
+void lr_shared_results_free(LR_SharedResults *sr);
+
 #endif /* LR_THREAD_POOL_H */

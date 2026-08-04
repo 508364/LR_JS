@@ -1736,20 +1736,25 @@ static JSValue js_array_proto_reduce(JSContext *ctx, JSValue this_val,
     }
     int32_t len = get_array_length(ctx, this_val);
 
-    /* Fast path: dense int32 array with initial value → sum directly in C.
-     * Skips 100k function call overheads for the common reduce-sum pattern. */
+    /* Fast path: dense array with initial value → sum directly in C.
+     * Uses int64_t to avoid overflow; returns Int32 when value fits. */
     if (argc >= 2 && this_val.tag == LR_TYPE_OBJECT) {
         LRObject *o = (LRObject *)this_val.u.ptr;
         if (o->type == LR_OBJ_ARRAY && o->extra) {
             LRArrayData *ad = (LRArrayData *)o->extra;
-            int init_val = 0;
-            if (argc >= 2 && JS_IsNumber(argv[1])) JS_ToInt32(ctx, &init_val, argv[1]);
-            int32_t sum = init_val;
+            int64_t sum = 0;
+            if (argc >= 2 && JS_IsNumber(argv[1])) {
+                int32_t iv = 0;
+                JS_ToInt32(ctx, &iv, argv[1]);
+                sum = iv;
+            }
             for (int32_t i = 0; i < len && i < (int32_t)ad->length; i++) {
                 if (ad->elements[i].tag == LR_TYPE_INT32)
                     sum += ad->elements[i].u.int32;
             }
-            return JS_NewInt32(ctx, sum);
+            if (sum >= (int64_t)INT32_MIN && sum <= (int64_t)INT32_MAX)
+                return JS_NewInt32(ctx, (int32_t)sum);
+            return JS_NewFloat64(ctx, (double)sum);
         }
     }
 
