@@ -20,12 +20,12 @@
 /* ── Threading mode ──────────────────────────────────────────────────── */
 #if defined(__GNUC__) || defined(__clang__)
   #define LR_THREADED_CODE 1
-  /* BC_CASE: computed-goto label only (no switch case needed). */
+  /* BC_CASE: computed-goto label (the trailing colon comes from call site). */
   #define BC_CASE(lbl, op) lbl_##lbl:
 #else
   #define LR_THREADED_CODE 0
-  /* BC_CASE: switch case label for indirect threaded dispatch. */
-  #define BC_CASE(lbl, op) case op
+  /* BC_CASE: switch case label (the trailing colon comes from call site). */
+  #define BC_CASE(lbl, op) case op:
 #endif
 
 #include <stdlib.h>
@@ -1576,30 +1576,30 @@ static LRValue bcv_binop(Interpreter *interp, int op, LRValue a, LRValue b)
     if (a.tag == LR_TYPE_INT32 && b.tag == LR_TYPE_INT32) {
         int32_t x = a.u.int32, y = b.u.int32;
         switch (op) {
-        BC_CASE(add, BC_ADD): return lr_new_int32(ctx, x + y);
-        BC_CASE(sub, BC_SUB): return lr_new_int32(ctx, x - y);
-        BC_CASE(mul, BC_MUL): {
+        case BC_ADD: return lr_new_int32(ctx, x + y);
+        case BC_SUB: return lr_new_int32(ctx, x - y);
+        case BC_MUL: {
             double d = (double)x * (double)y;
             return bcv_number(ctx, d);
         }
-        BC_CASE(bit_and, BC_BIT_AND): return lr_new_int32(ctx, x & y);
-        BC_CASE(bit_or, BC_BIT_OR):  return lr_new_int32(ctx, x | y);
-        BC_CASE(bit_xor, BC_BIT_XOR): return lr_new_int32(ctx, x ^ y);
-        BC_CASE(shl, BC_SHL): return lr_new_int32(ctx, (int32_t)((uint32_t)x << (y & 31)));
-        BC_CASE(shr, BC_SHR): return lr_new_int32(ctx, x >> (y & 31));
-        BC_CASE(sar, BC_SAR): return lr_new_int32(ctx, (int32_t)((uint32_t)x >> (y & 31)));
-        BC_CASE(lt, BC_LT):  return lr_new_bool(ctx, x <  y);
-        BC_CASE(gt, BC_GT):  return lr_new_bool(ctx, x >  y);
-        BC_CASE(le, BC_LE):  return lr_new_bool(ctx, x <= y);
-        BC_CASE(ge, BC_GE):  return lr_new_bool(ctx, x >= y);
-        BC_CASE(eq, BC_EQ):  BC_CASE(strict_eq, BC_STRICT_EQ): return lr_new_bool(ctx, x == y);
-        BC_CASE(ne, BC_NE):  BC_CASE(strict_ne, BC_STRICT_NE): return lr_new_bool(ctx, x != y);
+        case BC_BIT_AND: return lr_new_int32(ctx, x & y);
+        case BC_BIT_OR:  return lr_new_int32(ctx, x | y);
+        case BC_BIT_XOR: return lr_new_int32(ctx, x ^ y);
+        case BC_SHL: return lr_new_int32(ctx, (int32_t)((uint32_t)x << (y & 31)));
+        case BC_SHR: return lr_new_int32(ctx, x >> (y & 31));
+        case BC_SAR: return lr_new_int32(ctx, (int32_t)((uint32_t)x >> (y & 31)));
+        case BC_LT:  return lr_new_bool(ctx, x <  y);
+        case BC_GT:  return lr_new_bool(ctx, x >  y);
+        case BC_LE:  return lr_new_bool(ctx, x <= y);
+        case BC_GE:  return lr_new_bool(ctx, x >= y);
+        case BC_EQ:  case BC_STRICT_EQ: return lr_new_bool(ctx, x == y);
+        case BC_NE:  case BC_STRICT_NE: return lr_new_bool(ctx, x != y);
         default: break;
         }
     }
 
     switch (op) {
-    BC_CASE(add, BC_ADD):
+    case BC_ADD:
         if (lr_is_string(a) || lr_is_string(b)) {
             r = bcv_concat(ctx, a, b);
         } else if (lr_is_object(a) || lr_is_object(b)) {
@@ -1615,34 +1615,34 @@ static LRValue bcv_binop(Interpreter *interp, int op, LRValue a, LRValue b)
             r = bcv_number(ctx, bcv_to_number(ctx, a) + bcv_to_number(ctx, b));
         }
         break;
-    BC_CASE(sub, BC_SUB): r = bcv_number(ctx, bcv_to_number(ctx, a) - bcv_to_number(ctx, b)); break;
-    BC_CASE(mul, BC_MUL): r = bcv_number(ctx, bcv_to_number(ctx, a) * bcv_to_number(ctx, b)); break;
-    BC_CASE(div, BC_DIV): r = lr_new_float64(ctx, bcv_to_number(ctx, a) / bcv_to_number(ctx, b)); break;
-    BC_CASE(mod, BC_MOD): {
+    case BC_SUB: r = bcv_number(ctx, bcv_to_number(ctx, a) - bcv_to_number(ctx, b)); break;
+    case BC_MUL: r = bcv_number(ctx, bcv_to_number(ctx, a) * bcv_to_number(ctx, b)); break;
+    case BC_DIV: r = lr_new_float64(ctx, bcv_to_number(ctx, a) / bcv_to_number(ctx, b)); break;
+    case BC_MOD: {
         double da = bcv_to_number(ctx, a), db = bcv_to_number(ctx, b);
         r = (db == 0.0) ? lr_new_float64(ctx, NAN) : bcv_number(ctx, fmod(da, db));
         break;
     }
-    BC_CASE(pow, BC_POW): r = lr_new_float64(ctx, pow(bcv_to_number(ctx, a), bcv_to_number(ctx, b))); break;
+    case BC_POW: r = lr_new_float64(ctx, pow(bcv_to_number(ctx, a), bcv_to_number(ctx, b))); break;
 
-    BC_CASE(lt, BC_LT): r = lr_new_bool(ctx, bcv_relational(ctx, a, b, 0)); break;
-    BC_CASE(gt, BC_GT): r = lr_new_bool(ctx, bcv_relational(ctx, a, b, 1)); break;
-    BC_CASE(le, BC_LE): r = lr_new_bool(ctx, bcv_relational(ctx, a, b, 2)); break;
-    BC_CASE(ge, BC_GE): r = lr_new_bool(ctx, bcv_relational(ctx, a, b, 3)); break;
+    case BC_LT: r = lr_new_bool(ctx, bcv_relational(ctx, a, b, 0)); break;
+    case BC_GT: r = lr_new_bool(ctx, bcv_relational(ctx, a, b, 1)); break;
+    case BC_LE: r = lr_new_bool(ctx, bcv_relational(ctx, a, b, 2)); break;
+    case BC_GE: r = lr_new_bool(ctx, bcv_relational(ctx, a, b, 3)); break;
 
-    BC_CASE(eq, BC_EQ): r = lr_new_bool(ctx, bcv_abstract_eq(ctx, a, b)); break;
-    BC_CASE(ne, BC_NE): r = lr_new_bool(ctx, !bcv_abstract_eq(ctx, a, b)); break;
-    BC_CASE(strict_eq, BC_STRICT_EQ): r = lr_new_bool(ctx, bcv_strict_eq(a, b)); break;
-    BC_CASE(strict_ne, BC_STRICT_NE): r = lr_new_bool(ctx, !bcv_strict_eq(a, b)); break;
+    case BC_EQ: r = lr_new_bool(ctx, bcv_abstract_eq(ctx, a, b)); break;
+    case BC_NE: r = lr_new_bool(ctx, !bcv_abstract_eq(ctx, a, b)); break;
+    case BC_STRICT_EQ: r = lr_new_bool(ctx, bcv_strict_eq(a, b)); break;
+    case BC_STRICT_NE: r = lr_new_bool(ctx, !bcv_strict_eq(a, b)); break;
 
-    BC_CASE(shl, BC_SHL): r = lr_new_int32(ctx, (int32_t)((uint32_t)bcv_to_int32(ctx, a) << (bcv_to_int32(ctx, b) & 31))); break;
-    BC_CASE(shr, BC_SHR): r = lr_new_int32(ctx, bcv_to_int32(ctx, a) >> (bcv_to_int32(ctx, b) & 31)); break;
-    BC_CASE(sar, BC_SAR): r = lr_new_int32(ctx, (int32_t)((uint32_t)bcv_to_int32(ctx, a) >> (bcv_to_int32(ctx, b) & 31))); break;
-    BC_CASE(bit_and, BC_BIT_AND): r = lr_new_int32(ctx, bcv_to_int32(ctx, a) & bcv_to_int32(ctx, b)); break;
-    BC_CASE(bit_or, BC_BIT_OR):  r = lr_new_int32(ctx, bcv_to_int32(ctx, a) | bcv_to_int32(ctx, b)); break;
-    BC_CASE(bit_xor, BC_BIT_XOR): r = lr_new_int32(ctx, bcv_to_int32(ctx, a) ^ bcv_to_int32(ctx, b)); break;
+    case BC_SHL: r = lr_new_int32(ctx, (int32_t)((uint32_t)bcv_to_int32(ctx, a) << (bcv_to_int32(ctx, b) & 31))); break;
+    case BC_SHR: r = lr_new_int32(ctx, bcv_to_int32(ctx, a) >> (bcv_to_int32(ctx, b) & 31)); break;
+    case BC_SAR: r = lr_new_int32(ctx, (int32_t)((uint32_t)bcv_to_int32(ctx, a) >> (bcv_to_int32(ctx, b) & 31))); break;
+    case BC_BIT_AND: r = lr_new_int32(ctx, bcv_to_int32(ctx, a) & bcv_to_int32(ctx, b)); break;
+    case BC_BIT_OR:  r = lr_new_int32(ctx, bcv_to_int32(ctx, a) | bcv_to_int32(ctx, b)); break;
+    case BC_BIT_XOR: r = lr_new_int32(ctx, bcv_to_int32(ctx, a) ^ bcv_to_int32(ctx, b)); break;
 
-    BC_CASE(in_op, BC_IN): {
+    case BC_IN: {
         if (!lr_is_object(b)) {
             snprintf(interp->error_message, sizeof(interp->error_message),
                      "right-hand side of 'in' must be an object");
@@ -1655,7 +1655,7 @@ static LRValue bcv_binop(Interpreter *interp, int op, LRValue a, LRValue b)
         lr_free_cstring(ctx, prop);
         break;
     }
-    BC_CASE(instanceof, BC_INSTANCEOF):
+    case BC_INSTANCEOF:
         r = lr_new_bool(ctx, bcv_instanceof(ctx, a, b));
         break;
     default:
@@ -1833,52 +1833,52 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
         switch (*ip++) {
 #endif
 
-        BC_CASE(stop, BC_STOP): goto vm_done;
-        BC_CASE(nop, BC_NOP): DISPATCH();
+        BC_CASE(stop, BC_STOP) goto vm_done;
+        BC_CASE(nop, BC_NOP) DISPATCH();
 
-        BC_CASE(push_undefined, BC_PUSH_UNDEFINED): PUSH(LR_VALUE_UNDEFINED); DISPATCH();
-        BC_CASE(push_null, BC_PUSH_NULL):      PUSH(LR_VALUE_NULL); DISPATCH();
-        BC_CASE(push_true, BC_PUSH_TRUE):      PUSH(lr_new_bool(ctx, 1)); DISPATCH();
-        BC_CASE(push_false, BC_PUSH_FALSE):     PUSH(lr_new_bool(ctx, 0)); DISPATCH();
-        BC_CASE(push_this, BC_PUSH_THIS): {
+        BC_CASE(push_undefined, BC_PUSH_UNDEFINED) PUSH(LR_VALUE_UNDEFINED); DISPATCH();
+        BC_CASE(push_null, BC_PUSH_NULL)           PUSH(LR_VALUE_NULL); DISPATCH();
+        BC_CASE(push_true, BC_PUSH_TRUE)      PUSH(lr_new_bool(ctx, 1)); DISPATCH();
+        BC_CASE(push_false, BC_PUSH_FALSE)     PUSH(lr_new_bool(ctx, 0)); DISPATCH();
+        BC_CASE(push_this, BC_PUSH_THIS) {
             LRValue tv;
             interp_bc_push_this(interp, &tv);
             PUSH(tv);
             DISPATCH();
         }
-        BC_CASE(push_int32, BC_PUSH_INT32):     PUSH(lr_new_int32(ctx, rd32(&ip))); DISPATCH();
-        BC_CASE(push_float64, BC_PUSH_FLOAT64): {
+        BC_CASE(push_int32, BC_PUSH_INT32)     PUSH(lr_new_int32(ctx, rd32(&ip))); DISPATCH();
+        BC_CASE(push_float64, BC_PUSH_FLOAT64) {
             uint16_t si = rd16(&ip);
             PUSH(lr_new_float64(ctx, prog->pool[si].u.f64));
             DISPATCH();
         }
-        BC_CASE(push_string, BC_PUSH_STRING): {
+        BC_CASE(push_string, BC_PUSH_STRING) {
             uint16_t si = rd16(&ip);
             PUSH(lr_new_string(ctx, prog->pool[si].u.str));
             DISPATCH();
         }
 
-        BC_CASE(pop, BC_POP): { LRValue v = POP(); FREE_IF_HEAP(ctx, v); DISPATCH(); }
-        BC_CASE(dup, BC_DUP): {
+        BC_CASE(pop, BC_POP) { LRValue v = POP(); FREE_IF_HEAP(ctx, v); DISPATCH(); }
+        BC_CASE(dup, BC_DUP) {
             LRValue v = sp > 0 ? stack[sp - 1] : LR_VALUE_UNDEFINED;
             PUSH(lr_dup_value(ctx, v));
             DISPATCH();
         }
-        BC_CASE(dup2, BC_DUP2): {
+        BC_CASE(dup2, BC_DUP2) {
             if (sp < 2) goto vm_abort;
             LRValue a = stack[sp - 2], b = stack[sp - 1];
             PUSH(lr_dup_value(ctx, a));
             PUSH(lr_dup_value(ctx, b));
             DISPATCH();
         }
-        BC_CASE(swap, BC_SWAP): {
+        BC_CASE(swap, BC_SWAP) {
             if (sp < 2) goto vm_abort;
             LRValue t = stack[sp - 1];
             stack[sp - 1] = stack[sp - 2];
             stack[sp - 2] = t;
             DISPATCH();
         }
-        BC_CASE(rot3, BC_ROT3): {
+        BC_CASE(rot3, BC_ROT3) {
             if (sp < 3) goto vm_abort;
             LRValue t = stack[sp - 1];
             stack[sp - 1] = stack[sp - 2];
@@ -1887,14 +1887,14 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             DISPATCH();
         }
 
-        BC_CASE(load_var, BC_LOAD_VAR): {
+        BC_CASE(load_var, BC_LOAD_VAR) {
             uint16_t si = rd16(&ip);
             LRValue v;
             if (!interp_bc_load_var(interp, prog->pool[si].u.str, &v)) goto vm_abort;
             PUSH(v);
             DISPATCH();
         }
-        BC_CASE(store_var, BC_STORE_VAR): {
+        BC_CASE(store_var, BC_STORE_VAR) {
             uint16_t si = rd16(&ip);
             LRValue v = POP();
             interp_bc_store_var(interp, prog->pool[si].u.str, v);
@@ -1902,7 +1902,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             CHECK();
             DISPATCH();
         }
-        BC_CASE(declare_var, BC_DECLARE_VAR): {
+        BC_CASE(declare_var, BC_DECLARE_VAR) {
             uint16_t si = rd16(&ip);
             uint8_t kind = *ip++;
             LRValue v = POP();
@@ -1911,7 +1911,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             CHECK();
             DISPATCH();
         }
-        BC_CASE(typeof_var, BC_TYPEOF_VAR): {
+        BC_CASE(typeof_var, BC_TYPEOF_VAR) {
             uint16_t si = rd16(&ip);
             LRValue v;
             if (interp_bc_typeof_var(interp, prog->pool[si].u.str, &v)) {
@@ -1923,12 +1923,31 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             DISPATCH();
         }
 
-        BC_CASE(add, BC_ADD): BC_CASE(sub, BC_SUB): BC_CASE(mul, BC_MUL): BC_CASE(div, BC_DIV): BC_CASE(mod, BC_MOD):
-        BC_CASE(pow, BC_POW): BC_CASE(lt, BC_LT): BC_CASE(gt, BC_GT): BC_CASE(le, BC_LE): BC_CASE(ge, BC_GE):
-        BC_CASE(eq, BC_EQ): BC_CASE(ne, BC_NE): BC_CASE(strict_eq, BC_STRICT_EQ): BC_CASE(strict_ne, BC_STRICT_NE):
-        BC_CASE(shl, BC_SHL): BC_CASE(shr, BC_SHR): BC_CASE(sar, BC_SAR):
-        BC_CASE(bit_and, BC_BIT_AND): BC_CASE(bit_or, BC_BIT_OR): BC_CASE(bit_xor, BC_BIT_XOR):
-        BC_CASE(in_op, BC_IN): BC_CASE(instanceof, BC_INSTANCEOF): {
+        BC_CASE(add, BC_ADD)
+#if !LR_THREADED_CODE
+ case BC_SUB: case BC_MUL: case BC_DIV: case BC_MOD:
+#endif
+        BC_CASE(pow, BC_POW)
+#if !LR_THREADED_CODE
+ case BC_LT: case BC_GT: case BC_LE: case BC_GE:
+#endif
+        BC_CASE(eq, BC_EQ)
+#if !LR_THREADED_CODE
+ case BC_NE: case BC_STRICT_EQ: case BC_STRICT_NE:
+#endif
+        BC_CASE(shl, BC_SHL)
+#if !LR_THREADED_CODE
+ case BC_SHR: case BC_SAR:
+#endif
+        BC_CASE(bit_and, BC_BIT_AND)
+#if !LR_THREADED_CODE
+ case BC_BIT_OR: case BC_BIT_XOR:
+#endif
+        BC_CASE(in, BC_IN)
+#if !LR_THREADED_CODE
+ case BC_INSTANCEOF:
+#endif
+ {
             if (sp < 2) goto vm_abort;
             LRValue b = POP(), a = POP();
             LRValue r = bcv_binop(interp, (int)*(ip - 1), a, b);
@@ -1939,50 +1958,50 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             DISPATCH();
         }
 
-        BC_CASE(neg, BC_NEG): {
+        BC_CASE(neg, BC_NEG) {
             LRValue a = POP();
             LRValue r = bcv_number(ctx, -bcv_to_number(ctx, a));
             FREE_IF_HEAP(ctx, a);
             PUSH(r);
             DISPATCH();
         }
-        BC_CASE(pos, BC_POS): {
+        BC_CASE(pos, BC_POS) {
             LRValue a = POP();
             LRValue r = bcv_number(ctx, bcv_to_number(ctx, a));
             FREE_IF_HEAP(ctx, a);
             PUSH(r);
             DISPATCH();
         }
-        BC_CASE(not_op, BC_NOT): {
+        BC_CASE(not, BC_NOT) {
             LRValue a = POP();
             int t = lr_to_bool(ctx, a);
             FREE_IF_HEAP(ctx, a);
             PUSH(lr_new_bool(ctx, !t));
             DISPATCH();
         }
-        BC_CASE(bit_not, BC_BIT_NOT): {
+        BC_CASE(bit_not, BC_BIT_NOT) {
             LRValue a = POP();
             int32_t i = bcv_to_int32(ctx, a);
             FREE_IF_HEAP(ctx, a);
             PUSH(lr_new_int32(ctx, ~i));
             DISPATCH();
         }
-        BC_CASE(typeof_op, BC_TYPEOF): {
+        BC_CASE(typeof, BC_TYPEOF) {
             LRValue a = POP();
             LRValue r = lr_new_string(ctx, bcv_typeof(ctx, a));
             FREE_IF_HEAP(ctx, a);
             PUSH(r);
             DISPATCH();
         }
-        BC_CASE(void_op, BC_VOID): {
+        BC_CASE(void, BC_VOID) {
             LRValue a = POP();
             FREE_IF_HEAP(ctx, a);
             PUSH(LR_VALUE_UNDEFINED);
             DISPATCH();
         }
 
-        BC_CASE(jump, BC_JUMP): { int32_t off = rd32(&ip); ip += off; DISPATCH(); }
-        BC_CASE(jump_if_false, BC_JUMP_IF_FALSE): {
+        BC_CASE(jump, BC_JUMP) { int32_t off = rd32(&ip); ip += off; DISPATCH(); }
+        BC_CASE(jump_if_false, BC_JUMP_IF_FALSE) {
             int32_t off = rd32(&ip);
             LRValue v = POP();
             int t = lr_to_bool(ctx, v);
@@ -1990,7 +2009,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             if (!t) ip += off;
             DISPATCH();
         }
-        BC_CASE(jump_if_true, BC_JUMP_IF_TRUE): {
+        BC_CASE(jump_if_true, BC_JUMP_IF_TRUE) {
             int32_t off = rd32(&ip);
             LRValue v = POP();
             int t = lr_to_bool(ctx, v);
@@ -1998,26 +2017,26 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             if (t) ip += off;
             DISPATCH();
         }
-        BC_CASE(jump_if_false_keep, BC_JUMP_IF_FALSE_KEEP): {
+        BC_CASE(jump_if_false_keep, BC_JUMP_IF_FALSE_KEEP) {
             int32_t off = rd32(&ip);
             if (sp < 1) goto vm_abort;
             if (!lr_to_bool(ctx, stack[sp - 1])) ip += off;
             DISPATCH();
         }
-        BC_CASE(jump_if_true_keep, BC_JUMP_IF_TRUE_KEEP): {
+        BC_CASE(jump_if_true_keep, BC_JUMP_IF_TRUE_KEEP) {
             int32_t off = rd32(&ip);
             if (sp < 1) goto vm_abort;
             if (lr_to_bool(ctx, stack[sp - 1])) ip += off;
             DISPATCH();
         }
-        BC_CASE(jump_if_not_nullish, BC_JUMP_IF_NOT_NULLISH): {
+        BC_CASE(jump_if_not_nullish, BC_JUMP_IF_NOT_NULLISH) {
             int32_t off = rd32(&ip);
             if (sp < 1) goto vm_abort;
             LRValue v = stack[sp - 1];
             if (v.tag != LR_TYPE_UNDEFINED && v.tag != LR_TYPE_NULL) ip += off;
             DISPATCH();
         }
-        BC_CASE(loop_tick, BC_LOOP_TICK):
+        BC_CASE(loop_tick, BC_LOOP_TICK)
             if (interp->timeout_ms > 0 && ++interp->stmt_counter >= 1024) {
                 interp->stmt_counter = 0;
                 clock_t now = clock();
@@ -2031,7 +2050,11 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             }
             DISPATCH();
 
-        BC_CASE(call, BC_CALL): BC_CASE(call_method, BC_CALL_METHOD): BC_CASE(call_elem, BC_CALL_ELEM): BC_CASE(new_op, BC_NEW): {
+        BC_CASE(call, BC_CALL)
+#if !LR_THREADED_CODE
+ case BC_CALL_METHOD: case BC_CALL_ELEM: case BC_NEW:
+#endif
+ {
             uint8_t saved_op = *(ip - 1);
             uint16_t name_idx = 0;
             if (saved_op == BC_CALL_METHOD) name_idx = rd16(&ip);
@@ -2077,15 +2100,15 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             DISPATCH();
         }
 
-        BC_CASE(return_op, BC_RETURN): {
+        BC_CASE(return, BC_RETURN) {
             LRValue v = POP();
             FREE_IF_HEAP(ctx, result);
             result = v;
             goto vm_done;
         }
 
-        BC_CASE(new_object, BC_NEW_OBJECT): PUSH(lr_new_object(ctx)); DISPATCH();
-        BC_CASE(new_array, BC_NEW_ARRAY): {
+        BC_CASE(new_object, BC_NEW_OBJECT) PUSH(lr_new_object(ctx)); DISPATCH();
+        BC_CASE(new_array, BC_NEW_ARRAY) {
             uint16_t n = rd16(&ip);
             if (sp < n) goto vm_abort;
             LRValue arr = lr_new_array(ctx);
@@ -2097,14 +2120,14 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             PUSH(arr);
             DISPATCH();
         }
-        BC_CASE(def_prop, BC_DEF_PROP): {
+        BC_CASE(def_prop, BC_DEF_PROP) {
             uint16_t si = rd16(&ip);
             if (sp < 2) goto vm_abort;
             LRValue v = POP();
             lr_set_property_str(ctx, stack[sp - 1], prog->pool[si].u.str, v);
             DISPATCH();
         }
-        BC_CASE(def_elem, BC_DEF_ELEM): {
+        BC_CASE(def_elem, BC_DEF_ELEM) {
             if (sp < 3) goto vm_abort;
             LRValue v = POP(), k = POP();
             LRString *atom = lr_to_atom(ctx, k);
@@ -2112,7 +2135,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             FREE_IF_HEAP(ctx, k);
             DISPATCH();
         }
-        BC_CASE(get_prop, BC_GET_PROP): {
+        BC_CASE(get_prop, BC_GET_PROP) {
             uint16_t si = rd16(&ip);
             LRValue o = POP();
             LRValue v = lr_get_property_str(ctx, o, prog->pool[si].u.str);
@@ -2121,7 +2144,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             PUSH(v);
             DISPATCH();
         }
-        BC_CASE(set_prop, BC_SET_PROP): {
+        BC_CASE(set_prop, BC_SET_PROP) {
             uint16_t si = rd16(&ip);
             if (sp < 2) goto vm_abort;
             LRValue v = POP(), o = POP();
@@ -2130,7 +2153,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             PUSH(v);
             DISPATCH();
         }
-        BC_CASE(get_elem, BC_GET_ELEM): {
+        BC_CASE(get_elem, BC_GET_ELEM) {
             if (sp < 2) goto vm_abort;
             LRValue k = POP(), o = POP();
             LRString *atom = lr_to_atom(ctx, k);
@@ -2141,7 +2164,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             PUSH(v);
             DISPATCH();
         }
-        BC_CASE(set_elem, BC_SET_ELEM): {
+        BC_CASE(set_elem, BC_SET_ELEM) {
             if (sp < 3) goto vm_abort;
             LRValue v = POP(), k = POP(), o = POP();
             LRString *atom = lr_to_atom(ctx, k);
@@ -2151,7 +2174,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             PUSH(v);
             DISPATCH();
         }
-        BC_CASE(delete_prop, BC_DELETE_PROP): {
+        BC_CASE(delete_prop, BC_DELETE_PROP) {
             uint16_t si = rd16(&ip);
             LRValue o = POP();
             LRString *atom = lr_new_atom(ctx, prog->pool[si].u.str);
@@ -2160,7 +2183,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             PUSH(lr_new_bool(ctx, 1));
             DISPATCH();
         }
-        BC_CASE(delete_elem, BC_DELETE_ELEM): {
+        BC_CASE(delete_elem, BC_DELETE_ELEM) {
             if (sp < 2) goto vm_abort;
             LRValue k = POP(), o = POP();
             LRString *atom = lr_to_atom(ctx, k);
@@ -2171,7 +2194,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             DISPATCH();
         }
 
-        BC_CASE(iter_init, BC_ITER_INIT): {
+        BC_CASE(iter_init, BC_ITER_INIT) {
             LRValue src = POP();
             LRValue nextfn = LR_VALUE_UNDEFINED;
             int32_t index = 0;
@@ -2204,7 +2227,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             PUSH(lr_new_int32(ctx, index));
             DISPATCH();
         }
-        BC_CASE(iter_next, BC_ITER_NEXT): {
+        BC_CASE(iter_next, BC_ITER_NEXT) {
             int32_t off = rd32(&ip);
             if (sp < 3) goto vm_abort;
             int32_t index = stack[sp - 1].u.int32;
@@ -2251,7 +2274,7 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             }
             DISPATCH();
         }
-        BC_CASE(iter_close, BC_ITER_CLOSE): {
+        BC_CASE(iter_close, BC_ITER_CLOSE) {
             if (sp < 3) goto vm_abort;
             LRValue idx = POP(), nf = POP(), src = POP();
             (void)idx;
@@ -2260,12 +2283,12 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             DISPATCH();
         }
 
-        BC_CASE(scope_enter, BC_SCOPE_ENTER): interp_bc_push_scope(interp); scope_depth++; DISPATCH();
-        BC_CASE(scope_leave, BC_SCOPE_LEAVE):
+        BC_CASE(scope_enter, BC_SCOPE_ENTER) interp_bc_push_scope(interp); scope_depth++; DISPATCH();
+        BC_CASE(scope_leave, BC_SCOPE_LEAVE)
             if (scope_depth > 0) { interp_bc_pop_scope(interp); scope_depth--; }
             DISPATCH();
 
-        BC_CASE(eval_node, BC_EVAL_NODE): {
+        BC_CASE(eval_node, BC_EVAL_NODE) {
             uint16_t si = rd16(&ip);
             LRValue v = interp_bc_eval_node(interp, (ASTNode *)prog->pool[si].u.node);
             if (interp->error_flag || interp->exception_pending ||
@@ -2276,25 +2299,25 @@ LRValue bc_execute(BCProgram *prog, LRContext *ctx)
             PUSH(v);
             DISPATCH();
         }
-        BC_CASE(eval_node_pop, BC_EVAL_NODE_POP): {
+        BC_CASE(eval_node_pop, BC_EVAL_NODE_POP) {
             uint16_t si = rd16(&ip);
             LRValue v = interp_bc_eval_node(interp, (ASTNode *)prog->pool[si].u.node);
             FREE_IF_HEAP(ctx, v);
             CHECK();
             DISPATCH();
         }
-        BC_CASE(set_result, BC_SET_RESULT): {
+        BC_CASE(set_result, BC_SET_RESULT) {
             LRValue v = POP();
             FREE_IF_HEAP(ctx, result);
             result = v;
             DISPATCH();
         }
-        BC_CASE(clear_result, BC_CLEAR_RESULT):
+        BC_CASE(clear_result, BC_CLEAR_RESULT)
             FREE_IF_HEAP(ctx, result);
             result = LR_VALUE_UNDEFINED;
             DISPATCH();
 
-        BC_CASE(throw_op, BC_THROW): {
+        BC_CASE(throw, BC_THROW) {
             LRValue v = POP();
             interp_bc_throw(interp, v);
             FREE_IF_HEAP(ctx, v);
@@ -2359,10 +2382,10 @@ uint8_t *bc_serialize(BCProgram *prog, size_t *out_len)
     for (int i = 0; i < prog->pool_count; i++) {
         total += 1;
         switch (prog->pool[i].kind) {
-        case BC_POOL_INT32:   total += 4; break;
-        case BC_POOL_FLOAT64: total += 8; break;
-        case BC_POOL_STRING:  total += 4 + strlen(prog->pool[i].u.str) + 1; break;
-        case BC_POOL_NODE:    break;
+        case(pool_int32: BC_POOL_INT32   total += 4; break;
+        case(pool_float64: BC_POOL_FLOAT64 total += 8; break;
+        case(pool_string: BC_POOL_STRING  total += 4 + strlen(prog->pool[i].u.str) + 1; break;
+        case(pool_node: BC_POOL_NODE    break;
         }
     }
     uint8_t *buf = (uint8_t *)malloc(total);
@@ -2380,19 +2403,19 @@ uint8_t *bc_serialize(BCProgram *prog, size_t *out_len)
     for (int i = 0; i < prog->pool_count; i++) {
         buf[pos++] = (uint8_t)prog->pool[i].kind;
         switch (prog->pool[i].kind) {
-        case BC_POOL_INT32:
+        case(pool_int32: BC_POOL_INT32
             put_u32(buf + pos, (uint32_t)prog->pool[i].u.i32); pos += 4;
             break;
-        case BC_POOL_FLOAT64:
+        case(pool_float64: BC_POOL_FLOAT64
             memcpy(buf + pos, &prog->pool[i].u.f64, 8); pos += 8;
             break;
-        case BC_POOL_STRING: {
+        case(pool_string: BC_POOL_STRING {
             size_t sl = strlen(prog->pool[i].u.str);
             put_u32(buf + pos, (uint32_t)sl); pos += 4;
             memcpy(buf + pos, prog->pool[i].u.str, sl + 1); pos += sl + 1;
             break;
         }
-        case BC_POOL_NODE:
+        case(pool_node: BC_POOL_NODE
             break;
         }
     }
@@ -2430,15 +2453,15 @@ BCProgram *bc_deserialize(const uint8_t *data, size_t len)
         if (pos >= len) { bc_free_program(p); return NULL; }
         p->pool[i].kind = (BCPoolKind)data[pos++];
         switch (p->pool[i].kind) {
-        case BC_POOL_INT32:
+        case(pool_int32: BC_POOL_INT32
             if (pos + 4 > len) { bc_free_program(p); return NULL; }
             p->pool[i].u.i32 = (int32_t)get_u32(data + pos); pos += 4;
             break;
-        case BC_POOL_FLOAT64:
+        case(pool_float64: BC_POOL_FLOAT64
             if (pos + 8 > len) { bc_free_program(p); return NULL; }
             memcpy(&p->pool[i].u.f64, data + pos, 8); pos += 8;
             break;
-        case BC_POOL_STRING: {
+        case(pool_string: BC_POOL_STRING {
             if (pos + 4 > len) { bc_free_program(p); return NULL; }
             uint32_t sl = get_u32(data + pos); pos += 4;
             if (pos + sl + 1 > len) { bc_free_program(p); return NULL; }
@@ -2449,7 +2472,7 @@ BCProgram *bc_deserialize(const uint8_t *data, size_t len)
             pos += sl + 1;
             break;
         }
-        case BC_POOL_NODE:
+        case(pool_node: BC_POOL_NODE
             bc_free_program(p);
             return NULL;
         }
@@ -2471,85 +2494,85 @@ static BCInfo bc_info(uint8_t op)
     BCInfo t;
     t.name = "?"; t.operands = 0;
     switch (op) {
-    BC_CASE(stop, BC_STOP): t.name = "STOP"; break;
-    BC_CASE(nop, BC_NOP): t.name = "NOP"; break;
-    BC_CASE(push_undefined, BC_PUSH_UNDEFINED): t.name = "PUSH_UNDEFINED"; break;
-    BC_CASE(push_null, BC_PUSH_NULL): t.name = "PUSH_NULL"; break;
-    BC_CASE(push_true, BC_PUSH_TRUE): t.name = "PUSH_TRUE"; break;
-    BC_CASE(push_false, BC_PUSH_FALSE): t.name = "PUSH_FALSE"; break;
-    BC_CASE(push_this, BC_PUSH_THIS): t.name = "PUSH_THIS"; break;
-    BC_CASE(push_int32, BC_PUSH_INT32): t.name = "PUSH_INT32"; t.operands = 2; break;
-    BC_CASE(push_float64, BC_PUSH_FLOAT64): t.name = "PUSH_FLOAT64"; t.operands = 1; break;
-    BC_CASE(push_string, BC_PUSH_STRING): t.name = "PUSH_STRING"; t.operands = 1; break;
-    BC_CASE(pop, BC_POP): t.name = "POP"; break;
-    BC_CASE(dup, BC_DUP): t.name = "DUP"; break;
-    BC_CASE(dup2, BC_DUP2): t.name = "DUP2"; break;
-    BC_CASE(swap, BC_SWAP): t.name = "SWAP"; break;
-    BC_CASE(rot3, BC_ROT3): t.name = "ROT3"; break;
-    BC_CASE(load_var, BC_LOAD_VAR): t.name = "LOAD_VAR"; t.operands = 1; break;
-    BC_CASE(store_var, BC_STORE_VAR): t.name = "STORE_VAR"; t.operands = 1; break;
-    BC_CASE(declare_var, BC_DECLARE_VAR): t.name = "DECLARE_VAR"; t.operands = 4; break;
-    BC_CASE(typeof_var, BC_TYPEOF_VAR): t.name = "TYPEOF_VAR"; t.operands = 1; break;
-    BC_CASE(add, BC_ADD): t.name = "ADD"; break;
-    BC_CASE(sub, BC_SUB): t.name = "SUB"; break;
-    BC_CASE(mul, BC_MUL): t.name = "MUL"; break;
-    BC_CASE(div, BC_DIV): t.name = "DIV"; break;
-    BC_CASE(mod, BC_MOD): t.name = "MOD"; break;
-    BC_CASE(pow, BC_POW): t.name = "POW"; break;
-    BC_CASE(lt, BC_LT): t.name = "LT"; break;
-    BC_CASE(gt, BC_GT): t.name = "GT"; break;
-    BC_CASE(le, BC_LE): t.name = "LE"; break;
-    BC_CASE(ge, BC_GE): t.name = "GE"; break;
-    BC_CASE(eq, BC_EQ): t.name = "EQ"; break;
-    BC_CASE(ne, BC_NE): t.name = "NE"; break;
-    BC_CASE(strict_eq, BC_STRICT_EQ): t.name = "STRICT_EQ"; break;
-    BC_CASE(strict_ne, BC_STRICT_NE): t.name = "STRICT_NE"; break;
-    BC_CASE(shl, BC_SHL): t.name = "SHL"; break;
-    BC_CASE(shr, BC_SHR): t.name = "SHR"; break;
-    BC_CASE(sar, BC_SAR): t.name = "SAR"; break;
-    BC_CASE(bit_and, BC_BIT_AND): t.name = "BIT_AND"; break;
-    BC_CASE(bit_or, BC_BIT_OR): t.name = "BIT_OR"; break;
-    BC_CASE(bit_xor, BC_BIT_XOR): t.name = "BIT_XOR"; break;
-    BC_CASE(in_op, BC_IN): t.name = "IN"; break;
-    BC_CASE(instanceof, BC_INSTANCEOF): t.name = "INSTANCEOF"; break;
-    BC_CASE(neg, BC_NEG): t.name = "NEG"; break;
-    BC_CASE(pos, BC_POS): t.name = "POS"; break;
-    BC_CASE(not_op, BC_NOT): t.name = "NOT"; break;
-    BC_CASE(bit_not, BC_BIT_NOT): t.name = "BIT_NOT"; break;
-    BC_CASE(typeof_op, BC_TYPEOF): t.name = "TYPEOF"; break;
-    BC_CASE(void_op, BC_VOID): t.name = "VOID"; break;
-    BC_CASE(jump, BC_JUMP): t.name = "JUMP"; t.operands = 2; break;
-    BC_CASE(jump_if_false, BC_JUMP_IF_FALSE): t.name = "JUMP_IF_FALSE"; t.operands = 2; break;
-    BC_CASE(jump_if_true, BC_JUMP_IF_TRUE): t.name = "JUMP_IF_TRUE"; t.operands = 2; break;
-    BC_CASE(jump_if_false_keep, BC_JUMP_IF_FALSE_KEEP): t.name = "JUMP_IF_FALSE_KEEP"; t.operands = 2; break;
-    BC_CASE(jump_if_true_keep, BC_JUMP_IF_TRUE_KEEP): t.name = "JUMP_IF_TRUE_KEEP"; t.operands = 2; break;
-    BC_CASE(jump_if_not_nullish, BC_JUMP_IF_NOT_NULLISH): t.name = "JUMP_IF_NOT_NULLISH"; t.operands = 2; break;
-    BC_CASE(loop_tick, BC_LOOP_TICK): t.name = "LOOP_TICK"; break;
-    BC_CASE(call, BC_CALL): t.name = "CALL"; t.operands = 1; break;
-    BC_CASE(call_method, BC_CALL_METHOD): t.name = "CALL_METHOD"; t.operands = 3; break;
-    BC_CASE(call_elem, BC_CALL_ELEM): t.name = "CALL_ELEM"; t.operands = 1; break;
-    BC_CASE(new_op, BC_NEW): t.name = "NEW"; t.operands = 1; break;
-    BC_CASE(return_op, BC_RETURN): t.name = "RETURN"; break;
-    BC_CASE(new_object, BC_NEW_OBJECT): t.name = "NEW_OBJECT"; break;
-    BC_CASE(new_array, BC_NEW_ARRAY): t.name = "NEW_ARRAY"; t.operands = 1; break;
-    BC_CASE(def_prop, BC_DEF_PROP): t.name = "DEF_PROP"; t.operands = 1; break;
-    BC_CASE(def_elem, BC_DEF_ELEM): t.name = "DEF_ELEM"; break;
-    BC_CASE(get_prop, BC_GET_PROP): t.name = "GET_PROP"; t.operands = 1; break;
-    BC_CASE(set_prop, BC_SET_PROP): t.name = "SET_PROP"; t.operands = 1; break;
-    BC_CASE(get_elem, BC_GET_ELEM): t.name = "GET_ELEM"; break;
-    BC_CASE(set_elem, BC_SET_ELEM): t.name = "SET_ELEM"; break;
-    BC_CASE(delete_prop, BC_DELETE_PROP): t.name = "DELETE_PROP"; t.operands = 1; break;
-    BC_CASE(delete_elem, BC_DELETE_ELEM): t.name = "DELETE_ELEM"; break;
-    BC_CASE(iter_init, BC_ITER_INIT): t.name = "ITER_INIT"; break;
-    BC_CASE(iter_next, BC_ITER_NEXT): t.name = "ITER_NEXT"; t.operands = 2; break;
-    BC_CASE(iter_close, BC_ITER_CLOSE): t.name = "ITER_CLOSE"; break;
-    BC_CASE(scope_enter, BC_SCOPE_ENTER): t.name = "SCOPE_ENTER"; break;
-    BC_CASE(scope_leave, BC_SCOPE_LEAVE): t.name = "SCOPE_LEAVE"; break;
-    BC_CASE(eval_node, BC_EVAL_NODE): t.name = "EVAL_NODE"; t.operands = 1; break;
-    BC_CASE(eval_node_pop, BC_EVAL_NODE_POP): t.name = "EVAL_NODE_POP"; t.operands = 1; break;
-    BC_CASE(set_result, BC_SET_RESULT): t.name = "SET_RESULT"; break;
-    BC_CASE(clear_result, BC_CLEAR_RESULT): t.name = "CLEAR_RESULT"; break;
-    BC_CASE(throw_op, BC_THROW): t.name = "THROW"; break;
+    BC_CASE(stop, BC_STOP) t.name = "STOP"; break;
+    BC_CASE(nop, BC_NOP) t.name = "NOP"; break;
+    BC_CASE(push_undefined, BC_PUSH_UNDEFINED) t.name = "PUSH_UNDEFINED"; break;
+    BC_CASE(push_null, BC_PUSH_NULL) t.name = "PUSH_NULL"; break;
+    BC_CASE(push_true, BC_PUSH_TRUE) t.name = "PUSH_TRUE"; break;
+    BC_CASE(push_false, BC_PUSH_FALSE) t.name = "PUSH_FALSE"; break;
+    BC_CASE(push_this, BC_PUSH_THIS) t.name = "PUSH_THIS"; break;
+    BC_CASE(push_int32, BC_PUSH_INT32) t.name = "PUSH_INT32"; t.operands = 2; break;
+    BC_CASE(push_float64, BC_PUSH_FLOAT64) t.name = "PUSH_FLOAT64"; t.operands = 1; break;
+    BC_CASE(push_string, BC_PUSH_STRING) t.name = "PUSH_STRING"; t.operands = 1; break;
+    BC_CASE(pop, BC_POP) t.name = "POP"; break;
+    BC_CASE(dup, BC_DUP) t.name = "DUP"; break;
+    BC_CASE(dup2, BC_DUP2) t.name = "DUP2"; break;
+    BC_CASE(swap, BC_SWAP) t.name = "SWAP"; break;
+    BC_CASE(rot3, BC_ROT3) t.name = "ROT3"; break;
+    BC_CASE(load_var, BC_LOAD_VAR) t.name = "LOAD_VAR"; t.operands = 1; break;
+    BC_CASE(store_var, BC_STORE_VAR) t.name = "STORE_VAR"; t.operands = 1; break;
+    BC_CASE(declare_var, BC_DECLARE_VAR) t.name = "DECLARE_VAR"; t.operands = 4; break;
+    BC_CASE(typeof_var, BC_TYPEOF_VAR) t.name = "TYPEOF_VAR"; t.operands = 1; break;
+    BC_CASE(add, BC_ADD) t.name = "ADD"; break;
+    BC_CASE(sub, BC_SUB) t.name = "SUB"; break;
+    BC_CASE(mul, BC_MUL) t.name = "MUL"; break;
+    BC_CASE(div, BC_DIV) t.name = "DIV"; break;
+    BC_CASE(mod, BC_MOD) t.name = "MOD"; break;
+    BC_CASE(pow, BC_POW) t.name = "POW"; break;
+    BC_CASE(lt, BC_LT) t.name = "LT"; break;
+    BC_CASE(gt, BC_GT) t.name = "GT"; break;
+    BC_CASE(le, BC_LE) t.name = "LE"; break;
+    BC_CASE(ge, BC_GE) t.name = "GE"; break;
+    BC_CASE(eq, BC_EQ) t.name = "EQ"; break;
+    BC_CASE(ne, BC_NE) t.name = "NE"; break;
+    BC_CASE(strict_eq, BC_STRICT_EQ) t.name = "STRICT_EQ"; break;
+    BC_CASE(strict_ne, BC_STRICT_NE) t.name = "STRICT_NE"; break;
+    BC_CASE(shl, BC_SHL) t.name = "SHL"; break;
+    BC_CASE(shr, BC_SHR) t.name = "SHR"; break;
+    BC_CASE(sar, BC_SAR) t.name = "SAR"; break;
+    BC_CASE(bit_and, BC_BIT_AND) t.name = "BIT_AND"; break;
+    BC_CASE(bit_or, BC_BIT_OR) t.name = "BIT_OR"; break;
+    BC_CASE(bit_xor, BC_BIT_XOR) t.name = "BIT_XOR"; break;
+    BC_CASE(in, BC_IN) t.name = "IN"; break;
+    BC_CASE(instanceof, BC_INSTANCEOF) t.name = "INSTANCEOF"; break;
+    BC_CASE(neg, BC_NEG) t.name = "NEG"; break;
+    BC_CASE(pos, BC_POS) t.name = "POS"; break;
+    BC_CASE(not, BC_NOT) t.name = "NOT"; break;
+    BC_CASE(bit_not, BC_BIT_NOT) t.name = "BIT_NOT"; break;
+    BC_CASE(typeof, BC_TYPEOF) t.name = "TYPEOF"; break;
+    BC_CASE(void, BC_VOID) t.name = "VOID"; break;
+    BC_CASE(jump, BC_JUMP) t.name = "JUMP"; t.operands = 2; break;
+    BC_CASE(jump_if_false, BC_JUMP_IF_FALSE) t.name = "JUMP_IF_FALSE"; t.operands = 2; break;
+    BC_CASE(jump_if_true, BC_JUMP_IF_TRUE) t.name = "JUMP_IF_TRUE"; t.operands = 2; break;
+    BC_CASE(jump_if_false_keep, BC_JUMP_IF_FALSE_KEEP) t.name = "JUMP_IF_FALSE_KEEP"; t.operands = 2; break;
+    BC_CASE(jump_if_true_keep, BC_JUMP_IF_TRUE_KEEP) t.name = "JUMP_IF_TRUE_KEEP"; t.operands = 2; break;
+    BC_CASE(jump_if_not_nullish, BC_JUMP_IF_NOT_NULLISH) t.name = "JUMP_IF_NOT_NULLISH"; t.operands = 2; break;
+    BC_CASE(loop_tick, BC_LOOP_TICK) t.name = "LOOP_TICK"; break;
+    BC_CASE(call, BC_CALL) t.name = "CALL"; t.operands = 1; break;
+    BC_CASE(call_method, BC_CALL_METHOD) t.name = "CALL_METHOD"; t.operands = 3; break;
+    BC_CASE(call_elem, BC_CALL_ELEM) t.name = "CALL_ELEM"; t.operands = 1; break;
+    BC_CASE(new, BC_NEW) t.name = "NEW"; t.operands = 1; break;
+    BC_CASE(return, BC_RETURN) t.name = "RETURN"; break;
+    BC_CASE(new_object, BC_NEW_OBJECT) t.name = "NEW_OBJECT"; break;
+    BC_CASE(new_array, BC_NEW_ARRAY) t.name = "NEW_ARRAY"; t.operands = 1; break;
+    BC_CASE(def_prop, BC_DEF_PROP) t.name = "DEF_PROP"; t.operands = 1; break;
+    BC_CASE(def_elem, BC_DEF_ELEM) t.name = "DEF_ELEM"; break;
+    BC_CASE(get_prop, BC_GET_PROP) t.name = "GET_PROP"; t.operands = 1; break;
+    BC_CASE(set_prop, BC_SET_PROP) t.name = "SET_PROP"; t.operands = 1; break;
+    BC_CASE(get_elem, BC_GET_ELEM) t.name = "GET_ELEM"; break;
+    BC_CASE(set_elem, BC_SET_ELEM) t.name = "SET_ELEM"; break;
+    BC_CASE(delete_prop, BC_DELETE_PROP) t.name = "DELETE_PROP"; t.operands = 1; break;
+    BC_CASE(delete_elem, BC_DELETE_ELEM) t.name = "DELETE_ELEM"; break;
+    BC_CASE(iter_init, BC_ITER_INIT) t.name = "ITER_INIT"; break;
+    BC_CASE(iter_next, BC_ITER_NEXT) t.name = "ITER_NEXT"; t.operands = 2; break;
+    BC_CASE(iter_close, BC_ITER_CLOSE) t.name = "ITER_CLOSE"; break;
+    BC_CASE(scope_enter, BC_SCOPE_ENTER) t.name = "SCOPE_ENTER"; break;
+    BC_CASE(scope_leave, BC_SCOPE_LEAVE) t.name = "SCOPE_LEAVE"; break;
+    BC_CASE(eval_node, BC_EVAL_NODE) t.name = "EVAL_NODE"; t.operands = 1; break;
+    BC_CASE(eval_node_pop, BC_EVAL_NODE_POP) t.name = "EVAL_NODE_POP"; t.operands = 1; break;
+    BC_CASE(set_result, BC_SET_RESULT) t.name = "SET_RESULT"; break;
+    BC_CASE(clear_result, BC_CLEAR_RESULT) t.name = "CLEAR_RESULT"; break;
+    BC_CASE(throw, BC_THROW) t.name = "THROW"; break;
     default: break;
     }
     return t;
