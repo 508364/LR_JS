@@ -92,14 +92,3 @@ jit_analysis.txt
 sljitUtils.obj
 *.bak*
 debug_logs/
-
-# Nested upstream repos (must never be uploaded with this repo)
-/quickjs
-/v8
-/git-github
-
-# Debug artifacts directory
-/_debug/
-
-# Benchmarks directory
-/bench/
