@@ -13,11 +13,90 @@
 #include "lr_ast.h"
 #include "lr_interp.h"
 #include "lr_bytecode.h"
+#include "lr_jit.h"
 #include "../lr_promise.h"
+#include "../lr_platform.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#ifdef STR_POOL_DEBUG
+#include <malloc.h>
+#include <execinfo.h>
+
+/* Registry of linked-list pool node creations, to identify which code path
+ * created a node whose recorded size later turns out to be bogus. */
+#define POOL_REG_MAX 8192
+static struct {
+    void *ptr;
+    size_t size;
+    void *bt[8];
+    int   bt_len;
+} pool_reg[POOL_REG_MAX];
+static int pool_reg_n = 0;
+static void pool_reg_add(void *ptr, size_t size)
+{
+    if (pool_reg_n < POOL_REG_MAX) {
+        pool_reg[pool_reg_n].ptr = ptr;
+        pool_reg[pool_reg_n].size = size;
+        pool_reg[pool_reg_n].bt_len = backtrace(pool_reg[pool_reg_n].bt, 8);
+        pool_reg_n++;
+    }
+}
+static void pool_reg_dump(void *ptr)
+{
+    for (int i = 0; i < pool_reg_n; i++) {
+        if (pool_reg[i].ptr == ptr) {
+            fprintf(stderr, "  node created here (recorded size=%zu):\n", pool_reg[i].size);
+            backtrace_symbols_fd(pool_reg[i].bt, pool_reg[i].bt_len, 2);
+            return;
+        }
+    }
+    fprintf(stderr, "  node NOT FOUND in creation registry\n");
+}
+
+/* ── Full pool-operation history (per pointer) ───────────────────────── */
+/* Ring-buffer of every push/pop event on the string pool, so that when a
+ * node is found corrupted we can dump its complete lifecycle. */
+#define POOL_HIST_MAX 16384
+enum { PH_PUSH_RING, PH_PUSH_LINK, PH_POP_RING, PH_POP_LINK, PH_RING2LINK, PH_FRESH };
+static struct {
+    void  *ptr;
+    int    op;
+    int    site;        /* lr_string_free / lr_string_alloc ring2link / ... */
+    size_t len;         /* string logical length at the event */
+    size_t usable;      /* malloc_usable_size at the event */
+    size_t node_size;   /* node->size if pushed */
+    size_t req_len;     /* requested length if alloc event */
+} pool_hist[POOL_HIST_MAX];
+static int pool_hist_n = 0;
+static void pool_hist_add(void *ptr, int op, int site, size_t len, size_t usable, size_t node_size, size_t req_len)
+{
+    int i = pool_hist_n % POOL_HIST_MAX;
+    pool_hist[i].ptr = ptr;
+    pool_hist[i].op = op;
+    pool_hist[i].site = site;
+    pool_hist[i].len = len;
+    pool_hist[i].usable = usable;
+    pool_hist[i].node_size = node_size;
+    pool_hist[i].req_len = req_len;
+    pool_hist_n++;
+}
+static void pool_hist_dump(void *ptr)
+{
+    const char *opname[] = { "PUSH_RING", "PUSH_LINK", "POP_RING", "POP_LINK", "RING2LINK", "FRESH" };
+    int start = pool_hist_n > POOL_HIST_MAX ? pool_hist_n - POOL_HIST_MAX : 0;
+    fprintf(stderr, "  pool history for %p (events %d..%d):\n", ptr, start, pool_hist_n - 1);
+    for (int i = start; i < pool_hist_n; i++) {
+        const struct { void *ptr; int op; int site; size_t len; size_t usable; size_t node_size; size_t req_len; } *e
+            = (const void *)&pool_hist[i % POOL_HIST_MAX];
+        if (e->ptr == ptr) {
+            fprintf(stderr, "    [%d] %-10s site=%d len=%zu usable=%zu node_size=%zu req_len=%zu\n",
+                    i, opname[e->op], e->site, e->len, e->usable, e->node_size, e->req_len);
+        }
+    }
+}
+#endif
 
 /* Forward declaration to avoid pulling in lr_iome586.h which
  * transitively includes <windows.h> → winnt.h → TokenType collision. */
@@ -50,23 +129,289 @@ static void lr_free(LRRuntime *rt, void *ptr, size_t size)
     }
 }
 
+/* ── LRString Free-List Pool ─────────────────────────────────────────────
+ * Recycled LRString allocations (data length ≤ 256) are returned to a
+ * singly-linked free list instead of being freed.  This eliminates
+ * malloc/free churn in hot string-concat loops while remaining fully
+ * GC-safe because the pool is drained at runtime destruction.
+ * Maximum wasted memory: 256 bytes per pooled entry.                      */
+
+#define LR_STR_POOL_MAX_DATA  512   /* max string data length in pool */
+
+/* Each freed LRString is cast to this layout while on the free list.
+ * The first two fields overlap with the dead LRString header bytes. */
+typedef struct LRStrPoolNode {
+    struct LRStrPoolNode *next;   /* next free entry (overwrites ref_count) */
+    size_t               size;    /* original allocation size (overwrites len) */
+} LRStrPoolNode;
+
+/* ── Size-segregated string pool helpers ───────────────────────────────
+ * Bin k holds blocks whose size is in (2^(k-1), 2^k]  (bin 0 holds size 1).
+ * A request with bin j can be satisfied by any node in bin k >= j+1 without
+ * a per-node check (its size range always exceeds the request range).    */
+
+static int lr_str_pool_bin(size_t size)
+{
+    int bin = 0;
+    size_t v = size - 1;
+    while (v > 0) { v >>= 1; bin++; }
+    return bin;
+}
+
+static size_t lr_str_pool_bin_max_recompute(LRRuntime *rt, int k)
+{
+    size_t m = 0;
+    for (LRStrPoolNode *q = (LRStrPoolNode *)rt->str_pool_bins[k]; q; q = q->next)
+        if (q->size > m) m = q->size;
+    return m;
+}
+
+/* Overall pool max = max over bins.  O(LR_STR_POOL_NUM_BINS), constant,
+ * replacing the old O(n) rescan after every max-block pop. */
+static void lr_str_pool_recompute_global(LRRuntime *rt)
+{
+    size_t m = 0;
+    for (int k = 0; k < LR_STR_POOL_NUM_BINS; k++)
+        if (rt->str_pool_bin_max[k] > m) m = rt->str_pool_bin_max[k];
+    rt->str_pool_max_size = m;
+}
+
+/* Push a freed block into the size-segregated pool.  O(1). */
+static void lr_str_pool_push(LRRuntime *rt, LRString *s, size_t alloc_size)
+{
+    int k = lr_str_pool_bin(alloc_size);
+    if (k >= LR_STR_POOL_NUM_BINS) {
+        /* Oversized for the pool — hand back to the allocator directly. */
+        rt->str_count--;
+        rt->str_size -= (int64_t)alloc_size;
+        lr_free(rt, s, alloc_size);
+        return;
+    }
+    LRStrPoolNode *node = (LRStrPoolNode *)s;
+    node->next = (LRStrPoolNode *)rt->str_pool_bins[k];
+    node->size = alloc_size;
+    rt->str_pool_bins[k] = node;
+    if (alloc_size > rt->str_pool_bin_max[k]) rt->str_pool_bin_max[k] = alloc_size;
+    if (alloc_size > rt->str_pool_max_size) rt->str_pool_max_size = alloc_size;
+}
+
 /* ── String Operations ────────────────────────────────────────────────── */
 
-static LRString *lr_string_alloc(LRRuntime *rt, const char *str, size_t len)
+/* Cached env flag: getenv() on MSVCRT locks + scans the env (~7-14µs on
+ * Windows); lr_string_alloc is on EVERY string-allocation hot path. */
+static int g_lr_env_debug_poolstats = -1;
+
+LRString *lr_string_alloc(LRRuntime *rt, const char *str, size_t len)
 {
+    size_t need = sizeof(LRString) + len + 1;
+    if (rt) {
+        rt->str_pool_alloc_calls++;
+        if (g_lr_env_debug_poolstats < 0)
+            g_lr_env_debug_poolstats = (getenv("LR_DEBUG_POOLSTATS") != NULL);
+        if (g_lr_env_debug_poolstats && (rt->str_pool_alloc_calls & 0xFFFFF) == 0) {
+            fprintf(stderr,
+                    "[POOLSTATS] alloc=%llu scan_calls=%llu scan_steps=%llu avg=%.2f ring=%d pool_max=%zu\n",
+                    (unsigned long long)rt->str_pool_alloc_calls,
+                    (unsigned long long)rt->str_pool_scan_calls,
+                    (unsigned long long)rt->str_pool_scan_steps,
+                    rt->str_pool_scan_calls ?
+                        (double)rt->str_pool_scan_steps / (double)rt->str_pool_scan_calls : 0.0,
+                    rt->str_ring_count, rt->str_pool_max_size);
+        }
+    }
+
+    /* ── Fast path: ring-buffer pool (O(1) pop) ────────────────────────── */
+    if (rt && rt->str_ring_count > 0) {
+        int idx = rt->str_ring_count - 1;
+        LRString *s = rt->str_ring[idx];
+        /* Check if the pooled entry is large enough: s->len (logical length)
+         * must be >= the requested len (logical length).  The allocation size
+         * is sizeof(LRString) + s->len + 1, which is >= need. */
+        if (s && (size_t)s->len >= len) {
+#ifdef STR_POOL_DEBUG
+            size_t usable = malloc_usable_size(s);
+            if (usable < need) {
+                fprintf(stderr, "[POOL-RING] s->len=%u len=%zu need=%zu usable=%zu MISMATCH\n",
+                        s->len, len, need, usable);
+                abort();
+            }
+#endif
+            rt->str_ring_count = idx;
+            rt->str_ring[idx] = NULL;
+            s->ref_count = 1;
+            s->len = (uint32_t)len;
+            s->is_atom = 0;
+#ifdef STR_POOL_DEBUG
+            pool_hist_add(s, PH_POP_RING, 1, (size_t)s->len, malloc_usable_size(s), 0, len);
+#endif
+            if (str) {
+                uint32_t h = 2166136261u;
+                for (size_t i = 0; i < len; i++) {
+                    unsigned char c = (unsigned char)str[i];
+                    h ^= c;
+                    h *= 16777619u;
+                    s->str[i] = c;
+                }
+                s->str[len] = '\0';
+                s->hash = h;
+            } else {
+                s->str[len] = '\0';
+                s->hash = 0;
+            }
+            return s;
+        }
+        /* Entry too small — push it back to linked-list pool, fall through.
+         * NOTE: node->next is an 8-byte write at offset 0 that clobbers BOTH
+         * ref_count (bytes 0-3) and len (bytes 4-7).  node->size must therefore
+         * be computed from s->len BEFORE node->next is stored, otherwise the
+         * recorded size is derived from garbage (upper half of the pool-head
+         * pointer) and the pool will later hand out a block too small for the
+         * requested length → heap-buffer-overflow. */
+        {
+#ifdef STR_POOL_DEBUG
+            size_t usable2 = malloc_usable_size(s);
+            size_t sz2 = sizeof(LRString) + s->len + 1;
+            if (usable2 < sz2 || (size_t)s->len > 1000000 || len > 1000000) {
+                fprintf(stderr, "[POOL-RING2LINK] s=%p s->len=%u request_len=%zu sz=%zu usable=%zu str='%.16s'\n",
+                        (void *)s, s->len, len, sz2, usable2, s->str);
+                abort();
+            }
+#endif
+            size_t sz = sizeof(LRString) + s->len + 1;  /* read s->len FIRST */
+            lr_str_pool_push(rt, s, sz);
+#ifdef STR_POOL_DEBUG
+            LRStrPoolNode *node = (LRStrPoolNode *)s;
+            pool_reg_add(s, node->size);
+            pool_hist_add(s, PH_RING2LINK, 2, (size_t)s->len, malloc_usable_size(s), node->size, len);
+#endif
+        }
+        rt->str_ring_count = idx;
+        rt->str_ring[idx] = NULL;
+    }
+
+    /* ── Fallback: size-segregated linked-list pool ────────────────────── */
+    if (rt) {
+        int j = lr_str_pool_bin(need);
+        if (j < LR_STR_POOL_NUM_BINS) {
+            /* Global quick-reject: skip all scanning when no pooled block
+             * is large enough for this request (O(1) guard). */
+            if (rt->str_pool_max_size >= need) {
+                LRStrPoolNode *node = NULL;
+
+                /* 1) Best fit: scan the exact bin first.  Per-node size
+                 *    check required here because same-bin blocks can differ
+                 *    by up to 2x.  The bin scan is bounded by the number of
+                 *    blocks sharing one narrow size class, not the whole pool. */
+                if (rt->str_pool_bin_max[j] >= need) {
+                    rt->str_pool_scan_calls++;
+                    LRStrPoolNode **pp = (LRStrPoolNode **)&rt->str_pool_bins[j];
+                    LRStrPoolNode  *p = *pp;
+                    while (p) {
+                        rt->str_pool_scan_steps++;
+                        if (p->size >= need) {
+                            *pp = p->next;  /* unlink */
+                            if (p->size >= rt->str_pool_bin_max[j]) {
+                                rt->str_pool_bin_max[j] = lr_str_pool_bin_max_recompute(rt, j);
+                                lr_str_pool_recompute_global(rt);
+                            }
+                            node = p;
+                            break;
+                        }
+                        pp = &p->next;
+                        p  = p->next;
+                    }
+                }
+
+                /* 2) Any block in a strictly larger bin qualifies: a bin-k
+                 *    block has size > 2^(k-1) >= 2^j >= need (O(bins) max). */
+                if (!node) {
+                    for (int k = j + 1; k < LR_STR_POOL_NUM_BINS; k++) {
+                        if (rt->str_pool_bins[k]) {
+                            rt->str_pool_scan_calls++;
+                            node = (LRStrPoolNode *)rt->str_pool_bins[k];
+                            rt->str_pool_bins[k] = node->next;
+                            if (node->size >= rt->str_pool_bin_max[k]) {
+                                rt->str_pool_bin_max[k] = lr_str_pool_bin_max_recompute(rt, k);
+                                lr_str_pool_recompute_global(rt);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                if (node) {
+#ifdef STR_POOL_DEBUG
+                    LRString *sdbg = (LRString *)node;
+                    size_t usable = malloc_usable_size(sdbg);
+                    if (usable < need) {
+                        const uint8_t *h = (const uint8_t *)sdbg;
+                        fprintf(stderr, "[POOL-LINKED] rec_size=%zu len=%zu need=%zu usable=%zu MISMATCH\n",
+                                node->size, len, need, usable);
+                        fprintf(stderr, "  header: %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x\n",
+                                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+                                h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]);
+                        pool_reg_dump(node);
+                        pool_hist_dump(node);
+                        abort();
+                    }
+#endif
+                    LRString *s = (LRString *)node;
+                    s->ref_count = 1;
+                    s->len = (uint32_t)len;
+                    s->is_atom = 0;
+#ifdef STR_POOL_DEBUG
+                    pool_hist_add(s, PH_POP_LINK, 3, (size_t)s->len, malloc_usable_size(s), 0, len);
+#endif
+                    if (str) {
+                        uint32_t h = 2166136261u;
+                        for (size_t i = 0; i < len; i++) {
+                            unsigned char c = (unsigned char)str[i];
+                            h ^= c;
+                            h *= 16777619u;
+                            s->str[i] = c;
+                        }
+                        s->str[len] = '\0';
+                        s->hash = h;
+                    } else {
+                        s->str[len] = '\0';
+                        s->hash = 0;
+                    }
+                    return s;
+                }
+            }
+        }
+    }
+
+fresh_alloc:
+    /* ── Fresh allocation ──────────────────────────────────────────────── */
     LRString *s = (LRString *)lr_malloc(rt, sizeof(LRString) + len + 1);
     if (!s) return NULL;
     s->ref_count = 1;
     s->len = (uint32_t)len;
     s->is_atom = 0;
-    memcpy(s->str, str, len);
-    s->str[len] = '\0';
+#ifdef STR_POOL_DEBUG
+    pool_hist_add(s, PH_FRESH, 4, len, malloc_usable_size(s), 0, len);
+#endif
+    if (str) {
+        uint32_t h = 2166136261u;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)str[i];
+            h ^= c;
+            h *= 16777619u;
+            s->str[i] = c;
+        }
+        s->str[len] = '\0';
+        s->hash = h;
+    } else {
+        s->str[len] = '\0';
+        s->hash = 0;
+    }
     rt->str_count++;
     rt->str_size += (int64_t)(sizeof(LRString) + len + 1);
     return s;
 }
 
-static void lr_string_free(LRRuntime *rt, LRString *s)
+void lr_string_free(LRRuntime *rt, LRString *s)
 {
     if (!s) return;
     /* Clear from small string cache if present, to prevent dangling pointer */
@@ -80,24 +425,98 @@ static void lr_string_free(LRRuntime *rt, LRString *s)
             rt->small_string_cache[idx] = NULL;
         }
     }
+
+    size_t alloc_size = sizeof(LRString) + s->len + 1;
+
+#ifdef STR_POOL_DEBUG
+    {
+        size_t usable = malloc_usable_size(s);
+        if (usable < alloc_size) {
+            fprintf(stderr, "[POOL-FREE] s->len=%u alloc_size=%zu usable=%zu OVERREPORT  str='%.16s'\n",
+                    s->len, alloc_size, usable, s->str);
+            abort();
+        }
+    }
+#endif
+
+    if (rt && s->len <= LR_STR_POOL_MAX_DATA && !s->is_atom) {
+#ifdef STR_POOL_DEBUG
+        /* Detect double-push: same pointer already in ring or linked-list
+         * pool.  Off by default (LR_DEBUG_POOL) — the linked-list scan is
+         * O(pool size) per free, making string-heavy workloads quadratic. */
+        if (getenv("LR_DEBUG_POOL")) {
+        for (int _i = 0; _i < rt->str_ring_count; _i++) {
+            if (rt->str_ring[_i] == s) {
+                fprintf(stderr, "[POOL-DOUBLE-PUSH] ring hit s->len=%u str='%.16s' alloc=%zu\n",
+                        s->len, s->str, alloc_size);
+                abort();
+            }
+        }
+        for (int _b = 0; _b < LR_STR_POOL_NUM_BINS; _b++) {
+            for (LRStrPoolNode *_p = (LRStrPoolNode *)rt->str_pool_bins[_b]; _p; _p = _p->next) {
+                if ((LRString *)_p == s) {
+                    fprintf(stderr, "[POOL-DOUBLE-PUSH] linked hit s->len=%u str='%.16s' alloc=%zu\n",
+                            s->len, s->str, alloc_size);
+                    abort();
+                }
+            }
+        }
+        }
+#endif
+        /* ── Fast path: push to ring buffer (O(1)) ──────────────────────── */
+        if (rt->str_ring_count < LR_STR_RING_SIZE) {
+            rt->str_ring[rt->str_ring_count++] = s;
+#ifdef STR_POOL_DEBUG
+            pool_hist_add(s, PH_PUSH_RING, 5, (size_t)s->len, malloc_usable_size(s), 0, 0);
+#endif
+            return;
+        }
+        /* ── Fallback: push to size-segregated pool (O(1)) ──────────────── */
+        lr_str_pool_push(rt, s, alloc_size);
+#ifdef STR_POOL_DEBUG
+        pool_reg_add(s, alloc_size);
+        pool_hist_add(s, PH_PUSH_LINK, 6, (size_t)s->len, malloc_usable_size(s), alloc_size, 0);
+#endif
+        return;
+    }
+
     if (rt) {
         rt->str_count--;
-        rt->str_size -= (int64_t)(sizeof(LRString) + s->len + 1);
+        rt->str_size -= (int64_t)alloc_size;
     }
-    lr_free(rt, s, sizeof(LRString) + s->len + 1);
+    lr_free(rt, s, alloc_size);
 }
 
-static void lr_string_release(LRRuntime *rt, LRString *s)
+void lr_string_release(LRRuntime *rt, LRString *s)
 {
     if (!s) return;
     if (--s->ref_count <= 0) {
         if (rt) {
             lr_string_free(rt, s);
         } else {
-            free(s->str);
+            /* LRString uses flexible array member str[], so the string
+             * data is part of the same allocation as the struct itself.
+             * Only free(s) is needed, NOT free(s->str). */
             free(s);
         }
     }
+}
+
+/* Debug helper: is the given string currently sitting in the pool
+ * (ring buffer or linked-list free list)?  Used to detect the class of
+ * bug where a pooled node is mistaken for a live string and realloc'd. */
+int lr_string_in_pool(LRRuntime *rt, LRString *s)
+{
+    if (!rt || !s) return 0;
+    for (int i = 0; i < rt->str_ring_count; i++) {
+        if (rt->str_ring[i] == s) return 1;
+    }
+    for (int _b = 0; _b < LR_STR_POOL_NUM_BINS; _b++) {
+        for (LRStrPoolNode *p = (LRStrPoolNode *)rt->str_pool_bins[_b]; p; p = p->next) {
+            if ((LRString *)p == s) return 1;
+        }
+    }
+    return 0;
 }
 
 static LRString *lr_string_dup(LRString *s)
@@ -213,9 +632,17 @@ static LRObject *lr_object_alloc(LRRuntime *rt)
     obj->ref_count = 1;
     obj->type = LR_OBJ_PLAIN;
     obj->is_extensible = 1;
+    obj->mut_gen = 1;          /* IOME586: 0 reserved for "no cache", 1 is first gen */
     obj->opaque_free = NULL;
-    /* Link into runtime object list for GC tracking */
+    /* Link into runtime object list for GC tracking.
+     * Maintain proper doubly-linked list: the old head's gc_prev must
+     * point back to the new object.  Without this, every node has
+     * gc_prev=NULL and freeing a non-head object cannot unlink it
+     * from the head's gc_next chain, causing gc_next to dangle into
+     * freed memory — the source of the ASAN heap-use-after-free. */
     obj->gc_next = rt->obj_list;
+    obj->gc_prev = NULL;
+    if (rt->obj_list) rt->obj_list->gc_prev = obj;
     rt->obj_list = obj;
     rt->obj_count++;
     return obj;
@@ -227,43 +654,80 @@ typedef struct ArrayBufferMeta {
     void (*free_func)(void *opaque, void *ptr);
     void *opaque;
     int is_shared;
+    size_t byte_length;       /* cached to avoid property lookup */
 } ArrayBufferMeta;
 
 /* Hook installed by the interpreter to release captured closure scopes. */
 void (*lr_closure_scope_release)(void *scope, LRContext *ctx) = NULL;
 
+/* Thread-local re-entrancy guard for lr_free_object.
+ * When the opaque destructor (e.g. gen_lazy_data_free) triggers scope_release
+ * which indirectly calls lr_free_object on the same object, we skip the inner
+ * call and let the outer call finish the cleanup. */
+static LR_THREAD_LOCAL LRObject *lr_freeing_object = NULL;
+
 void lr_free_object(LRRuntime *rt, LRObject *obj)
 {
     if (!obj) return;
+    /* Re-entrant guard: if we are already freeing this object, skip.
+     * The outer call will handle the complete cleanup including free(obj). */
+    if (obj == lr_freeing_object) return;
+
+    LRObject *saved_freeing = lr_freeing_object;
+    lr_freeing_object = obj;
+
     /* Unlink from runtime object list - use the object's own context
      * if rt is not provided (e.g. when called from lr_free_value(NULL, ...)) */
     if (!rt && obj->ctx) {
         rt = obj->ctx->rt;
     }
     if (rt) {
-        LRObject **pprev = &rt->obj_list;
-        while (*pprev && *pprev != obj) {
-            pprev = &(*pprev)->gc_next;
+        /* O(1) removal via gc_prev back pointer.  The previous code walked
+         * the whole obj_list on every free, making bulk teardown of large
+         * object graphs O(n^2) (e.g. freeing a 100k-element array).
+         *
+         * Fallback: if gc_prev is NULL but obj is not the head, the
+         * doubly-linked invariant is broken (an insertion site failed to
+         * update the old head's gc_prev).  Walk the list linearly to make
+         * sure the object is actually removed, otherwise it is freed but
+         * stays linked -> dangling pointer in obj_list. */
+        if (obj->gc_prev) {
+            obj->gc_prev->gc_next = obj->gc_next;
+        } else if (rt->obj_list == obj) {
+            rt->obj_list = obj->gc_next;
+        } else {
+            LRObject **pprev = &rt->obj_list;
+            while (*pprev && *pprev != obj) pprev = &(*pprev)->gc_next;
+            if (*pprev == obj) *pprev = obj->gc_next;
         }
-        if (*pprev == obj) {
-            *pprev = obj->gc_next;
+        if (obj->gc_next) {
+            obj->gc_next->gc_prev = obj->gc_prev;
         }
+        obj->gc_next = NULL;
+        obj->gc_prev = NULL;
     }
     /* Determine a valid context for freeing property values */
     LRContext *free_ctx = obj->ctx;
     if (!free_ctx && rt && rt->ctx_list) {
         free_ctx = rt->ctx_list;
     }
-    /* Free properties */
+    /* Free properties. NULL the pointer immediately so that a recursive
+     * lr_free_object call (triggered by opaque_free below, e.g. via
+     * gen_lazy_data_free → scope_release → FREE_IF_HEAP) does not
+     * re-enter the props loop on already freed memory. */
     if (obj->props) {
         for (uint32_t i = 0; i < obj->prop_count; i++) {
             lr_free_value(free_ctx, obj->props[i]);
         }
-        lr_free(rt, obj->props, obj->prop_count * sizeof(LRValue));
+        lr_free(rt, obj->props, obj->prop_capacity * sizeof(LRValue));
+        obj->props = NULL;
+        obj->prop_count = 0;
+        obj->prop_capacity = 0;
     }
     /* Free property hash chain */
     {
         LRProperty *prop = obj->prop_hash;
+        obj->prop_hash = NULL;
         while (prop) {
             LRProperty *next = prop->next;
             lr_string_release(rt, prop->key);
@@ -279,7 +743,12 @@ void lr_free_object(LRRuntime *rt, LRObject *obj)
             }
             prop = next;
         }
-        obj->prop_hash = NULL;
+    }
+    /* Free dynamic hash table bucket array */
+    if (obj->prop_buckets) {
+        lr_free(rt, obj->prop_buckets, obj->prop_buckets_count * sizeof(LRProperty *));
+        obj->prop_buckets = NULL;
+        obj->prop_buckets_count = 0;
     }
     /* Free shape chain */
     if (obj->shape) {
@@ -381,15 +850,24 @@ void lr_free_object(LRRuntime *rt, LRObject *obj)
             }
             obj->opaque = NULL;
         } else {
-            /* Generic opaque data: use destructor if set, otherwise free() */
+            /* Generic opaque data: use destructor if set, otherwise free().
+             * Save the pointers and NULL them BEFORE calling the callback,
+             * because the callback (e.g. gen_lazy_data_free) can indirectly
+             * free this same object via scope_release, making any subsequent
+             * access to obj->opaque_free / obj->opaque a use-after-free. */
             if (obj->opaque_free) {
-                obj->opaque_free(obj->opaque);
+                void (*ofree)(void *) = obj->opaque_free;
+                void *opaque = obj->opaque;
+                obj->opaque_free = NULL;
+                obj->opaque = NULL;
+                ofree(opaque);
             } else {
                 free(obj->opaque);
+                obj->opaque = NULL;
             }
-            obj->opaque = NULL;
         }
     }
+    lr_freeing_object = saved_freeing;
     if (rt) rt->obj_count--;
     free(obj);
 }
@@ -559,19 +1037,23 @@ void lr_register_finalization(LRRuntime *rt, LRObject *target,
                               LRValue callback, LRValue heldValue,
                               LRValue registry, LRValue token)
 {
+    /* Get a context for lr_free_value, so that strings are released via
+     * lr_string_free (which clears the small-string cache) and not via
+     * free() directly (which would leave dangling cache entries). */
+    LRContext *ctx = rt ? rt->ctx_list : NULL;
     if (!rt || !target) {
-        lr_free_value(NULL, callback);
-        lr_free_value(NULL, heldValue);
-        lr_free_value(NULL, registry);
-        lr_free_value(NULL, token);
+        lr_free_value(ctx, callback);
+        lr_free_value(ctx, heldValue);
+        lr_free_value(ctx, registry);
+        lr_free_value(ctx, token);
         return;
     }
     LRFinalizationEntry *e = (LRFinalizationEntry *)malloc(sizeof(LRFinalizationEntry));
     if (!e) {
-        lr_free_value(NULL, callback);
-        lr_free_value(NULL, heldValue);
-        lr_free_value(NULL, registry);
-        lr_free_value(NULL, token);
+        lr_free_value(ctx, callback);
+        lr_free_value(ctx, heldValue);
+        lr_free_value(ctx, registry);
+        lr_free_value(ctx, token);
         return;
     }
     e->target = target;
@@ -587,15 +1069,19 @@ int lr_unregister_finalization(LRRuntime *rt, LRValue token)
 {
     int removed = 0;
     if (!rt) return 0;
+    /* Get a context for lr_free_value, so that strings are released via
+     * lr_string_free (which clears the small-string cache) and not via
+     * free() directly (which would leave dangling cache entries). */
+    LRContext *ctx = rt->ctx_list;
     LRFinalizationEntry **pp = &rt->finalization_entries;
     while (*pp) {
         LRFinalizationEntry *e = *pp;
         if (lr_token_matches(e->token, token)) {
             *pp = e->next;
-            lr_free_value(NULL, e->heldValue);
-            lr_free_value(NULL, e->callback);
-            lr_free_value(NULL, e->registry);
-            lr_free_value(NULL, e->token);
+            lr_free_value(ctx, e->heldValue);
+            lr_free_value(ctx, e->callback);
+            lr_free_value(ctx, e->registry);
+            lr_free_value(ctx, e->token);
             free(e);
             removed++;
         } else {
@@ -699,6 +1185,41 @@ LRValue lr_new_string_len(LRContext *ctx, const char *str, size_t len)
     return v;
 }
 
+/* ── Substring Creation ──────────────────────────────────────────────── */
+
+LRValue lr_new_substring(LRContext *ctx, LRValue src, size_t start, size_t end)
+{
+    if (src.tag != LR_TYPE_STRING) {
+        LRValue v; v.tag = LR_TYPE_STRING; v.u.ptr = NULL;
+        return v;
+    }
+    LRString *s = (LRString *)src.u.ptr;
+    if (!s) { LRValue v; v.tag = LR_TYPE_STRING; v.u.ptr = NULL; return v; }
+    if (start > s->len) start = s->len;
+    if (end > s->len) end = s->len;
+    if (start >= end) return lr_new_string(ctx, "");
+    size_t sub_len = end - start;
+    LRString *os = lr_string_alloc(ctx->rt, s->str + start, sub_len);
+    LRValue v;
+    v.tag = LR_TYPE_STRING;
+    v.u.ptr = os ? os : NULL;
+    return v;
+}
+
+LRValue lr_new_substring_len(LRContext *ctx, const char *buf, size_t len, size_t start, size_t end)
+{
+    if (!buf) return lr_new_string(ctx, "");
+    if (start > len) start = len;
+    if (end > len) end = len;
+    if (start >= end) return lr_new_string(ctx, "");
+    size_t sub_len = end - start;
+    LRString *os = lr_string_alloc(ctx->rt, buf + start, sub_len);
+    LRValue v;
+    v.tag = LR_TYPE_STRING;
+    v.u.ptr = os ? os : NULL;
+    return v;
+}
+
 /* ── Object / Array Creation ──────────────────────────────────────────── */
 
 LRValue lr_new_object(LRContext *ctx)
@@ -767,6 +1288,17 @@ LRValue lr_new_array(LRContext *ctx)
     
     v.tag = LR_TYPE_OBJECT;
     v.u.ptr = obj;
+    return v;
+}
+
+/* ── Symbol Creation / Query ──────────────────────────────────────────── */
+
+LRValue lr_new_symbol_str(LRContext *ctx, const char *description)
+{
+    LRValue v;
+    v.tag = LR_TYPE_SYMBOL;
+    v.u.ptr = description ? strdup(description) : strdup("");
+    if (!v.u.ptr) v.u.ptr = strdup("");
     return v;
 }
 
@@ -858,18 +1390,7 @@ LRValue lr_new_cfunction2(LRContext *ctx, LRCFunctionFunc func,
 
 /* ── Value Management ─────────────────────────────────────────────────── */
 
-LRValue lr_dup_value(LRContext *ctx, LRValue val)
-{
-    (void)ctx;
-    if (val.tag == LR_TYPE_STRING) {
-        LRString *s = (LRString *)val.u.ptr;
-        lr_string_dup(s);
-    } else if (val.tag == LR_TYPE_OBJECT) {
-        LRObject *obj = (LRObject *)val.u.ptr;
-        lr_object_dup(obj);
-    }
-    return val;
-}
+
 
 void lr_free_value(LRContext *ctx, LRValue val)
 {
@@ -892,6 +1413,8 @@ void lr_free_value(LRContext *ctx, LRValue val)
                 lr_free_object(NULL, obj);
             }
         }
+    } else if (val.tag == LR_TYPE_SYMBOL) {
+        free((void *)val.u.ptr);
     }
 }
 
@@ -910,24 +1433,52 @@ const char *lr_to_cstring(LRContext *ctx, LRValue val)
         /* Fast integer-to-string without snprintf (hot path for concat) */
         int32_t n = val.u.int32;
         int neg = n < 0;
-        if (neg) n = -n;
+        uint32_t un = neg ? (uint32_t)(-(n + 1)) + 1 : (uint32_t)n;
         char tmp[32];
         int pos = 31;
         tmp[31] = '\0';
-        if (n == 0) tmp[--pos] = '0';
-        else while (n > 0) { tmp[--pos] = (char)('0' + (n % 10)); n /= 10; }
+        if (un == 0) tmp[--pos] = '0';
+        else while (un > 0) { tmp[--pos] = (char)('0' + (un % 10)); un /= 10; }
         if (neg) tmp[--pos] = '-';
         return strdup(tmp + pos);
     }
-    case LR_TYPE_FLOAT64:
-        snprintf(buf, sizeof(buf), "%.15g", val.u.float64);
+    case LR_TYPE_FLOAT64: {
+        double d = val.u.float64;
+        if (isnan(d)) return strdup("NaN");
+        if (isinf(d)) return strdup(d > 0.0 ? "Infinity" : "-Infinity");
+        snprintf(buf, sizeof(buf), "%.17g", d);
         return strdup(buf);
+    }
     case LR_TYPE_STRING: {
         LRString *s = (LRString *)val.u.ptr;
         return strdup(s->str);
     }
     case LR_TYPE_OBJECT: {
         LRObject *obj = (LRObject *)val.u.ptr;
+        if (obj->type == LR_OBJ_BIGINT) {
+            /* BigInt: print as decimal with 'n' suffix (matches Node's
+             * console.log, e.g. `10n`).  Uses the int64 payload directly;
+             * coercing through lr_to_float64 would lose precision beyond
+             * 2^53. */
+            int64_t bi = 0;
+            LRBigIntData *bd = (LRBigIntData *)obj->opaque;
+            if (bd) bi = bd->value;
+            if (bi == 0) return strdup("0n");
+            char tmp[40];
+            int neg = bi < 0;
+            uint64_t un = neg ? (uint64_t)(-(bi + 1)) + 1 : (uint64_t)bi;
+            int pos = 31;
+            tmp[31] = '\0';
+            while (un > 0) { tmp[--pos] = (char)('0' + (un % 10)); un /= 10; }
+            if (neg) tmp[--pos] = '-';
+            /* Append the 'n' suffix: "10n", "-5n", "9223372036854775807n" */
+            size_t dlen = strlen(tmp + pos);
+            if (dlen + 1 < sizeof(tmp)) {
+                tmp[pos + dlen] = 'n';
+                tmp[pos + dlen + 1] = '\0';
+            }
+            return strdup(tmp + pos);
+        }
         if (obj->type == LR_OBJ_CFUNCTION) {
             LRCFunction *cf = (LRCFunction *)obj->extra;
             snprintf(buf, sizeof(buf), "function %s() { [native code] }",
@@ -987,8 +1538,13 @@ const char *lr_to_cstring(LRContext *ctx, LRValue val)
         }
         return strdup("[object Object]");
     }
-    case LR_TYPE_SYMBOL:
-        return strdup("Symbol()");
+    case LR_TYPE_SYMBOL: {
+        const char *desc = (const char *)val.u.ptr;
+        if (!desc) desc = "";
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Symbol(%s)", desc);
+        return strdup(buf);
+    }
     case LR_TYPE_EXCEPTION:
         return strdup("exception");
     default:
@@ -1065,7 +1621,7 @@ int lr_to_bool(LRContext *ctx, LRValue val)
     case LR_TYPE_BOOL:      return val.u.bool_val;
     case LR_TYPE_INT32:     return val.u.int32 != 0;
     case LR_TYPE_FLOAT64:   return val.u.float64 != 0.0 && !isnan(val.u.float64);
-    case LR_TYPE_STRING:    return 1; /* non-empty string is truthy */
+    case LR_TYPE_STRING:    return ((LRString *)val.u.ptr)->len > 0; /* empty string is falsy */
     case LR_TYPE_OBJECT:    return 1;
     case LR_TYPE_SYMBOL:    return 1;
     default:                return 0;
@@ -1119,8 +1675,29 @@ int lr_to_float64(LRContext *ctx, double *pres, LRValue val)
     case LR_TYPE_FLOAT64:   *pres = val.u.float64; return 0;
     case LR_TYPE_STRING: {
         LRString *s = (LRString *)val.u.ptr;
-        char *end;
-        *pres = strtod(s->str, &end);
+        const char *p = s->str;
+        const char *endp = s->str + s->len;
+        /* skip leading whitespace */
+        while (p < endp) {
+            char c = *p;
+            if (!(c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+                  c == '\f' || c == '\v')) break;
+            p++;
+        }
+        /* empty after trim ("" or all whitespace) → 0 */
+        if (p == endp) { *pres = 0.0; return 0; }
+        char *pend;
+        errno = 0;
+        *pres = strtod(p, &pend);
+        /* nothing numeric parsed, or trailing non-whitespace garbage → NaN */
+        if (pend == p) { *pres = NAN; return 0; }
+        while (pend < endp) {
+            char c = *pend;
+            if (!(c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+                  c == '\f' || c == '\v')) break;
+            pend++;
+        }
+        if (pend != endp) *pres = NAN;
         return 0;
     }
     default: *pres = NAN; return -1;
@@ -1165,12 +1742,69 @@ static void shape_cache_update(LRContext *ctx, LRObject *obj, LRString *atom,
 
 /* ── Property Access ──────────────────────────────────────────────────── */
 
-/* Hash bucket index for property lookup */
-static int prop_bucket_idx(LRString *key) {
-    return ((key->str[0] * 31 + key->len) & (OBJ_PROP_BUCKETS - 1));
+/* ── Dynamic property hash table ─────────────────────────────────────────
+ * Instead of a fixed-size bucket array embedded in every LRObject (wasteful
+ * for small objects, too small for large objects), we allocate the bucket
+ * array dynamically and grow it when the load factor exceeds a threshold.
+ *
+ *   INIT:   64 buckets (first allocation, 0 → 64 when first prop is added)
+ *   GROW:   4x the current count when avg chain length > PROP_BUCKETS_MAX_LOAD
+ *   MAX:    64K buckets (to avoid unbounded memory growth)                  */
+#define PROP_BUCKETS_INIT      64
+#define PROP_BUCKETS_GROW_FACTOR 4
+#define PROP_BUCKETS_MAX_LOAD   2      /* max avg chain length before growth */
+#define PROP_BUCKETS_MAX        65536
+
+/* Hash bucket index for property lookup — uses pre-computed hash from LRString */
+static int prop_bucket_idx(LRString *key, uint32_t n_buckets) {
+    return (int)(key->hash & (n_buckets - 1));
 }
+
+/* Ensure the object's hash table has enough capacity for `n_props` entries.
+ * Grows by PROP_BUCKETS_GROW_FACTOR when the average chain length exceeds
+ * PROP_BUCKETS_MAX_LOAD.  Returns 1 on success, 0 on OOM. */
+static int prop_ensure_capacity(LRObject *obj, uint32_t n_props) {
+    uint32_t cur = obj->prop_buckets_count;
+    if (cur == 0) {
+        /* First allocation */
+        obj->prop_buckets = (LRProperty **)calloc(PROP_BUCKETS_INIT, sizeof(LRProperty *));
+        if (!obj->prop_buckets) return 0;
+        obj->prop_buckets_count = PROP_BUCKETS_INIT;
+        return 1;
+    }
+    /* Grow if avg chain length exceeds max load */
+    if (cur < PROP_BUCKETS_MAX && n_props > cur * PROP_BUCKETS_MAX_LOAD) {
+        uint32_t new_count = cur * PROP_BUCKETS_GROW_FACTOR;
+        if (new_count > PROP_BUCKETS_MAX) new_count = PROP_BUCKETS_MAX;
+        if (new_count <= cur) return 1; /* already at max */
+        LRProperty **new_buckets = (LRProperty **)calloc(new_count, sizeof(LRProperty *));
+        if (!new_buckets) return 0;
+        /* Rehash all existing properties into the new bucket array */
+        LRProperty *p = obj->prop_hash;
+        while (p) {
+            int bi = prop_bucket_idx(p->key, new_count);
+            p->bnext = new_buckets[bi];
+            new_buckets[bi] = p;
+            p = p->next;
+        }
+        free(obj->prop_buckets);
+        obj->prop_buckets = new_buckets;
+        obj->prop_buckets_count = new_count;
+        if (getenv("LR_DEBUG_BUCKETS"))
+            fprintf(stderr, "[bucket-grow] n_props=%u old=%u new=%u\n",
+                    n_props, cur, new_count);
+    }
+    return 1;
+}
+
 static void prop_add_bucket(LRObject *obj, LRProperty *prop) {
-    int bi = prop_bucket_idx(prop->key);
+    /* Ensure hash table exists (allocate on first use) */
+    if (!obj->prop_buckets) {
+        obj->prop_buckets = (LRProperty **)calloc(PROP_BUCKETS_INIT, sizeof(LRProperty *));
+        if (!obj->prop_buckets) return;
+        obj->prop_buckets_count = PROP_BUCKETS_INIT;
+    }
+    int bi = prop_bucket_idx(prop->key, obj->prop_buckets_count);
     prop->bnext = obj->prop_buckets[bi];
     obj->prop_buckets[bi] = prop;
 }
@@ -1178,12 +1812,18 @@ static void prop_add_bucket(LRObject *obj, LRProperty *prop) {
 /* Get property from object's own properties (bucketed hash lookup) */
 static LRProperty *lr_object_find_own_prop(LRObject *obj, LRString *key)
 {
-    if (!key) return NULL;
-    int bi = prop_bucket_idx(key);
-    /* Check bucket chain first (O(1) amortized) */
+    if (!key || !obj->prop_buckets) return NULL;
+    int bi = prop_bucket_idx(key, obj->prop_buckets_count);
+    /* Check bucket chain (O(1) amortized) */
     LRProperty *prop = obj->prop_buckets[bi];
     while (prop) {
+        /* OPTIMIZATION: Add hash comparison before memcmp to quickly reject
+         * non-matching keys.  The hash is already cached in LRString, so this
+         * is a single 64-bit comparison vs. a memcmp call.  Two keys with the
+         * same bucket index (lower N bits of hash) may have different full
+         * hashes — the hash check filters them out in ~1 cycle. */
         if (prop->key == key || (prop->key && key &&
+            prop->key->hash == key->hash &&
             prop->key->len == key->len &&
             memcmp(prop->key->str, key->str, key->len) == 0))
             return prop;
@@ -1206,6 +1846,10 @@ static LRValue lr_property_get(LRContext *ctx, LRValue receiver, LRProperty *pro
     }
     return lr_dup_value(ctx, prop->value);
 }
+
+/* Forward declaration: shape flat-slot lookup used by accessor demotion
+ * before the definition below (see "Shape flat-hash O(1) slot lookup"). */
+static inline int shape_get_slot_fast(LRObject *o, LRString *atom);
 
 /* Set an accessor (getter/setter) property on an object.
  * getter/setter are function values (or LR_VALUE_UNDEFINED).
@@ -1256,10 +1900,27 @@ int lr_set_accessor_property(LRContext *ctx, LRValue obj, LRString *atom,
             prop->flags = flags;
             lr_string_dup(atom);
             shape_cache_update(ctx, o, atom, prop);
+            /* A normal data property was demoted to an accessor.  Invalidate
+             * its flat-slot entry: clear props[slot] so the shape fast paths
+             * (which return props[slot] verbatim) miss and route to the
+             * accessor machinery, and bump the shape version so interpreter
+             * inline caches keyed on this shape are also invalidated. */
+            if (o->shape) {
+                int slot = shape_get_slot_fast(o, atom);
+                if (slot >= 0 && (uint32_t)slot < o->prop_count) {
+                    lr_free_value(ctx, o->props[slot]);
+                    o->props[slot] = LR_VALUE_UNDEFINED;
+                }
+                o->shape->version++;
+            }
             return 0;
         }
         prop = prop->next;
     }
+
+    /* Grow hash table if needed before adding new property */
+    uint32_t nxt = (uint32_t)(o->prop_count + 1);
+    prop_ensure_capacity(o, nxt);
 
     LRProperty *new_prop = (LRProperty *)calloc(1, sizeof(LRProperty));
     new_prop->key = lr_string_dup(atom);
@@ -1325,38 +1986,81 @@ static LRValue lr_primitive_proto_get(LRContext *ctx, const char *ctor_name,
     return result;
 }
 
+/* ── Shape flat-hash O(1) slot lookup + transition cache ─────────────── */
+
+/* Better hash for atom pointers: shift right by 4 to avoid alignment
+ * collisions (atoms are 16-byte aligned, so low 4 bits are always 0). */
+#define SHAPE_ATOM_HASH(atom)  ((((uintptr_t)(atom)) >> 4) ^ (((uintptr_t)(atom)) >> 10)) & SHAPE_FLAT_MASK
+
+/* Fast flat-hash + chain lookup only — NO fallback to lr_object_find_own_prop.
+ * Caller handles the fallback to avoid double work. */
+static inline int shape_get_slot_fast(LRObject *o, LRString *atom) {
+    LRShape *s;
+    if (__builtin_expect(!o || !(s = o->shape) || !atom, 0)) return -1;
+    if (__builtin_expect(s->flat_count != 0, 1)) {
+        unsigned h = SHAPE_ATOM_HASH(atom);
+        for (unsigned i = 0; i < SHAPE_FLAT_SIZE; i++) {
+            unsigned idx = (h + i) & SHAPE_FLAT_MASK;
+            LRString *k = s->flat_keys[idx];
+            if (__builtin_expect(k == atom, 1)) return (int)s->flat_slots[idx];
+            if (__builtin_expect(!k, 0)) break;
+        }
+    } else {
+        while (s) {
+            if (__builtin_expect(s->prop_name == atom, 1)) return (int)s->slot_index;
+            s = s->prev;
+        }
+    }
+    return -1;
+}
+
 /* Forward declarations for shape helpers (defined below after lr_property_get) */
-static int  shape_get_slot(LRObject *o, LRString *atom);
-static void shape_add_prop(LRObject *o, LRString *atom, LRValue val);
+static void shape_add_prop(LRContext *ctx, LRObject *o, LRString *atom, LRValue val);
 
 LRValue lr_get_property(LRContext *ctx, LRValue obj, LRString *atom)
 {
-    /* Primitive values delegate to their wrapper prototypes */
-    if (obj.tag == LR_TYPE_STRING) {
-        LRString *s = (LRString *)obj.u.ptr;
-        if (atom && strcmp(atom->str, "length") == 0) {
-            return lr_new_int32(ctx, (int32_t)s->len);
-        }
-        uint32_t idx;
-        if (atom && lr_is_numeric_index(atom, &idx)) {
-            if (idx < s->len) {
-                char b[2] = { s->str[idx], '\0' };
-                return lr_new_string(ctx, b);
+    /* Fast path: object property access (most common case) */
+    if (obj.tag == LR_TYPE_OBJECT) {
+        LRObject *o = (LRObject *)obj.u.ptr;
+
+        /* ── Plain object fast path: skip Proxy/TypedArray/Array checks ── */
+        /* Also skip for dictionary-mode objects (>= SHAPE_FLAT_SIZE props)
+         * since the flat hash won't contain the key. */
+        if (__builtin_expect(o->type == LR_OBJ_PLAIN && o->shape && o->props
+                             && o->prop_count < SHAPE_FLAT_SIZE, 1)) {
+            LRShape *s = o->shape;
+            if (__builtin_expect(s->flat_count != 0, 1)) {
+                unsigned h = SHAPE_ATOM_HASH(atom);
+                for (unsigned i = 0; i < SHAPE_FLAT_SIZE; i++) {
+                    unsigned idx = (h + i) & SHAPE_FLAT_MASK;
+                    LRString *k = s->flat_keys[idx];
+                    if (__builtin_expect(k == atom, 1)) {
+                        int slot = (int)s->flat_slots[idx];
+                        if (__builtin_expect((uint32_t)slot < o->prop_count, 1)) {
+                            LRValue *v = &o->props[slot];
+                            if (__builtin_expect(v->tag != LR_TYPE_UNDEFINED, 1))
+                                return lr_dup_value(ctx, *v);
+                        }
+                        break;
+                    }
+                    if (__builtin_expect(!k, 0)) break;
+                }
+            } else {
+                while (s) {
+                    if (__builtin_expect(s->prop_name == atom, 1)) {
+                        int slot = (int)s->slot_index;
+                        if (__builtin_expect((uint32_t)slot < o->prop_count, 1)) {
+                            LRValue *v = &o->props[slot];
+                            if (__builtin_expect(v->tag != LR_TYPE_UNDEFINED, 1))
+                                return lr_dup_value(ctx, *v);
+                        }
+                        break;
+                    }
+                    s = s->prev;
+                }
             }
-            return LR_VALUE_UNDEFINED;
+            /* Fall through to shape cache + bucket lookup */
         }
-        return lr_primitive_proto_get(ctx, "String", atom);
-    }
-    if (obj.tag == LR_TYPE_INT32 || obj.tag == LR_TYPE_FLOAT64) {
-        return lr_primitive_proto_get(ctx, "Number", atom);
-    }
-    if (obj.tag == LR_TYPE_BOOL) {
-        return lr_primitive_proto_get(ctx, "Boolean", atom);
-    }
-    if (obj.tag != LR_TYPE_OBJECT) {
-        return LR_VALUE_UNDEFINED;
-    }
-    LRObject *o = (LRObject *)obj.u.ptr;
 
     /* Check if it's a Proxy */
     if (o->type == LR_OBJ_PROXY) {
@@ -1417,24 +2121,15 @@ LRValue lr_get_property(LRContext *ctx, LRValue obj, LRString *atom)
         }
     }
 
-    /* Shape flat-hash O(1) read: direct props[] access */
-    if (o->shape && o->props) {
-        int slot = shape_get_slot(o, atom);
-        if (slot >= 0 && (uint32_t)slot < o->prop_count) {
-            LRValue *v = &o->props[slot];
-            if (v->tag != LR_TYPE_UNDEFINED) return lr_dup_value(ctx, *v);
-        }
-    }
-
     /* Shape cache: fast lookup for (obj, atom) pairs we've seen before */
     LRValue *cached = shape_cache_lookup(ctx, o, atom);
-    if (cached) {
+    if (__builtin_expect(cached != NULL, 0)) {
         return lr_dup_value(ctx, *cached);
     }
 
     /* Check own properties */
     LRProperty *found = lr_object_find_own_prop(o, atom);
-    if (found) {
+    if (__builtin_expect(found != NULL, 1)) {
         shape_cache_update(ctx, o, atom, found);
         return lr_property_get(ctx, obj, found);
     }
@@ -1443,7 +2138,7 @@ LRValue lr_get_property(LRContext *ctx, LRValue obj, LRString *atom)
     LRValue proto = o->proto;
     while (proto.tag == LR_TYPE_OBJECT) {
         LRObject *po = (LRObject *)proto.u.ptr;
-        if (po->type == LR_OBJ_PROXY) {
+        if (__builtin_expect(po->type == LR_OBJ_PROXY, 0)) {
             /* Proxy in prototype chain - use Proxy-aware get */
             return lr_get_property(ctx, proto, atom);
         }
@@ -1454,6 +2149,31 @@ LRValue lr_get_property(LRContext *ctx, LRValue obj, LRString *atom)
         proto = po->proto;
     }
 
+    return LR_VALUE_UNDEFINED;
+    } /* end if (obj.tag == LR_TYPE_OBJECT) */
+
+    /* Primitive values delegate to their wrapper prototypes */
+    if (obj.tag == LR_TYPE_STRING) {
+        LRString *s = (LRString *)obj.u.ptr;
+        if (atom && strcmp(atom->str, "length") == 0) {
+            return lr_new_int32(ctx, (int32_t)s->len);
+        }
+        uint32_t idx;
+        if (atom && lr_is_numeric_index(atom, &idx)) {
+            if (idx < s->len) {
+                char b[2] = { s->str[idx], '\0' };
+                return lr_new_string(ctx, b);
+            }
+            return LR_VALUE_UNDEFINED;
+        }
+        return lr_primitive_proto_get(ctx, "String", atom);
+    }
+    if (obj.tag == LR_TYPE_INT32 || obj.tag == LR_TYPE_FLOAT64) {
+        return lr_primitive_proto_get(ctx, "Number", atom);
+    }
+    if (obj.tag == LR_TYPE_BOOL) {
+        return lr_primitive_proto_get(ctx, "Boolean", atom);
+    }
     return LR_VALUE_UNDEFINED;
 }
 
@@ -1510,78 +2230,84 @@ LRValue lr_get_property_uint32(LRContext *ctx, LRValue obj, uint32_t idx)
     }
 }
 
-/* ── Shape flat-hash O(1) slot lookup + transition cache ─────────────── */
-
-static int shape_get_slot(LRObject *o, LRString *atom) {
-    if (!o || !o->shape || !atom) return -1;
-    LRShape *s = o->shape;
-    if (!s->flat_count) {
-        while (s) { if (s->prop_name == atom) return (int)s->slot_index; s = s->prev; }
-        return -1;
-    }
-    unsigned h = ((uintptr_t)atom) & SHAPE_FLAT_MASK;
-    for (unsigned i = 0; i < SHAPE_FLAT_SIZE; i++) {
-        unsigned idx = (h + i) & SHAPE_FLAT_MASK;
-        if (s->flat_keys[idx] == atom) return (int)s->flat_slots[idx];
-        if (!s->flat_keys[idx]) return -1;
-    }
-    while (s) { if (s->prop_name == atom) return (int)s->slot_index; s = s->prev; }
-    return -1;
+int lr_shape_get_slot(LRObject *o, LRString *atom) {
+    return shape_get_slot_fast(o, atom);
 }
 
-#define SHAPE_TRANS_CACHE_SIZE 256
-typedef struct { LRShape *old_shape; LRString *key; LRShape *new_shape; uint32_t slot_index; } ShapeTransEntry;
-static ShapeTransEntry shape_trans_cache[SHAPE_TRANS_CACHE_SIZE];
-static int shape_trans_next = 0;
-
-static void shape_add_prop(LRObject *o, LRString *atom, LRValue val) {
+/* Record a newly-added property in the object's hidden-class shape so the
+ * interpreter's shape-based inline cache (bc_ic_prop) and lr_get_property's
+ * flat fast path can hit for object literals.
+ *
+ * NOTE: the previous version kept a global "transition cache" of raw shape
+ * pointers (old_shape, key) -> new_shape.  Shapes are freed together with
+ * their owning object (see lr_free_object), so a cached new_shape could
+ * dangle into freed memory and be re-assigned to a later object — a
+ * use-after-free under ASAN.  We therefore always build a fresh shape node
+ * here.  The interpreter's per-(site, shape) bc_ic_prop cache still delivers
+ * O(1) slot access after the first lookup per object.
+ *
+ * `val` is stored by reference into o->props[slot] (the caller must pass an
+ * independent reference; the hash-table LRProperty owns its own reference).
+ * For dictionary mode (>= SHAPE_FLAT_SIZE props), the value is freed and
+ * o->props[slot] is set to UNDEFINED since the shape fast path does not
+ * cover those entries — the hash table is used instead. */
+static void shape_add_prop(LRContext *ctx, LRObject *o, LRString *atom, LRValue val) {
     if (!o || !atom) return;
-    LRShape *old_shape = o->shape;
-    for (int i = 0; i < SHAPE_TRANS_CACHE_SIZE; i++) {
-        ShapeTransEntry *e = &shape_trans_cache[i];
-        if (e->old_shape == old_shape && e->key == atom) {
-            uint32_t slot = e->slot_index, nc = slot + 1;
-            if (nc > o->prop_count) {
-                LRValue *np = (LRValue *)realloc(o->props, nc * sizeof(LRValue));
-                if (!np) return;
-                o->props = np; o->prop_count = nc;
-            }
-            o->props[slot] = val;
-            o->shape = e->new_shape;
-            if (e->new_shape) e->new_shape->ref_count++;
-            return;
+
+    /* ── Geometric growth for props[] ────────────────────────────────────
+     * Instead of realloc by 1 per new property (O(n²)), double capacity
+     * when full.  Initial capacity = 8, then grows as 8,16,32,64,128,...
+     * This eliminates the O(n²) realloc overhead for large objects.      */
+    if (o->prop_count >= o->prop_capacity) {
+        uint32_t new_cap = o->prop_capacity ? o->prop_capacity * 2 : 8;
+        LRValue *np = (LRValue *)realloc(o->props, new_cap * sizeof(LRValue));
+        if (!np) return;
+        o->props = np;
+        o->prop_capacity = new_cap;
+    }
+
+    /* ── Dictionary mode ─────────────────────────────────────────────────
+     * For objects with >= SHAPE_FLAT_SIZE (64) properties, every new
+     * property name is unique (computed keys like 'key_'+i).  There is no
+     * reuse benefit from shape tracking — each new property would create a
+     * new LRShape with a unique chain, wasting both memory and time.
+     * In dictionary mode we skip shape creation entirely and fall back to
+     * the hash-based bucket lookup (lr_object_find_own_prop), which is
+     * O(1) amortized.  The shape pointer stays at the last pre-64 shape,
+     * so the inline cache (bc_ic_prop) still works for the first 64.      */
+    uint32_t idx = o->prop_count++;
+
+    if (o->prop_count <= SHAPE_FLAT_SIZE) {
+        o->props[idx] = val;  /* stored for shape-based fast path */
+        LRShape *old_shape = o->shape;
+        LRShape *s = (LRShape *)calloc(1, sizeof(LRShape));
+        if (!s) return;
+        s->prop_name = atom; s->prev = old_shape;
+        s->slot_index = idx; s->ref_count = 1;
+        if (old_shape && old_shape->flat_count) {
+            memcpy(s->flat_keys, old_shape->flat_keys, sizeof(s->flat_keys));
+            memcpy(s->flat_slots, old_shape->flat_slots, sizeof(s->flat_slots));
+            s->flat_count = old_shape->flat_count;
         }
-    }
-    LRShape *s = (LRShape *)calloc(1, sizeof(LRShape));
-    if (!s) return;
-    s->prop_name = atom; s->prev = old_shape;
-    s->slot_index = o->prop_count; s->ref_count = 1;
-    if (old_shape && old_shape->flat_count) {
-        memcpy(s->flat_keys, old_shape->flat_keys, sizeof(s->flat_keys));
-        memcpy(s->flat_slots, old_shape->flat_slots, sizeof(s->flat_slots));
-        s->flat_count = old_shape->flat_count;
-    }
-    if (s->flat_count < SHAPE_FLAT_SIZE) {
-        unsigned h = ((uintptr_t)atom) & SHAPE_FLAT_MASK;
-        for (unsigned i = 0; i < SHAPE_FLAT_SIZE; i++) {
-            unsigned idx = (h + i) & SHAPE_FLAT_MASK;
-            if (!s->flat_keys[idx]) {
-                s->flat_keys[idx] = atom;
-                s->flat_slots[idx] = (uint16_t)s->slot_index;
-                s->flat_count++; break;
+        if (s->flat_count < SHAPE_FLAT_SIZE) {
+            unsigned h = SHAPE_ATOM_HASH(atom);
+            for (unsigned i = 0; i < SHAPE_FLAT_SIZE; i++) {
+                unsigned idx2 = (h + i) & SHAPE_FLAT_MASK;
+                if (!s->flat_keys[idx2]) {
+                    s->flat_keys[idx2] = atom;
+                    s->flat_slots[idx2] = (uint16_t)idx;
+                    s->flat_count++; break;
+                }
             }
         }
+        o->shape = s;
+    } else {
+        /* Dictionary mode: props[] entry is unused by the shape fast path.
+         * Store UNDEFINED and release the value to avoid leaking memory. */
+        o->props[idx] = LR_VALUE_UNDEFINED;
+        lr_free_value(ctx, val);
     }
-    uint32_t nc = o->prop_count + 1;
-    LRValue *np = (LRValue *)realloc(o->props, nc * sizeof(LRValue));
-    if (!np) { free(s); return; }
-    o->props = np; o->props[o->prop_count] = val;
-    o->prop_count = nc; o->shape = s;
-    int si = shape_trans_next++ % SHAPE_TRANS_CACHE_SIZE;
-    shape_trans_cache[si].old_shape = old_shape;
-    shape_trans_cache[si].key = atom;
-    shape_trans_cache[si].new_shape = s;
-    shape_trans_cache[si].slot_index = s->slot_index;
+    /* else: dictionary mode — no new shape created */
 }
 
 int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
@@ -1589,12 +2315,40 @@ int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
     if (obj.tag != LR_TYPE_OBJECT) return -1;
     LRObject *o = (LRObject *)obj.u.ptr;
 
-    /* Shape fast path: O(1) direct write to props[] array */
-    if (o->shape && o->props) {
-        int slot = shape_get_slot(o, atom);
-        if (slot >= 0 && (uint32_t)slot < o->prop_count) {
+    /* Shape fast path: inline flat-hash O(1) direct write to props[] array.
+     * Must match the same type check in lr_get_property's shape fast path
+     * (line 1513) — non-plain types (e.g. LR_OBJ_FUNCTION) go through the
+     * bucket hash in the getter, so the setter must also update the bucket.
+     * For dictionary-mode objects (prop_count >= SHAPE_FLAT_SIZE), skip the
+     * shape fast path entirely — the key won't be in the flat hash. */
+    if (__builtin_expect(o->type == LR_OBJ_PLAIN && o->shape && o->props
+                         && o->prop_count < SHAPE_FLAT_SIZE, 1)) {
+        LRShape *s = o->shape;
+        int slot = -1;
+        if (__builtin_expect(s->flat_count != 0, 1)) {
+            unsigned h = SHAPE_ATOM_HASH(atom);
+            for (unsigned i = 0; i < SHAPE_FLAT_SIZE; i++) {
+                unsigned idx = (h + i) & SHAPE_FLAT_MASK;
+                LRString *k = s->flat_keys[idx];
+                if (__builtin_expect(k == atom, 1)) {
+                    slot = (int)s->flat_slots[idx];
+                    break;
+                }
+                if (__builtin_expect(!k, 0)) break;
+            }
+        } else {
+            while (s) {
+                if (__builtin_expect(s->prop_name == atom, 1)) {
+                    slot = (int)s->slot_index;
+                    break;
+                }
+                s = s->prev;
+            }
+        }
+        if (__builtin_expect(slot >= 0 && (uint32_t)slot < o->prop_count, 1)) {
             lr_free_value(ctx, o->props[slot]);
             o->props[slot] = val;
+            o->mut_gen++;  /* IOME586: mutation version bump */
             return 0;
         }
     }
@@ -1657,32 +2411,34 @@ int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
         }
     }
 
-    /* Dense array: sync numeric index writes to the linear buffer */
+    /* Dense array: fast path for numeric index writes and length */
     if (o->type == LR_OBJ_ARRAY) {
-        uint32_t idx;
-        if (lr_is_numeric_index(atom, &idx)) {
-            LRArrayData *ad = (LRArrayData *)o->extra;
-            if (ad) {
-                if (idx >= ad->capacity) {
-                    uint32_t new_cap = ad->capacity;
-                    while (new_cap <= idx) new_cap *= 2;
-                    LRValue *new_elems = (LRValue *)realloc(ad->elements,
-                                                            new_cap * sizeof(LRValue));
-                    if (!new_elems) goto dense_fallback;
-                    memset(new_elems + ad->capacity, 0,
-                           (new_cap - ad->capacity) * sizeof(LRValue));
-                    ad->elements = new_elems;
-                    ad->capacity = new_cap;
+        if (atom && atom->len <= 10 && atom->str[0] >= '0' && atom->str[0] <= '9') {
+            uint32_t idx;
+            if (lr_is_numeric_index(atom, &idx)) {
+                LRArrayData *ad = (LRArrayData *)o->extra;
+                if (ad) {
+                    if (idx >= ad->capacity) {
+                        uint32_t new_cap = ad->capacity ? ad->capacity : 8;
+                        while (new_cap <= idx) new_cap *= 2;
+                        LRValue *new_elems = (LRValue *)calloc(new_cap, sizeof(LRValue));
+                        if (!new_elems) goto dense_fallback;
+                        if (ad->elements && ad->capacity > 0) {
+                            memcpy(new_elems, ad->elements, ad->capacity * sizeof(LRValue));
+                            free(ad->elements);
+                        }
+                        ad->elements = new_elems;
+                        ad->capacity = new_cap;
+                    }
+                    if (ad->elements[idx].tag != LR_TYPE_UNDEFINED)
+                        lr_free_value(ctx, ad->elements[idx]);
+                    ad->elements[idx] = lr_dup_value(ctx, val);
+                    if (idx >= ad->length) ad->length = idx + 1;
                 }
-                if (ad->elements[idx].tag != LR_TYPE_UNDEFINED)
-                    lr_free_value(ctx, ad->elements[idx]);
-                ad->elements[idx] = lr_dup_value(ctx, val);
-                if (idx >= ad->length) ad->length = idx + 1;
+                /* Fall through to property hash for compatibility (e.g. for...in) */
             }
-            /* Fall through to property hash for compatibility (e.g. for...in) */
-        }
-        /* Sync "length" property to dense array */
-        if (atom && strcmp(atom->str, "length") == 0) {
+        } else if (atom && atom->len == 6 && memcmp(atom->str, "length", 6) == 0) {
+            /* Sync "length" property to dense array */
             LRArrayData *ad = (LRArrayData *)o->extra;
             if (ad) {
                 int32_t new_len = 0;
@@ -1693,45 +2449,35 @@ int lr_set_property(LRContext *ctx, LRValue obj, LRString *atom, LRValue val)
     }
 dense_fallback:
 
-    /* Shape cache lookup: check if we've seen this (obj, atom) pair before */
-    {
-        LRRuntime *rt = ctx->rt;
-        unsigned int idx = ((uintptr_t)o ^ (uintptr_t)atom) & (LR_SHAPE_CACHE_SIZE - 1);
-        LRShapeCacheEntry *entry = &rt->shape_cache[idx];
-        if (entry->valid && entry->obj == o && entry->prop == atom) {
-            /* Cache hit: directly update the known property */
-            LRProperty *prop = o->prop_hash;
-            while (prop) {
-                if (prop->key == atom) {
-                    if (lr_property_try_set_accessor(ctx, obj, prop, val))
-                        return 0;
-                    lr_free_value(ctx, prop->value);
-                    prop->value = val;
-                    lr_string_dup(atom);
-                    return 0;
-                }
-                prop = prop->next;
+    /* Try to find existing property using bucket hash (O(1) amortized).
+     * This replaces the old linked-list walk which was O(n) for large objects. */
+    LRProperty *found = lr_object_find_own_prop(o, atom);
+    if (found) {
+        /* Accessor property: invoke setter */
+        if (lr_property_try_set_accessor(ctx, obj, found, val))
+            return 0;
+        /* Property exists - update value */
+        lr_free_value(ctx, found->value);
+        found->value = val; /* Takes ownership of val */
+        /* Mirror the value into the shape flat slot (o->props[slot]) so the
+         * interpreter's shape-based inline cache (bc_ic_prop) sees the fresh
+         * value.  The shape fast path above writes props[slot] directly; this
+         * hash path (reached for arrays, functions, and any non-PLAIN object)
+         * must keep the flat slot in sync too, otherwise the IC returns the
+         * stale pre-update value (e.g. arr.length stuck at 0 after push).
+         * The shape version is intentionally NOT bumped so the IC stays valid
+         * and simply returns the just-updated slot value. */
+        if (o->shape && o->props) {
+            int slot = lr_shape_get_slot(o, atom);
+            if (slot >= 0 && (uint32_t)slot < o->prop_count) {
+                lr_free_value(ctx, o->props[slot]);
+                o->props[slot] = lr_dup_value(ctx, val);
             }
         }
-    }
-
-    /* Check if property already exists */
-    LRProperty *prop = o->prop_hash;
-    while (prop) {
-        if (prop->key == atom || (prop->key && atom &&
-            prop->key->len == atom->len &&
-            memcmp(prop->key->str, atom->str, atom->len) == 0)) {
-            /* Accessor property: invoke setter */
-            if (lr_property_try_set_accessor(ctx, obj, prop, val))
-                return 0;
-            /* Property exists - update value */
-            lr_free_value(ctx, prop->value);
-            prop->value = val; /* Takes ownership of val */
-            lr_string_dup(atom); /* Keep atom alive */
-            shape_cache_update(ctx, o, atom, prop);
-            return 0;
-        }
-        prop = prop->next;
+        lr_string_dup(atom); /* Keep atom alive */
+        shape_cache_update(ctx, o, atom, found);
+        o->mut_gen++;  /* IOME586: mutation version bump */
+        return 0;
     }
 
     /* Spec [[Set]]: no own property - walk the prototype chain looking for
@@ -1754,16 +2500,48 @@ dense_fallback:
         }
     }
 
+    /* Grow the hash table if necessary BEFORE adding to prop_hash.
+     * This ensures prop_ensure_capacity's rehashing only sees existing
+     * properties — otherwise the new property would be added to the
+     * bucket chain twice (once during rehash, once via prop_add_bucket),
+     * creating a self-loop in bnext that causes infinite loops. */
+    uint32_t next_prop_count = (uint32_t)(o->prop_count + 1);
+    prop_ensure_capacity(o, next_prop_count);
+
     /* Create new property */
     LRProperty *new_prop = (LRProperty *)calloc(1, sizeof(LRProperty));
+    if (!new_prop) return -1;
     new_prop->key = lr_string_dup(atom);
     new_prop->value = val; /* Takes ownership */
     new_prop->flags = LR_PROP_NORMAL | LR_PROP_ENUMERABLE | LR_PROP_WRITABLE | LR_PROP_CONFIGURABLE;
     new_prop->next = o->prop_hash;
     o->prop_hash = new_prop;
+
     prop_add_bucket(o, new_prop);
     shape_cache_update(ctx, o, atom, new_prop);
 
+    /* Record the new property in the hidden-class shape (independent
+     * reference in o->props[slot]; the LRProperty above owns its own).
+     * This lets object literals hit the interpreter's shape-based
+     * inline cache (bc_ic_prop) instead of falling through to the hash
+     * table on every access.
+     * For dictionary-mode objects (>= SHAPE_FLAT_SIZE), skip the shape
+     * tracking and just manage props[] capacity + increment prop_count
+     * inline to avoid the function call overhead. */
+    if (o->prop_count < SHAPE_FLAT_SIZE) {
+        LRValue dup_val = lr_dup_value(ctx, val);
+        shape_add_prop(ctx, o, atom, dup_val);
+    } else {
+        /* Dict mode: inline simple prop_count management */
+        if (o->prop_count >= o->prop_capacity) {
+            uint32_t new_cap = o->prop_capacity ? o->prop_capacity * 2 : 8;
+            LRValue *np = (LRValue *)realloc(o->props, new_cap * sizeof(LRValue));
+            if (np) { o->props = np; o->prop_capacity = new_cap; }
+        }
+        o->props[o->prop_count++] = LR_VALUE_UNDEFINED;
+    }
+
+    o->mut_gen++;  /* IOME586: mutation version bump */
     ctx->rt->prop_count++;
     ctx->rt->prop_size += sizeof(LRProperty);
     return 0;
@@ -1776,22 +2554,18 @@ int lr_set_property_direct(LRContext *ctx, LRValue obj, LRString *atom, LRValue 
     if (obj.tag != LR_TYPE_OBJECT) return -1;
     LRObject *o = (LRObject *)obj.u.ptr;
 
-    /* Check if property already exists */
-    LRProperty *prop = o->prop_hash;
-    while (prop) {
-        if (prop->key == atom || (prop->key && atom &&
-            prop->key->len == atom->len &&
-            memcmp(prop->key->str, atom->str, atom->len) == 0)) {
-            /* Accessor property: invoke setter */
-            if (lr_property_try_set_accessor(ctx, obj, prop, val))
-                return 0;
-            /* Property exists - update value */
-            lr_free_value(ctx, prop->value);
-            prop->value = val; /* Takes ownership of val */
-            lr_string_dup(atom); /* Keep atom alive */
+    /* Check if property already exists (bucketed hash lookup, O(1) amortized) */
+    LRProperty *prop = lr_object_find_own_prop(o, atom);
+    if (prop) {
+        /* Accessor property: invoke setter */
+        if (lr_property_try_set_accessor(ctx, obj, prop, val))
             return 0;
-        }
-        prop = prop->next;
+        /* Property exists - update value */
+        lr_free_value(ctx, prop->value);
+        prop->value = val; /* Takes ownership of val */
+        lr_string_dup(atom); /* Keep atom alive */
+        o->mut_gen++;  /* IOME586: mutation version bump */
+        return 0;
     }
 
     /* Walk prototype chain for an accessor property (setter) */
@@ -1811,6 +2585,14 @@ int lr_set_property_direct(LRContext *ctx, LRValue obj, LRString *atom, LRValue 
         }
     }
 
+    /* Grow hash table if needed BEFORE adding to prop_hash (avoids
+     * double-inserting the new property into the bucket chain and
+     * creating a self-loop in bnext). */
+    {
+        uint32_t nxt = (uint32_t)(o->prop_count + 1);
+        prop_ensure_capacity(o, nxt);
+    }
+
     /* Create new property */
     LRProperty *new_prop = (LRProperty *)calloc(1, sizeof(LRProperty));
     new_prop->key = lr_string_dup(atom);
@@ -1819,7 +2601,12 @@ int lr_set_property_direct(LRContext *ctx, LRValue obj, LRString *atom, LRValue 
     new_prop->next = o->prop_hash;
     o->prop_hash = new_prop;
     prop_add_bucket(o, new_prop);
-
+    /* In dict mode, skip the wasteful lr_dup_value/lr_free_value pair */
+    if (o->prop_count < SHAPE_FLAT_SIZE)
+        shape_add_prop(ctx, o, atom, lr_dup_value(ctx, val));
+    else
+        shape_add_prop(ctx, o, atom, LR_VALUE_UNDEFINED);
+    o->mut_gen++;  /* IOME586: mutation version bump */
     ctx->rt->prop_count++;
     ctx->rt->prop_size += sizeof(LRProperty);
     return 0;
@@ -1843,11 +2630,13 @@ int lr_set_property_uint32(LRContext *ctx, LRValue obj, uint32_t idx, LRValue va
             if (idx >= ad->capacity) {
                 uint32_t new_cap = ad->capacity;
                 while (new_cap <= idx) new_cap *= 2;
-                LRValue *new_elems = (LRValue *)realloc(ad->elements,
-                                                        new_cap * sizeof(LRValue));
+                /* Use calloc to avoid separate memset */
+                LRValue *new_elems = (LRValue *)calloc(new_cap, sizeof(LRValue));
                 if (!new_elems) goto fallback;
-                memset(new_elems + ad->capacity, 0,
-                       (new_cap - ad->capacity) * sizeof(LRValue));
+                if (ad->elements && ad->capacity > 0) {
+                    memcpy(new_elems, ad->elements, ad->capacity * sizeof(LRValue));
+                    free(ad->elements);
+                }
                 ad->elements = new_elems;
                 ad->capacity = new_cap;
             }
@@ -1858,6 +2647,7 @@ int lr_set_property_uint32(LRContext *ctx, LRValue obj, uint32_t idx, LRValue va
             ad->elements[idx] = val;
             /* Update length if index >= current length */
             if (idx >= ad->length) ad->length = idx + 1;
+            o->mut_gen++;  /* IOME586: mutation version bump */
             return 0;
         }
     }
@@ -1868,6 +2658,10 @@ fallback:
         return lr_set_property_str(ctx, obj, buf, val);
     }
 }
+
+/* Forward declaration: core own-property delete used by both
+ * lr_delete_property and lr_delete_property_direct (defined below). */
+static int lr_object_delete_own_prop(LRContext *ctx, LRObject *o, LRString *atom);
 
 int lr_delete_property(LRContext *ctx, LRValue obj, LRString *atom, int flags)
 {
@@ -1905,24 +2699,66 @@ int lr_delete_property(LRContext *ctx, LRValue obj, LRString *atom, int flags)
         return lr_delete_property_direct(ctx, target, atom, flags);
     }
 
-    LRProperty **prev = &o->prop_hash;
-    LRProperty *prop = o->prop_hash;
-    while (prop) {
-        if (prop->key == atom || (prop->key && atom &&
-            prop->key->len == atom->len &&
-            memcmp(prop->key->str, atom->str, atom->len) == 0)) {
-            *prev = prop->next;
-            lr_string_release(ctx->rt, prop->key);
-            lr_free_value(ctx, prop->value);
-            ctx->rt->prop_count--;
-            ctx->rt->prop_size -= sizeof(LRProperty);
-            free(prop);
-            return 0;
-        }
-        prev = &prop->next;
-        prop = prop->next;
+    return lr_object_delete_own_prop(ctx, o, atom);
+}
+
+/* Delete an own property from an object, unlinking it from BOTH the
+ * singly-linked prop_hash chain and the prop_buckets bucket chain, and
+ * invalidating every lookup path that could still observe it:
+ *   1. the global shape cache entry for (o, atom) — otherwise a later
+ *      read would dereference the freed LRProperty (use-after-free);
+ *   2. the shape flat-slot value o->props[slot] — cleared to UNDEFINED so
+ *      the O(1) shape fast path misses and falls through to a lookup that
+ *      (after the bucket unlink) correctly returns undefined;
+ *   3. the shape version — bumped so the interpreter's shape-keyed inline
+ *      cache (bc_ic_prop) is invalidated.
+ * Returns 0 on success, -1 if the property was not found. */
+static int lr_object_delete_own_prop(LRContext *ctx, LRObject *o, LRString *atom)
+{
+    LRProperty *prop = lr_object_find_own_prop(o, atom);
+    if (!prop) return -1;
+
+    /* Unlink from the prop_hash chain */
+    LRProperty **pp = &o->prop_hash;
+    while (*pp && *pp != prop) pp = &(*pp)->next;
+    if (*pp == prop) *pp = prop->next;
+
+    /* Unlink from the prop_buckets bucket chain */
+    if (o->prop_buckets) {
+        int bi = prop_bucket_idx(atom, o->prop_buckets_count);
+        LRProperty **bp = &o->prop_buckets[bi];
+        while (*bp && *bp != prop) bp = &(*bp)->bnext;
+        if (*bp == prop) *bp = prop->bnext;
     }
-    return -1;
+
+    /* Invalidate the global shape cache entry so it never hands out the
+     * now-freed LRProperty pointer. */
+    {
+        LRRuntime *rt = ctx->rt;
+        unsigned int idx = ((uintptr_t)o ^ (uintptr_t)atom) & (LR_SHAPE_CACHE_SIZE - 1);
+        LRShapeCacheEntry *entry = &rt->shape_cache[idx];
+        if (entry->valid && entry->obj == o && entry->prop == atom)
+            entry->valid = 0;
+    }
+
+    /* Clear the shape flat-slot value and bump the shape version so the
+     * shape fast path and the interpreter's shape-keyed IC both miss. */
+    if (o->shape) {
+        int slot = shape_get_slot_fast(o, atom);
+        if (slot >= 0 && (uint32_t)slot < o->prop_count) {
+            lr_free_value(ctx, o->props[slot]);
+            o->props[slot] = LR_VALUE_UNDEFINED;
+        }
+        o->shape->version++;
+    }
+
+    lr_string_release(ctx->rt, prop->key);
+    lr_free_value(ctx, prop->value);
+    lr_free_value(ctx, prop->setter);
+    ctx->rt->prop_count--;
+    ctx->rt->prop_size -= sizeof(LRProperty);
+    free(prop);
+    return 0;
 }
 
 /* Direct property delete - bypasses Proxy traps */
@@ -1931,25 +2767,7 @@ int lr_delete_property_direct(LRContext *ctx, LRValue obj, LRString *atom, int f
     (void)flags;
     if (obj.tag != LR_TYPE_OBJECT) return -1;
     LRObject *o = (LRObject *)obj.u.ptr;
-
-    LRProperty **prev = &o->prop_hash;
-    LRProperty *prop = o->prop_hash;
-    while (prop) {
-        if (prop->key == atom || (prop->key && atom &&
-            prop->key->len == atom->len &&
-            memcmp(prop->key->str, atom->str, atom->len) == 0)) {
-            *prev = prop->next;
-            lr_string_release(ctx->rt, prop->key);
-            lr_free_value(ctx, prop->value);
-            ctx->rt->prop_count--;
-            ctx->rt->prop_size -= sizeof(LRProperty);
-            free(prop);
-            return 0;
-        }
-        prev = &prop->next;
-        prop = prop->next;
-    }
-    return -1;
+    return lr_object_delete_own_prop(ctx, o, atom);
 }
 
 int lr_has_property(LRContext *ctx, LRValue obj, LRString *atom)
@@ -2033,6 +2851,74 @@ int lr_define_property_value(LRContext *ctx, LRValue obj, LRString *atom,
                               LRValue val, int flags)
 {
     return lr_set_property(ctx, obj, atom, val);
+}
+
+/* Returns 1 if `key` is a canonical array index (0..4294967294), and sets
+ * *out to its value. Canonical array indices never have leading zeros. */
+static int prop_is_array_index(const LRString *key, uint32_t *out)
+{
+    const char *s = (const char *)key->str;
+    int len = (int)key->len;
+    if (len == 0) return 0;
+    if (len > 1 && s[0] == '0') return 0; /* leading zero is not canonical */
+    uint64_t v = 0;
+    for (int i = 0; i < len; i++) {
+        if (s[i] < '0' || s[i] > '9') return 0;
+        v = v * 10 + (uint64_t)(s[i] - '0');
+        if (v > 4294967294ULL) return 0;
+    }
+    *out = (uint32_t)v;
+    return 1;
+}
+
+/* Reorder an own-property enumeration to match the ES iteration order:
+ * array-index keys first, in ascending numeric order, then the remaining
+ * (string/symbol) keys, preserving their original relative order. */
+static void sort_property_enum_order(LRPropertyEnum *tab, uint32_t len)
+{
+    if (len <= 1) return;
+    /* The prop_hash chain is built by prepending, so the enumeration array is
+     * in reverse-insertion order. Reverse it to restore true insertion order
+     * before applying the ES ordering (integer indices ascending first). */
+    for (uint32_t i = 0; i < len / 2; i++) {
+        LRPropertyEnum t = tab[i];
+        tab[i] = tab[len - 1 - i];
+        tab[len - 1 - i] = t;
+    }
+    LRPropertyEnum *sorted = (LRPropertyEnum *)malloc(len * sizeof(LRPropertyEnum));
+    uint32_t *vals = (uint32_t *)malloc(len * sizeof(uint32_t));
+    uint32_t *pos = (uint32_t *)malloc(len * sizeof(uint32_t));
+    if (!sorted || !vals || !pos) {
+        free(sorted); free(vals); free(pos);
+        return;
+    }
+    /* Gather the array-index entries (values are unique). */
+    uint32_t cnt = 0;
+    for (uint32_t i = 0; i < len; i++) {
+        uint32_t v;
+        if (prop_is_array_index(tab[i].atom, &v)) { vals[cnt] = v; pos[cnt] = i; cnt++; }
+    }
+    /* Stable-insertion sort ascending by index value. */
+    for (uint32_t a = 1; a < cnt; a++) {
+        uint32_t v = vals[a], p = pos[a];
+        uint32_t b = a;
+        while (b > 0 && vals[b - 1] > v) {
+            vals[b] = vals[b - 1];
+            pos[b] = pos[b - 1];
+            b--;
+        }
+        vals[b] = v;
+        pos[b] = p;
+    }
+    uint32_t di = 0;
+    for (uint32_t a = 0; a < cnt; a++) sorted[di++] = tab[pos[a]];
+    /* Remaining keys in original order. */
+    for (uint32_t i = 0; i < len; i++) {
+        uint32_t v;
+        if (!prop_is_array_index(tab[i].atom, &v)) sorted[di++] = tab[i];
+    }
+    memcpy(tab, sorted, len * sizeof(LRPropertyEnum));
+    free(sorted); free(vals); free(pos);
 }
 
 int lr_get_own_property_names(LRContext *ctx, LRPropertyEnum **ptab,
@@ -2127,6 +3013,7 @@ int lr_get_own_property_names(LRContext *ctx, LRPropertyEnum **ptab,
         i++;
         prop = prop->next;
     }
+    sort_property_enum_order(*ptab, *plen);
     return 0;
 }
 
@@ -2161,6 +3048,7 @@ int lr_get_own_property_names_direct(LRContext *ctx, LRPropertyEnum **ptab,
         i++;
         prop = prop->next;
     }
+    sort_property_enum_order(*ptab, *plen);
     return 0;
 }
 
@@ -2320,6 +3208,12 @@ LRValue lr_call_constructor(LRContext *ctx, LRValue func,
             ctx->current_func = func;
             LRValue result = cf->func(ctx, new_obj, argc, argv);
             ctx->current_func = LR_VALUE_UNDEFINED;
+
+            /* If the constructor threw an exception, propagate it. */
+            if (lr_is_exception(result)) {
+                lr_free_value(ctx, new_obj);
+                return result;
+            }
 
             /* If the constructor returns an object, return that (unless it's
              * the same object as new_obj, to avoid double-free);
@@ -2551,8 +3445,16 @@ void lr_push_call_frame(LRContext *ctx, const char *function_name,
 {
     if (ctx->call_stack_depth >= LR_MAX_CALL_STACK_DEPTH) return;
     LRCallStackFrame *frame = &ctx->call_stack[ctx->call_stack_depth];
-    frame->function_name = function_name ? strdup(function_name) : strdup("");
-    frame->filename = filename ? strdup(filename) : strdup("");
+    if (function_name)
+        strncpy(frame->function_name, function_name, LR_FRAME_NAME_LEN - 1);
+    else
+        frame->function_name[0] = '\0';
+    frame->function_name[LR_FRAME_NAME_LEN - 1] = '\0';
+    if (filename)
+        strncpy(frame->filename, filename, LR_FRAME_FILE_LEN - 1);
+    else
+        frame->filename[0] = '\0';
+    frame->filename[LR_FRAME_FILE_LEN - 1] = '\0';
     frame->line_number = line_number;
     ctx->call_stack_depth++;
 }
@@ -2561,40 +3463,39 @@ void lr_pop_call_frame(LRContext *ctx)
 {
     if (ctx->call_stack_depth <= 0) return;
     ctx->call_stack_depth--;
-    LRCallStackFrame *frame = &ctx->call_stack[ctx->call_stack_depth];
-    free((void *)frame->function_name);
-    frame->function_name = NULL;
-    free((void *)frame->filename);
-    frame->filename = NULL;
+    /* Inline buffers: no free needed, just let the next call overwrite them */
 }
 
 char **lr_capture_stack_trace(LRContext *ctx, int *out_count)
 {
     int limit = ctx->stack_trace_limit > 0 ? ctx->stack_trace_limit : ctx->call_stack_depth;
-    int count = ctx->call_stack_depth < limit ? ctx->call_stack_depth : limit;
-    *out_count = count;
+    if (limit <= 0) { *out_count = 0; return NULL; }
+    char **trace = (char **)calloc((size_t)limit, sizeof(char *));
+    if (!trace) { *out_count = 0; return NULL; }
 
-    if (count == 0) return NULL;
-
-    char **trace = (char **)calloc((size_t)count, sizeof(char *));
-    if (!trace) {
-        *out_count = 0;
-        return NULL;
-    }
-
-    for (int i = 0; i < count; i++) {
-        LRCallStackFrame *frame = &ctx->call_stack[ctx->call_stack_depth - 1 - i];
+    int n = 0;
+    int depth = ctx->call_stack_depth;
+    for (int i = 0; i < depth && n < limit; i++) {
+        LRCallStackFrame *frame = &ctx->call_stack[depth - 1 - i];
+        const char *fn = frame->function_name;
+        const char *file = frame->filename;
+        /* Skip pure-anonymous frames with no source location (empty name AND
+         * empty filename).  These are internal dispatch/native-constructor
+         * frames (e.g. the call trampoline or `new Error(...)` builtin),
+         * which V8 omits from the user-visible stack trace.  Genuinely
+         * anonymous JS functions still carry a filename/line and are kept. */
+        if (fn[0] == '\0' && file[0] == '\0') continue;
         char buf[512];
-        const char *fn = frame->function_name ? frame->function_name : "";
-        const char *file = frame->filename ? frame->filename : "<unknown>";
         if (fn[0] == '\0') {
             snprintf(buf, sizeof(buf), "    at %s:%d", file, frame->line_number);
         } else {
             snprintf(buf, sizeof(buf), "    at %s (%s:%d)", fn, file, frame->line_number);
         }
-        trace[i] = strdup(buf);
+        trace[n++] = strdup(buf);
     }
 
+    if (n == 0) { free(trace); *out_count = 0; return NULL; }
+    *out_count = n;
     return trace;
 }
 
@@ -2635,7 +3536,9 @@ char *lr_build_stack_string(LRContext *ctx, const char *error_message)
     }
     for (int i = 0; i < count; i++) {
         strcat(result, trace[i]);
-        strcat(result, "\n");
+        /* No trailing newline after the last frame, matching V8's stack
+         * string format (e.stack does not end with '\n'). */
+        if (i < count - 1) strcat(result, "\n");
     }
 
     lr_free_stack_trace(ctx, trace, count);
@@ -2659,10 +3562,32 @@ LRValue lr_error_constructor(LRContext *ctx, LRValue this_val,
     LRValue msg_val = lr_new_string(ctx, msg);
     lr_set_property_str(ctx, obj, "message", msg_val);
 
-    /* Capture stack trace and set stack property */
+    /* Capture stack trace and set stack property.  The first line must
+     * match V8's "<TypeName>: <message>"; the type name is the constructor
+     * name (Error, RangeError, MyError, ...), defaulting to "Error". */
+    char header[1024];
+    char typebuf[64];
+    snprintf(typebuf, sizeof(typebuf), "%s", "Error");
+    LRValue proto_v = lr_get_prototype(ctx, obj);
+    if (lr_is_object(proto_v)) {
+        LRValue ctor_v = lr_get_property_str(ctx, proto_v, "constructor");
+        if (lr_is_object(ctor_v)) {
+            LRValue name_v = lr_get_property_str(ctx, ctor_v, "name");
+            if (lr_is_string(name_v)) {
+                const char *nm = lr_to_cstring(ctx, name_v);
+                if (nm && nm[0])
+                    snprintf(typebuf, sizeof(typebuf), "%s", nm);
+                if (nm) lr_free_cstring(ctx, nm);
+            }
+            lr_free_value(ctx, name_v);
+        }
+        lr_free_value(ctx, ctor_v);
+    }
+    lr_free_value(ctx, proto_v);
+    snprintf(header, sizeof(header), "%s: %s", typebuf, msg);
     int count;
     char **trace = lr_capture_stack_trace(ctx, &count);
-    char *stack = lr_build_stack_string(ctx, msg);
+    char *stack = lr_build_stack_string(ctx, header);
 
     /* Free the C string — safe now because lr_build_stack_string is done with it */
     if (argc > 0 && !lr_is_undefined(argv[0])) {
@@ -2780,6 +3705,13 @@ LRRuntime *lr_new_runtime2(void *mem_opaque, void *alloc_opaque,
     rt->max_stack_size = 1024 * 1024; /* 1MB default */
     rt->gc_nursery_size = 8 * 1024 * 1024; /* 8MB (previously 4MB) */
     rt->gc_pause_target_ns = 10000000; /* 10ms (previously 5ms) - allows more work per GC pause */
+
+    /* Initialize JIT runtime */
+    LRJITRuntime *jit = (LRJITRuntime *)calloc(1, sizeof(LRJITRuntime));
+    if (jit) {
+        lr_jit_init(jit);
+        rt->jit_runtime = jit;
+    }
     return rt;
 }
 
@@ -2793,6 +3725,53 @@ void lr_free_runtime(LRRuntime *rt)
         free(ctx->error_message);
         free(ctx);
         ctx = next;
+    }
+    /* Destroy JIT runtime */
+    if (rt->jit_runtime) {
+        lr_jit_destroy((LRJITRuntime *)rt->jit_runtime);
+        free(rt->jit_runtime);
+        rt->jit_runtime = NULL;
+    }
+    /* Drain the string ring buffer + linked-list pool */
+    for (int i = 0; i < rt->str_ring_count; i++) {
+        LRString *s = rt->str_ring[i];
+        if (s) {
+            size_t alloc_size = sizeof(LRString) + s->len + 1;
+            rt->str_count--;
+            rt->str_size -= (int64_t)alloc_size;
+            lr_free(rt, s, alloc_size);
+        }
+        rt->str_ring[i] = NULL;
+    }
+    rt->str_ring_count = 0;
+    for (int _b = 0; _b < LR_STR_POOL_NUM_BINS; _b++) {
+        void *p = rt->str_pool_bins[_b];
+        while (p) {
+            LRStrPoolNode *node = (LRStrPoolNode *)p;
+            void *next = node->next;
+            size_t alloc_size = node->size;
+            rt->str_count--;
+            rt->str_size -= (int64_t)alloc_size;
+            lr_free(rt, p, alloc_size);
+            p = next;
+        }
+        rt->str_pool_bins[_b] = NULL;
+        rt->str_pool_bin_max[_b] = 0;
+    }
+    rt->str_pool_max_size = 0;
+    rt->str_pool_alloc_calls = 0;
+    rt->str_pool_scan_calls = 0;
+    rt->str_pool_scan_steps = 0;
+    if (getenv("LR_DEBUG_POOLSTATS")) {
+        fprintf(stderr,
+                "[POOLSTATS] alloc_calls=%llu scan_calls=%llu scan_steps=%llu "
+                "avg_scan=%.2f ring_size=%d\n",
+                (unsigned long long)rt->str_pool_alloc_calls,
+                (unsigned long long)rt->str_pool_scan_calls,
+                (unsigned long long)rt->str_pool_scan_steps,
+                rt->str_pool_scan_calls ?
+                    (double)rt->str_pool_scan_steps / (double)rt->str_pool_scan_calls : 0.0,
+                rt->str_ring_count);
     }
     free(rt);
 }
@@ -2821,8 +3800,21 @@ LRContext *lr_new_context(LRRuntime *rt)
     /* Init atom table */
     ctx->atom_capacity = 64;
     ctx->atom_table = (LRString **)calloc(ctx->atom_capacity, sizeof(LRString *));
+    ctx->atom_map_size = 1024;
+    ctx->atom_map = (LRString **)calloc(ctx->atom_map_size, sizeof(LRString *));
+    ctx->atom_map_count = 0;
 
     return ctx;
+}
+
+/* qsort comparator: order scope pointers so equal scopes are contiguous. */
+static int lr_scope_ptr_cmp(const void *a, const void *b)
+{
+    const void *pa = *(const void *const *)a;
+    const void *pb = *(const void *const *)b;
+    if (pa < pb) return -1;
+    if (pa > pb) return 1;
+    return 0;
 }
 
 void lr_free_context(LRContext *ctx)
@@ -2860,19 +3852,51 @@ void lr_free_context(LRContext *ctx)
      * lr_runtime_free, otherwise the def_scope hook would touch values
      * pointing at already force-freed objects (heap corruption).
      * Releasing a scope can cascade-free objects (unlinking them from
-     * obj_list), so restart the scan after each release. */
+     * obj_list), so all def_scope pointers are cleared BEFORE any
+     * release runs (that also prevents re-entrant scope_release via
+     * lr_free_value during the release from double-freeing).
+     *
+     * IMPORTANT: Count how many objects reference the same scope and
+     * release that many times.  Each call to interp_capture_closure
+     * incremented the scope's refcount, so we must decrement it once
+     * per closure.
+     *
+     * Single pass: collect every distinct scope into an array, count
+     * references by sorting, then release each scope count times.  The
+     * old implementation restarted the whole obj_list scan for every
+     * distinct scope (O(scopes x obj_count)), which stalled teardown
+     * when the object list was large.  All scopes use packed_alloc, so
+     * pooled memory remains valid after the first release, and the
+     * sentinel (refcount < 0) prevents double-free on later releases. */
     if (rt && lr_closure_scope_release) {
-        int again = 1;
-        while (again) {
-            again = 0;
-            for (LRObject *obj = rt->obj_list; obj; obj = obj->gc_next) {
-                if (obj->def_scope) {
-                    void *sc = obj->def_scope;
-                    obj->def_scope = NULL;
-                    lr_closure_scope_release(sc, ctx);
-                    again = 1;
-                    break; /* obj_list may have changed; restart */
+        /* Upper bound: one entry per object that references a scope. */
+        size_t need = 0;
+        for (LRObject *obj = rt->obj_list; obj; obj = obj->gc_next)
+            if (obj->def_scope) need++;
+
+        if (need > 0) {
+            void **scopes = (void **)malloc(need * sizeof(void *));
+            if (scopes) {
+                size_t n = 0;
+                for (LRObject *obj = rt->obj_list; obj; obj = obj->gc_next) {
+                    if (obj->def_scope) {
+                        scopes[n++] = obj->def_scope;
+                        obj->def_scope = NULL;   /* clear before any release */
+                    }
                 }
+                /* Sort pointers so equal scopes are contiguous; count runs. */
+                qsort(scopes, n, sizeof(void *), lr_scope_ptr_cmp);
+                size_t i = 0;
+                while (i < n) {
+                    void *sc = scopes[i];
+                    size_t j = i;
+                    while (j < n && scopes[j] == sc) j++;
+                    int count = (int)(j - i);
+                    for (int k = 0; k < count; k++)
+                        lr_closure_scope_release(sc, ctx);
+                    i = j;
+                }
+                free(scopes);
             }
         }
     }
@@ -2927,6 +3951,7 @@ void lr_free_context(LRContext *ctx)
         lr_string_free(rt, ctx->atom_table[i]);
     }
     free(ctx->atom_table);
+    free(ctx->atom_map);
     free(ctx->error_message);
     /* Note: ctx itself is NOT freed here. The caller (lr_runtime_free)
      * is responsible for freeing ctx AFTER the object cleanup loop,
@@ -2970,6 +3995,9 @@ typedef struct LREvalUnit {
     BCProgram  *bc_prog;    /* compiled bytecode (nullable; IOME586 warm-path) */
     uint8_t    *bc_ser;     /* serialized bytecode for IOME586 */
     size_t      bc_ser_len;
+    uint8_t    *mir_ser;    /* serialized MIR for cross-platform codegen cache */
+    size_t      mir_ser_len;
+    MIRProgram *mir_cache;  /* deserialized MIR from cache (owned, freed on unit free) */
 } LREvalUnit;
 
 /* Persistent per-context interpreter state. Created on first eval and
@@ -3006,6 +4034,8 @@ static void lr_eval_unit_free(LREvalUnit *unit)
     if (unit->ns.tag == LR_TYPE_OBJECT) lr_free_value(unit->ctx, unit->ns);
     if (unit->bc_prog) bc_free_program(unit->bc_prog);
     free(unit->bc_ser);
+    free(unit->mir_ser);
+    mir_free(unit->mir_cache);
     free(unit);
 }
 
@@ -3025,7 +4055,8 @@ void lr_context_free_persistent_interp(LRContext *ctx)
         o = o->gc_next;
     }
 
-    /* Free compiled cache entries (the BCPrograms are freed by lr_eval_unit_free) */
+    /* Free compiled cache entries (the BCPrograms' references are held
+     * by the eval units and released by lr_eval_unit_free below). */
     for (int i = 0; i < 64; i++) {
         struct LRCompiledCacheEntry *ce = ps->compiled_cache[i];
         while (ce) {
@@ -3114,6 +4145,8 @@ static LRValue lr_engine_exec_unit(LRContext *ctx, LREvalUnit *unit,
             return lr_throw_internal_error(ctx, "eval: out of memory");
         }
         interp_init(&ps->interp, ctx, is_module);
+        /* TEST-DISABLED */
+        /* interp_prepopulate_global_scope(&ps->interp); */
         ctx->persistent_interp = ps;
     } else {
         interp_reattach(&ps->interp, ctx);
@@ -3155,7 +4188,12 @@ static LRValue lr_engine_exec_unit(LRContext *ctx, LREvalUnit *unit,
         struct LRCompiledCacheEntry *ce = ps->compiled_cache[bucket];
         while (ce) {
             if (ce->hash == src_hash) {
+                /* The cached program is shared: multiple eval units alias
+                 * the same BCProgram.  Take our own reference so teardown
+                 * (bc_free_program = release) does not free the program
+                 * while another unit still holds it. */
                 unit->bc_prog = ce->prog;
+                bc_retain_program(unit->bc_prog);
                 break;
             }
             ce = ce->next;
@@ -3187,8 +4225,30 @@ static LRValue lr_engine_exec_unit(LRContext *ctx, LREvalUnit *unit,
         }
     }
 
+    /* Bytecode dump (LR_DUMP_BYTECODE=1) — diagnostic aid for profiling
+     * generated code.  Prints each function's disassembly to stderr. */
+    if (unit->bc_prog && unit->bc_prog->compiled &&
+        getenv("LR_DUMP_BYTECODE")) {
+        char *dump = bc_disassemble(unit->bc_prog);
+        if (dump) {
+            fprintf(stderr, "── bytecode dump: %s ──\n%s", filename, dump);
+            free(dump);
+        }
+    }
+
     /* Execute: bytecode VM only (direct/indirect threaded as of v0.1.1+). */
     if (unit->bc_prog && unit->bc_prog->compiled) {
+        if (getenv("LR_DEBUG_CALL")) {
+            BCProgram *dbgp = unit->bc_prog;
+            fprintf(stderr, "[COMPILE-END] prog=%p len=%d poolcnt=%d bytes@765:",
+                    (void *)dbgp, dbgp->code_len, dbgp->pool_count);
+            for (int db = 765; db < 786 && db < dbgp->code_len; db++)
+                fprintf(stderr, " %02x", dbgp->code[db]);
+            fprintf(stderr, "\n");
+            for (int di = 66; di < 76 && di < (int)dbgp->pool_count; di++)
+                if (dbgp->pool[di].kind == 2)
+                    fprintf(stderr, "  pool[%d]=%s\n", di, dbgp->pool[di].u.str);
+        }
         result = bc_execute(unit->bc_prog, ctx);
     } else {
         interp->error_flag = 1;
@@ -3301,6 +4361,34 @@ int lr_engine_unit_load_bytecode(void *unit_handle,
     if (u->bc_prog) bc_free_program(u->bc_prog);
     u->bc_prog = bc_deserialize(data, len);
     return u->bc_prog ? 0 : -1;
+}
+
+const uint8_t *lr_engine_unit_mir_data(void *unit_handle, size_t *out_len)
+{
+    if (!unit_handle) { if (out_len) *out_len = 0; return NULL; }
+    LREvalUnit *u = (LREvalUnit *)unit_handle;
+    if (out_len) *out_len = u->mir_ser_len;
+    return u->mir_ser;
+}
+
+MIRProgram *lr_engine_unit_load_mir(void *unit_handle,
+                                     const uint8_t *data, size_t len)
+{
+    if (!unit_handle || !data || !len) return NULL;
+    LREvalUnit *u = (LREvalUnit *)unit_handle;
+    MIRProgram *mir = mir_deserialize(data, len, NULL);
+    if (!mir) return NULL;
+    /* Transfer ownership: free old if any */
+    mir_free(u->mir_cache);
+    u->mir_cache = mir;
+    return mir;
+}
+
+Interpreter *lr_engine_get_interp(LRContext *ctx)
+{
+    if (!ctx) return NULL;
+    LRPersistentInterp *ps = (LRPersistentInterp *)ctx->persistent_interp;
+    return ps ? &ps->interp : NULL;
 }
 
 int lr_engine_program_count(const ASTNode *program)
@@ -3475,41 +4563,9 @@ LRValue lr_engine_build_function(LRContext *ctx, int nparams,
         obj->def_scope = NULL;
     }
 
-    /* Eagerly compile the function body into a BCProgram so the function
-     * can execute independently of the eval unit's AST. Store it in
-     * obj->opaque; the interpreter's function-call path checks opaque
-     * for a BCProgram before falling back to the AST via obj->extra. */
-    ASTNode *func_ast = (ASTNode *)obj->extra;
-    if (func_ast) {
-        BCProgram *prog = bc_new_program();
-        if (prog && bc_compile(prog, func_ast->u.func.body, 0) == 0) {
-            obj->opaque = prog;
-            obj->opaque_free = (void (*)(void *))bc_free_program;
-        } else if (prog) {
-            bc_free_program(prog);
-        }
-    }
-
-    /* Break the AST dependency: new Function objects must not hold
-     * pointers into the eval unit's AST, which will be freed below. */
-    obj->extra = NULL;
-
-    /* Immediately unlink and free the eval unit so it does not accumulate
-     * in the persistent interpreter's unit list. The BCProgram in
-     * obj->opaque is the only thing the function needs. */
-    LRPersistentInterp *ps = (LRPersistentInterp *)ctx->persistent_interp;
-    if (ps) {
-        LREvalUnit **pp = &ps->units;
-        while (*pp) {
-            LREvalUnit *u = *pp;
-            /* Find the unit that owns this function's AST. Since
-             * lr_engine_eval_source creates exactly one unit for this
-             * source, we free the most recently appended unit (head). */
-            *pp = u->next;
-            lr_eval_unit_free(u);
-            break;  /* one unit per new Function call */
-        }
-    }
+    /* Keep the AST alive by NOT freeing the eval unit. The eval unit
+     * stays in the persistent interpreter's unit list, ensuring the
+     * function's AST (obj->extra) remains valid for future calls. */
 
     return r;
 }
@@ -4364,26 +5420,40 @@ void lr_gc_run(LRRuntime *rt)
      * freed by free() directly without being unlinked from obj_list,
      * creating dangling pointers that corrupt the sweep traversal. */
     {
-        LRObject **pprev = &rt->obj_list;
-        while (*pprev) {
-            LRObject *obj = *pprev;
+        LRObject *obj = rt->obj_list;
+        while (obj) {
+            LRObject *next = obj->gc_next;
             if (obj->gc_mark == 0) {
                 if (obj->ref_count > 0 || obj->finalization_pending) {
                     /* Object is referenced but not GC-marked, OR it is
                      * awaiting deferred finalization (ref_count 0 but kept
                      * alive for WeakRefs / FinalizationRegistry). Keep it
                      * in the object list; it will be freed explicitly. */
-                    pprev = &(*pprev)->gc_next;
-                    continue;
+                } else {
+                    /* ref_count == 0 — already freed by ref counting,
+                     * just unlink from the list (O(1) via gc_prev, with a
+                     * linear-scan fallback when gc_prev is NULL and obj is
+                     * not the head, matching lr_free_object). */
+                    if (obj->gc_prev) {
+                        obj->gc_prev->gc_next = obj->gc_next;
+                    } else if (rt->obj_list == obj) {
+                        rt->obj_list = obj->gc_next;
+                    } else {
+                        LRObject **pprev = &rt->obj_list;
+                        while (*pprev && *pprev != obj) pprev = &(*pprev)->gc_next;
+                        if (*pprev == obj) *pprev = obj->gc_next;
+                    }
+                    if (obj->gc_next) {
+                        obj->gc_next->gc_prev = obj->gc_prev;
+                    }
+                    obj->gc_next = NULL;
+                    obj->gc_prev = NULL;
                 }
-                /* ref_count == 0 — already freed by ref counting, skip */
-                *pprev = obj->gc_next;
-                continue;
             } else {
                 /* Marked — reset for next GC cycle */
                 obj->gc_mark = 0;
             }
-            pprev = &(*pprev)->gc_next;
+            obj = next;
         }
     }
 
@@ -4466,20 +5536,44 @@ LRString *lr_new_atom_len(LRContext *ctx, const char *str, size_t len)
     uint32_t h = 2166136261u;
     for (size_t i = 0; i < len; i++)
         h = (h ^ (uint8_t)str[i]) * 16777619u;
-    int bi = (int)(h & (ATOM_HASH_SIZE - 1));
 
-    /* Check hash cache first (O(1)) */
-    LRString *cached = ctx->atom_hash[bi];
+    uint32_t mask = ctx->atom_map_size - 1;
+    uint32_t bi = h & mask;
+    LRString *cached = ctx->atom_map[bi];
     if (cached && cached->len == len && memcmp(cached->str, str, len) == 0)
         return lr_string_dup(cached);
 
-    /* Fallback: linear search in atom table */
-    for (uint32_t i = 0; i < ctx->atom_count; i++) {
-        if (ctx->atom_table[i]->len == len &&
-            memcmp(ctx->atom_table[i]->str, str, len) == 0) {
-            ctx->atom_hash[bi] = ctx->atom_table[i]; /* update cache */
-            return lr_string_dup(ctx->atom_table[i]);
+    /* Slow path: linear probing for a matching atom or empty slot */
+    uint32_t slot = bi;
+    for (;;) {
+        LRString *ent = ctx->atom_map[slot];
+        if (!ent) break; /* empty slot: insertion point */
+        if (ent->len == len && memcmp(ent->str, str, len) == 0)
+            return lr_string_dup(ent);
+        slot = (slot + 1) & mask;
+    }
+
+    /* Grow if load factor exceeds ~70% */
+    if (ctx->atom_map_count >= ctx->atom_map_size * 7 / 10) {
+        uint32_t new_size = ctx->atom_map_size * 2;
+        LRString **new_map = (LRString **)calloc(new_size, sizeof(LRString *));
+        if (!new_map) return NULL;
+        uint32_t new_mask = new_size - 1;
+        for (uint32_t i = 0; i < ctx->atom_map_size; i++) {
+            LRString *at = ctx->atom_map[i];
+            if (at) {
+                uint32_t s2 = at->hash & new_mask;
+                while (new_map[s2]) s2 = (s2 + 1) & new_mask;
+                new_map[s2] = at;
+            }
         }
+        free(ctx->atom_map);
+        ctx->atom_map = new_map;
+        ctx->atom_map_size = new_size;
+        /* Recompute insertion slot */
+        mask = new_mask;
+        slot = h & mask;
+        while (ctx->atom_map[slot]) slot = (slot + 1) & mask;
     }
 
     /* Create new atom */
@@ -4487,14 +5581,15 @@ LRString *lr_new_atom_len(LRContext *ctx, const char *str, size_t len)
     if (!atom) return NULL;
     atom->is_atom = 1;
 
-    /* Add to atom table + hash cache */
+    /* Add to atom table */
     if (ctx->atom_count >= ctx->atom_capacity) {
         ctx->atom_capacity *= 2;
         ctx->atom_table = (LRString **)realloc(ctx->atom_table,
             ctx->atom_capacity * sizeof(LRString *));
     }
     ctx->atom_table[ctx->atom_count++] = atom;
-    ctx->atom_hash[bi] = atom;  /* cache for next lookup */
+    ctx->atom_map[slot] = atom;
+    ctx->atom_map_count++;
     ctx->rt->atom_count++;
     ctx->rt->atom_size += (int64_t)(sizeof(LRString) + len + 1);
 
@@ -4519,7 +5614,15 @@ LRString *lr_to_atom(LRContext *ctx, LRValue val)
 {
     if (val.tag == LR_TYPE_STRING) {
         LRString *s = (LRString *)val.u.ptr;
+        /* Fast path: already an atom */
+        if (s->is_atom) return lr_string_dup(s);
         return lr_new_atom_len(ctx, s->str, s->len);
+    }
+    if (val.tag == LR_TYPE_SYMBOL) {
+        /* Symbol primitives store their description as a C string */
+        const char *desc = (const char *)val.u.ptr;
+        if (!desc) desc = "";
+        return lr_new_atom_len(ctx, desc, strlen(desc));
     }
     if (val.tag == LR_TYPE_OBJECT) {
         LRObject *o = (LRObject *)val.u.ptr;
@@ -4612,6 +5715,7 @@ LRValue lr_new_array_buffer(LRContext *ctx, uint8_t *buf, size_t len,
             meta->free_func = free_func;
             meta->opaque = opaque;
             meta->is_shared = is_shared;
+            meta->byte_length = len;
         }
         obj->opaque = meta;
     } else {
@@ -4649,11 +5753,8 @@ uint8_t *lr_get_array_buffer(LRContext *ctx, size_t *psize, LRValue obj)
     LRObject *o = (LRObject *)obj.u.ptr;
     if (o->type != LR_OBJ_ARRAY_BUFFER) return NULL;
     if (psize) {
-        LRValue len_val = lr_get_property_str(ctx, obj, "byteLength");
-        int32_t len = 0;
-        lr_to_int32(ctx, &len, len_val);
-        lr_free_value(ctx, len_val);
-        *psize = (size_t)len;
+        ArrayBufferMeta *meta = (ArrayBufferMeta *)o->opaque;
+        *psize = meta ? meta->byte_length : 0;
     }
     return (uint8_t *)o->extra;
 }

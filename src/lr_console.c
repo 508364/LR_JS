@@ -202,7 +202,8 @@ static JSValue lr_console_timeEnd(JSContext *ctx, JSValueConst this_val,
     }
 
     JSValue start_val = JS_GetPropertyStr(ctx, timers, label);
-    if (!JS_IsUndefined(start_val)) {
+    int has_start = !JS_IsUndefined(start_val);
+    if (has_start) {
         double start_ms;
         JS_ToFloat64(ctx, &start_ms, start_val);
         clock_t now = clock();
@@ -210,13 +211,13 @@ static JSValue lr_console_timeEnd(JSContext *ctx, JSValueConst this_val,
         double elapsed = now_ms - start_ms;
 
         LR_Runtime *rt = JS_GetContextOpaque(ctx);
-        fprintf(rt->stdout_fp, "%s: %.3f ms\n", label, elapsed);
-        fflush(rt->stdout_fp);
-
-        JS_DeleteProperty(ctx, timers, JS_NewAtom(ctx, label), 0);
+        if (rt) {
+            fprintf(rt->stdout_fp, "%s: %.3f ms\n", label, elapsed);
+            fflush(rt->stdout_fp);
+        }
     }
     JS_FreeValue(ctx, start_val);
-    JS_FreeValue(ctx, timers);
+    /* Don't free timers — it's owned by the global object */
     if (argc > 0) JS_FreeCString(ctx, label);
     return JS_UNDEFINED;
 }

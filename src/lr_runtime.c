@@ -8,11 +8,24 @@
 
 #include "lr_runtime.h"
 #include "lr_renderer.h"
+#include "lr_dom.h"
+#include "engine/lr_bytecode.h"
+#include "engine/lr_jit.h"
 
 /* Forward-declare interp functions (cannot include lr_interp.h on Windows
  * due to TokenType collision with winnt.h). */
 void interp_precompile_all_bodies(struct ASTNode *ast);
 int  interp_precompile_bodies_cas(struct ASTNode *ast);
+/* Iterate over all precompiled bodies for warm-path JIT from MIR cache */
+void interp_iterate_precompiled_bodies(
+    void (*callback)(ASTNode *ast_body, BCProgram *prog, void *userdata),
+    void *userdata);
+/* Free interpreter scope chain during runtime cleanup */
+void interp_free_scopes(LRContext *ctx);
+/* Drain the thread-local scope pool (frees cached scopes) */
+void interp_drain_scope_pool(void);
+/* Generator lazy-data destructor: releases the saved scope reference. */
+void gen_lazy_data_free(void *ptr);
 
 /* ── Global renderer bridge (shared across all Canvas instances) ───────── */
 
@@ -95,6 +108,21 @@ void lr_log(LR_Runtime *rt, LR_LogLevel level, const char *fmt, ...)
 int lr_check_exception(LR_Runtime *rt)
 {
     JSContext *ctx = rt->lr_ctx;
+
+    /* Engine-raised error message (lr_throw_* or internal engine error)
+     * takes priority. It may be set even when the exception value is not
+     * a proper error object (e.g. bytecode compilation failure). */
+    if (ctx->error_message) {
+        lr_set_error(rt, "%s", ctx->error_message);
+        free(ctx->error_message);
+        ctx->error_message = NULL;
+        /* Clear any stale exception value */
+        if (ctx->current_exception.tag == LR_TYPE_EXCEPTION)
+            JS_FreeValue(ctx, ctx->current_exception);
+        ctx->current_exception = LR_VALUE_UNDEFINED;
+        return -1;
+    }
+
     JSValue exc = JS_GetException(ctx);
     if (!JS_IsException(exc)) {
         /* A thrown JS value. For Error objects, JS_ToCString would yield the
@@ -603,6 +631,33 @@ void lr_runtime_free(LR_Runtime *rt)
         g_lr_renderer_bridge = NULL;
     }
 
+    /* Free interpreter scopes BEFORE freeing the context.
+     * JS_FreeContext → lr_free_context → lr_context_free_persistent_interp
+     * → interp_free clears ctx->opaque_interp, which would make the
+     * later interp_free_scopes call a no-op and leak the scope chain.
+     *
+     * Must clear def_scope on all function objects first, otherwise
+     * lr_free_context → lr_context_free_persistent_interp → interp_free
+     * → interp_closure_release_hook will try to release already-freed
+     * scopes (heap-use-after-free). */
+    if (rt->lr_rt) {
+        LRRuntime *eng_rt = rt->lr_rt;
+        /* Clear all def_scope pointers on function objects */
+        LRObject *o = eng_rt->obj_list;
+        while (o) {
+            o->def_scope = NULL;
+            o = o->gc_next;
+        }
+        /* Now free the scope chain */
+        LRContext *ctx = eng_rt->ctx_list;
+        while (ctx) {
+            if (ctx->opaque_interp) {
+                interp_free_scopes(ctx);
+            }
+            ctx = ctx->next_ctx;
+        }
+    }
+
     /* Free JS runtime (breaks circular references, clears object values,
      * frees atom table, but does NOT free the context struct itself so
      * that obj->ctx remains valid for the object cleanup loop). */
@@ -616,6 +671,12 @@ void lr_runtime_free(LR_Runtime *rt)
      * 2. Free remaining objects */
     if (rt->lr_rt) {
         LRRuntime *eng_rt = rt->lr_rt;
+        /* Mark the runtime as tearing down.  Map/Set opaque destructors
+         * check this flag and skip releasing their stored key/value refs:
+         * during teardown every object is freed by the walk below, and the
+         * stored refs may already point at freed objects (UAF otherwise). */
+        eng_rt->tearing_down = 1;
+
         /* Clear prop->key to prevent use-after-free on freed atom table */
         LRObject *obj = eng_rt->obj_list;
         while (obj) {
@@ -626,15 +687,89 @@ void lr_runtime_free(LR_Runtime *rt)
             }
             obj = obj->gc_next;
         }
-        /* Free remaining objects. Advance list head before each free
-         * to handle indirect freeing through data_free callbacks. */
+        /* Pre-cleanup pass: nullify all data_free callbacks and clear
+         * property values and array elements to prevent heap-use-after-free
+         * when one object's cleanup indirectly references another object
+         * that has already been freed by the loop below.
+         * This pass covers:
+         *   - CFunction data_free pointers (prevent callback chains)
+         *   - Property values (obj->props, break via lr_free_value chain)
+         *   - Array element values (stored in LRArrayData->elements)
+         *   - Proxy target/handler values
+         *   - TypedArray / DataView buffer references */
+        {
+            LRObject *o = eng_rt->obj_list;
+            while (o) {
+                /* Free CFunction data BEFORE nullifying data_free to
+                 * prevent leaking resolve/reject data and other custom
+                 * allocations. data_free is then set to NULL to prevent
+                 * double-free in lr_free_object's cleanup pass. */
+                if (o->type == LR_OBJ_CFUNCTION && o->extra) {
+                    LRCFunction *cf = (LRCFunction *)o->extra;
+                    if (cf->data_free && cf->data) {
+                        cf->data_free(cf->data);
+                        cf->data = NULL;
+                    }
+                    cf->data_free = NULL;
+                }
+                /* Free all property values to break reference chains.
+                 * Must free BEFORE clearing to avoid leaking strdup'd
+                 * symbol descriptions and other non-refcounted data.
+                 * lr_free_object will see UNDEFINED and skip, which is
+                 * correct — the value has already been released. */
+                if (o->props) {
+                    for (uint32_t i = 0; i < o->prop_count; i++) {
+                        lr_free_value(NULL, o->props[i]);
+                        o->props[i] = LR_VALUE_UNDEFINED;
+                    }
+                }
+                /* Free array element values before clearing */
+                if (o->type == LR_OBJ_ARRAY && o->extra) {
+                    LRArrayData *ad = (LRArrayData *)o->extra;
+                    for (uint32_t i = 0; i < ad->capacity; i++) {
+                        lr_free_value(NULL, ad->elements[i]);
+                        ad->elements[i] = LR_VALUE_UNDEFINED;
+                    }
+                }
+                /* Clear proxy target/handler (stored in extra) */
+                if (o->type == LR_OBJ_PROXY && o->extra) {
+                    LRProxyData *pd = (LRProxyData *)o->extra;
+                    pd->target = LR_VALUE_UNDEFINED;
+                    pd->handler = LR_VALUE_UNDEFINED;
+                }
+                /* Clear TypedArray/DataView buffer reference (stored in opaque) */
+                if (o->opaque) {
+                    if (o->type == LR_OBJ_TYPED_ARRAY) {
+                        TypedArrayData *tad = (TypedArrayData *)o->opaque;
+                        tad->buffer = LR_VALUE_UNDEFINED;
+                    } else if (o->type == LR_OBJ_DATA_VIEW) {
+                        DataViewData *dvd = (DataViewData *)o->opaque;
+                        dvd->buffer = LR_VALUE_UNDEFINED;
+                    }
+                }
+                /* Clear generator scope reference BEFORE the interpreter
+                 * scope chain is freed by interp_free_scopes below.
+                 * gen_lazy_data_free holds a saved scope pointer that will
+                 * become dangling once interp_free_scopes runs.  Nullify
+                 * the scope so that gen_lazy_data_free skips scope_release
+                 * (the scope is freed by interp_free_scopes instead). */
+                if (o->opaque_free == gen_lazy_data_free && o->opaque) {
+                    /* The GenLazyData struct has scope as its second field
+                     * (after body).  Cast to a pointer-sized array to set
+                     * the scope field to NULL without pulling in the full
+                     * struct definition (which lives in lr_interp.c). */
+                    void **fields = (void **)o->opaque;
+                    fields[1] = NULL; /* gd->scope = NULL */
+                }
+                o = o->gc_next;
+            }
+        }
+        /* Free remaining objects. lr_free_object handles O(1) removal
+         * from the obj_list via the gc_prev back pointer. */
         {
             int max_count = 100000;
             while (eng_rt->obj_list && max_count-- > 0) {
-                LRObject *cur = eng_rt->obj_list;
-                eng_rt->obj_list = cur->gc_next;
-                cur->gc_next = NULL;
-                lr_free_object(eng_rt, cur);
+                lr_free_object(eng_rt, eng_rt->obj_list);
             }
             eng_rt->obj_list = NULL;
         }
@@ -648,6 +783,12 @@ void lr_runtime_free(LR_Runtime *rt)
     if (rt->lr_rt) {
         JS_FreeRuntime(rt->lr_rt);
     }
+
+    /* Drain the scope pool as a final backstop against ASAN leak reports.
+     * The pool should already be drained by interp_free during context
+     * cleanup, but this ensures it happens even if the cleanup path
+     * is interrupted or the persistent interpreter was not created. */
+    interp_drain_scope_pool();
 
     free(rt->last_error);
     free(rt);
@@ -723,6 +864,18 @@ static int lr_exec_file_cached(LR_Runtime *rt, const char *filename,
              * eliminated. */
             interp_precompile_bodies_cas(ast);
 
+            /* Warm-path MIR JIT precompilation: if the archive contains
+             * serialized MIR, emit native code directly from cache,
+             * bypassing the bytecode→MIR frontend entirely. */
+            if (mf.mir_data && mf.mir_len > 0) {
+                Interpreter *interp = lr_engine_get_interp(ctx);
+                if (interp) {
+                    int mir_compiled = 0;
+                    lr_jit_precompile_from_mir_cache(interp,
+                        mf.mir_data, mf.mir_len, &mir_compiled);
+                }
+            }
+
             /* Execute with pre-compiled bytecode if available (v0.1.1+),
              * otherwise compile from deserialized AST. */
             LRValue result;
@@ -796,6 +949,15 @@ static int lr_exec_file_cached(LR_Runtime *rt, const char *filename,
             const uint8_t *bc_data = lr_engine_unit_bc_data(unit, &bc_len);
             if (bc_data && bc_len > 0)
                 lr_iome586_set_bytecode(&w, bc_data, bc_len);
+            /* Also attach serialized MIR for JIT warm-path acceleration.
+             * When present, the warm path can emit native code directly
+             * from cached MIR, bypassing the bytecode→MIR frontend. */
+            if (rt->lr_rt && rt->lr_rt->jit_runtime
+                && ((LRJITRuntime *)rt->lr_rt->jit_runtime)->mir_ser
+                && ((LRJITRuntime *)rt->lr_rt->jit_runtime)->mir_ser_len > 0) {
+                LRJITRuntime *jit = (LRJITRuntime *)rt->lr_rt->jit_runtime;
+                lr_iome586_set_mir(&w, jit->mir_ser, jit->mir_ser_len);
+            }
             lr_iome586_commit(&rt->iome586, &w, ctx, prog, exec_us);
         }
         ret = 0;
@@ -847,6 +1009,17 @@ int lr_event_loop_run(LR_Runtime *rt)
             lr_gc_before_alloc(&rt->gc_ctx);
 
             int ret = JS_ExecutePendingJob(rt->lr_rt, &ctx);
+            if (ret < 0) {
+                lr_check_exception(rt);
+                rt->event_loop_running = 0;
+                break;
+            }
+            has_jobs = 1;
+        }
+        /* Also drain LR_JS's own job queue (promise reactions, etc.) */
+        while (lr_is_job_pending(rt->lr_rt)) {
+            lr_gc_before_alloc(&rt->gc_ctx);
+            int ret = lr_execute_pending_job(rt->lr_rt, &ctx);
             if (ret < 0) {
                 lr_check_exception(rt);
                 rt->event_loop_running = 0;
@@ -1001,11 +1174,13 @@ void lr_dump_memory_usage(LR_Runtime *rt, FILE *fp)
     lr_compute_memory_usage(rt, &usage);
 
     fprintf(fp, "=== L/R_JS Memory Usage ===\n");
+    int64_t malloc_sz = usage.malloc_size < 0 ? 0 : usage.malloc_size;
+    int64_t mem_sz = usage.memory_used_size < 0 ? 0 : usage.memory_used_size;
     fprintf(fp, "  Malloc:  %lld bytes (%lld allocs, limit %lld)\n",
-            (long long)usage.malloc_size, (long long)usage.malloc_count,
+            (long long)malloc_sz, (long long)usage.malloc_count,
             (long long)usage.malloc_limit);
     fprintf(fp, "  Memory:  %lld bytes (%lld allocs)\n",
-            (long long)usage.memory_used_size, (long long)usage.memory_used_count);
+            (long long)mem_sz, (long long)usage.memory_used_count);
     fprintf(fp, "  Atoms:   %lld (%lld bytes)\n",
             (long long)usage.atom_count, (long long)usage.atom_size);
     fprintf(fp, "  Strings: %lld (%lld bytes)\n",
@@ -1042,12 +1217,75 @@ static JSValue js_gc(JSContext *ctx, JSValueConst this_val, int argc, JSValueCon
     return JS_UNDEFINED;
 }
 
+static JSValue js_print(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    LR_Runtime *rt = JS_GetContextOpaque(ctx);
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) fputc(' ', rt->stdout_fp);
+        JSValue v = JS_ToString(ctx, argv[i]);
+        if (!JS_IsException(v)) {
+            char *s = JS_ToCString(ctx, v);
+            if (s) {
+                fputs(s, rt->stdout_fp);
+                JS_FreeCString(ctx, s);
+            }
+            JS_FreeValue(ctx, v);
+        }
+    }
+    fputc('\n', rt->stdout_fp);
+    fflush(rt->stdout_fp);
+    return JS_UNDEFINED;
+}
+
 static JSValue js_gc_stats(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
     (void)this_val; (void)argc; (void)argv;
     LR_Runtime *rt = JS_GetContextOpaque(ctx);
     lr_gc_print_stats(rt, stderr);
     return JS_UNDEFINED;
+}
+
+static JSValue js_memo_stats(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    (void)this_val; (void)argc; (void)argv;
+    JSValue ret = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, ret, "hits",
+                      JS_NewUint32(ctx, (uint32_t)lr_memo_hit_count()));
+    JS_SetPropertyStr(ctx, ret, "misses",
+                      JS_NewUint32(ctx, (uint32_t)lr_memo_miss_count()));
+    return ret;
+}
+
+static JSValue js_memory_usage(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    (void)this_val; (void)argc; (void)argv;
+    LR_Runtime *rt = JS_GetContextOpaque(ctx);
+    if (!rt) return JS_NULL;
+    LR_MemoryUsage u;
+    lr_compute_memory_usage(rt, &u);
+    if (u.memory_used_size < 0) u.memory_used_size = 0;
+    if (u.malloc_size < 0) u.malloc_size = 0;
+    JSValue ret = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, ret, "mallocSize",       JS_NewInt64(ctx, u.malloc_size));
+    JS_SetPropertyStr(ctx, ret, "memoryUsedSize",   JS_NewInt64(ctx, u.memory_used_size));
+    JS_SetPropertyStr(ctx, ret, "atomCount",        JS_NewInt64(ctx, u.atom_count));
+    JS_SetPropertyStr(ctx, ret, "atomSize",         JS_NewInt64(ctx, u.atom_size));
+    JS_SetPropertyStr(ctx, ret, "strCount",         JS_NewInt64(ctx, u.str_count));
+    JS_SetPropertyStr(ctx, ret, "strSize",          JS_NewInt64(ctx, u.str_size));
+    JS_SetPropertyStr(ctx, ret, "objCount",         JS_NewInt64(ctx, u.obj_count));
+    JS_SetPropertyStr(ctx, ret, "objSize",          JS_NewInt64(ctx, u.obj_size));
+    JS_SetPropertyStr(ctx, ret, "propCount",        JS_NewInt64(ctx, u.prop_count));
+    JS_SetPropertyStr(ctx, ret, "propSize",         JS_NewInt64(ctx, u.prop_size));
+    JS_SetPropertyStr(ctx, ret, "shapeCount",       JS_NewInt64(ctx, u.shape_count));
+    JS_SetPropertyStr(ctx, ret, "shapeSize",        JS_NewInt64(ctx, u.shape_size));
+    JS_SetPropertyStr(ctx, ret, "jsFuncCount",      JS_NewInt64(ctx, u.js_func_count));
+    JS_SetPropertyStr(ctx, ret, "jsFuncSize",       JS_NewInt64(ctx, u.js_func_size));
+    JS_SetPropertyStr(ctx, ret, "cFuncCount",       JS_NewInt64(ctx, u.c_func_count));
+    JS_SetPropertyStr(ctx, ret, "arrayCount",       JS_NewInt64(ctx, u.array_count));
+    JS_SetPropertyStr(ctx, ret, "fastArrayCount",   JS_NewInt64(ctx, u.fast_array_count));
+    JS_SetPropertyStr(ctx, ret, "fastArrayElements",JS_NewInt64(ctx, u.fast_array_elements));
+    return ret;
 }
 
 /* ── Built-in registration ────────────────────────────────────────────── */
@@ -1104,6 +1342,16 @@ void lr_register_builtins(LR_Runtime *rt)
                       JS_NewCFunction(ctx, js_gc, "gc", 0));
     JS_SetPropertyStr(ctx, global, "gcStats",
                       JS_NewCFunction(ctx, js_gc_stats, "gcStats", 0));
+    JS_SetPropertyStr(ctx, global, "print",
+                      JS_NewCFunction(ctx, js_print, "print", 1));
+
+    /* Register bc_memo_stats() — returns IOME586 memo cache hit/miss counts */
+    JS_SetPropertyStr(ctx, global, "bc_memo_stats",
+                      JS_NewCFunction(ctx, js_memo_stats, "bc_memo_stats", 0));
+
+    /* Register lr_memory_usage() — returns VM memory breakdown */
+    JS_SetPropertyStr(ctx, global, "lr_memory_usage",
+                      JS_NewCFunction(ctx, js_memory_usage, "lr_memory_usage", 0));
 
     /* ES2020 globalThis */
     JS_SetPropertyStr(ctx, global, "globalThis", JS_DupValue(ctx, global));
@@ -1129,6 +1377,7 @@ void lr_register_builtins(LR_Runtime *rt)
     lr_sysinfo_init(rt);
     lr_worker_init(rt);
     lr_canvas_init(rt);
+    lr_dom_init(rt);
     lr_promise_init(rt);
     lr_proxy_init(rt);
     lr_reflect_init(rt);

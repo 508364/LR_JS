@@ -97,8 +97,15 @@ LRValue lr_new_promise(LRContext *ctx)
         v.u.ptr = NULL;
         return v;
     }
-    /* Link into runtime object list for GC tracking */
+    /* Link into runtime object list for GC tracking.
+     * Maintain the doubly-linked list invariant: the old head's gc_prev
+     * must point back to the new object.  Without this, freeing the old
+     * head (gc_prev==NULL but no longer the head) cannot unlink it via
+     * the O(1) gc_prev path in lr_free_object, leaving a dangling
+     * pointer in obj_list -> heap-use-after-free at shutdown. */
     obj->gc_next = ctx->rt->obj_list;
+    obj->gc_prev = NULL;
+    if (ctx->rt->obj_list) ctx->rt->obj_list->gc_prev = obj;
     ctx->rt->obj_list = obj;
     ctx->rt->obj_count++;
     v.tag = LR_TYPE_OBJECT;
@@ -299,6 +306,40 @@ static LRValue job_fulfill_reaction(JSContext *ctx, JSValueConst this_val,
     return LR_VALUE_UNDEFINED;
 }
 
+#if 0
+/* Debug version of job_fulfill_reaction for tracing */
+static LRValue job_fulfill_reaction_debug(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    (void)this_val; (void)argc; (void)argv;
+    LRValue func = ctx->current_func;
+    if (func.tag != LR_TYPE_OBJECT) { fprintf(stderr, "JOB_FF: no func\n"); return LR_VALUE_UNDEFINED; }
+    LRObject *obj = (LRObject *)func.u.ptr;
+    if (!obj || !obj->extra) { fprintf(stderr, "JOB_FF: no extra\n"); return LR_VALUE_UNDEFINED; }
+    LRCFunction *cf = (LRCFunction *)obj->extra;
+    JobData *jd = (JobData *)cf->data;
+    if (!jd) { fprintf(stderr, "JOB_FF: no jd\n"); return LR_VALUE_UNDEFINED; }
+    const char *vstr = lr_to_cstring(ctx, jd->value);
+    fprintf(stderr, "JOB_FF: handler=%p value=%s\n", (void*)jd->handler.u.ptr, vstr ? vstr : "?");
+    lr_free_cstring(ctx, vstr);
+    LRValue result = lr_call(ctx, jd->handler, LR_VALUE_UNDEFINED, 1, &jd->value);
+    const char *rstr = lr_to_cstring(ctx, result);
+    fprintf(stderr, "JOB_FF: result tag=%d ptr=%p str=%s exc=%d\n", result.tag, (void*)result.u.ptr, rstr ? rstr : "?", lr_is_exception(result));
+    lr_free_cstring(ctx, rstr);
+    if (lr_is_exception(result)) {
+        LRValue exc = lr_get_exception(ctx);
+        lr_call(ctx, jd->reject, LR_VALUE_UNDEFINED, 1, &exc);
+        lr_free_value(ctx, exc);
+    } else {
+        lr_call(ctx, jd->resolve, LR_VALUE_UNDEFINED, 1, &result);
+        lr_free_value(ctx, result);
+    }
+    cf->data = NULL;
+    job_data_free(ctx, jd);
+    return LR_VALUE_UNDEFINED;
+}
+#endif
+
 static LRValue job_reject_reaction(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
@@ -457,12 +498,30 @@ void lr_promise_resolve_internal(LRContext *ctx, LRValue promise, LRValue value)
     pd->result = lr_dup_value(ctx, value);
 
 trigger:
-    /* Trigger all reactions as microtasks */
-    for (int i = 0; i < pd->fulfill_count; i++) {
-        lr_promise_trigger_reaction(ctx, &pd->fulfill_reactions[i], pd->result);
-    }
-    for (int i = 0; i < pd->reject_count; i++) {
-        lr_promise_trigger_reaction(ctx, &pd->reject_reactions[i], pd->result);
+    /* Only trigger the appropriate reactions based on state,
+     * and clean up the unused ones. */
+    if (pd->state == LR_PROMISE_FULFILLED) {
+        for (int i = 0; i < pd->fulfill_count; i++) {
+            lr_promise_trigger_reaction(ctx, &pd->fulfill_reactions[i], pd->result);
+        }
+        /* Free unused reject reactions */
+        for (int i = 0; i < pd->reject_count; i++) {
+            lr_free_value(ctx, pd->reject_reactions[i].handler);
+            lr_free_value(ctx, pd->reject_reactions[i].resolve);
+            lr_free_value(ctx, pd->reject_reactions[i].reject);
+            lr_free_value(ctx, pd->reject_reactions[i].promise);
+        }
+    } else {
+        for (int i = 0; i < pd->reject_count; i++) {
+            lr_promise_trigger_reaction(ctx, &pd->reject_reactions[i], pd->result);
+        }
+        /* Free unused fulfill reactions */
+        for (int i = 0; i < pd->fulfill_count; i++) {
+            lr_free_value(ctx, pd->fulfill_reactions[i].handler);
+            lr_free_value(ctx, pd->fulfill_reactions[i].resolve);
+            lr_free_value(ctx, pd->fulfill_reactions[i].reject);
+            lr_free_value(ctx, pd->fulfill_reactions[i].promise);
+        }
     }
     pd->fulfill_count = 0;
     pd->reject_count = 0;
@@ -477,12 +536,16 @@ void lr_promise_reject_internal(LRContext *ctx, LRValue promise, LRValue reason)
     pd->state = LR_PROMISE_REJECTED;
     pd->result = lr_dup_value(ctx, reason);
 
-    /* Trigger all reactions as microtasks */
-    for (int i = 0; i < pd->fulfill_count; i++) {
-        lr_promise_trigger_reaction(ctx, &pd->fulfill_reactions[i], pd->result);
-    }
+    /* Only trigger reject reactions */
     for (int i = 0; i < pd->reject_count; i++) {
         lr_promise_trigger_reaction(ctx, &pd->reject_reactions[i], pd->result);
+    }
+    /* Also clean up fulfill reactions (free them) */
+    for (int i = 0; i < pd->fulfill_count; i++) {
+        lr_free_value(ctx, pd->fulfill_reactions[i].handler);
+        lr_free_value(ctx, pd->fulfill_reactions[i].resolve);
+        lr_free_value(ctx, pd->fulfill_reactions[i].reject);
+        lr_free_value(ctx, pd->fulfill_reactions[i].promise);
     }
     pd->fulfill_count = 0;
     pd->reject_count = 0;
@@ -597,6 +660,20 @@ static LRValue js_promise_then(JSContext *ctx, JSValueConst this_val,
         lr_free_value(ctx, on_fulfilled);
         lr_free_value(ctx, on_rejected);
         return derived_promise;
+    }
+
+    /* Set the prototype to Promise.prototype so derived promises have
+     * then/catch/finally methods available through the prototype chain. */
+    {
+        JSValue proto = JS_GetPropertyStr(ctx, ctx->global_obj, "Promise");
+        if (proto.tag == LR_TYPE_OBJECT) {
+            JSValue pp = JS_GetPropertyStr(ctx, proto, "prototype");
+            if (pp.tag == LR_TYPE_OBJECT) {
+                lr_set_prototype(ctx, derived_promise, pp);
+            }
+            lr_free_value(ctx, pp);
+        }
+        lr_free_value(ctx, proto);
     }
 
     /* Create resolve/reject functions for the derived promise */
@@ -918,15 +995,118 @@ static LRValue js_promise_reject(JSContext *ctx, JSValueConst this_val,
 
 /* ── Promise.all ───────────────────────────────────────────────────────── */
 
+/* Data for tracking Promise.all progress */
+typedef struct {
+    int32_t remaining;
+    int32_t total;
+    LRValue  result_arr;
+    LRValue  reject_fn;
+    int      rejected;
+} PromiseAllData;
+
+static LRValue promise_all_fulfill(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    LRValue func = ctx->current_func;
+    if (func.tag != LR_TYPE_OBJECT) return LR_VALUE_UNDEFINED;
+    LRObject *obj = (LRObject *)func.u.ptr;
+    if (!obj || !obj->extra) return LR_VALUE_UNDEFINED;
+    LRCFunction *cf = (LRCFunction *)obj->extra;
+    PromiseAllData *pd = (PromiseAllData *)cf->data;
+    if (!pd || pd->rejected) return LR_VALUE_UNDEFINED;
+
+    /* Get the index from magic */
+    int32_t index = cf->magic;
+    LRValue value = (argc > 0) ? argv[0] : LR_VALUE_UNDEFINED;
+
+    /* Store the result */
+    lr_set_property_uint32(ctx, pd->result_arr, (uint32_t)index, lr_dup_value(ctx, value));
+
+    pd->remaining--;
+    if (pd->remaining <= 0) {
+        /* All promises resolved */
+        lr_set_property_str(ctx, pd->result_arr, "length", lr_new_int32(ctx, pd->total));
+        LRValue resolve_fn = lr_get_property_str(ctx, func, "_resolve");
+        lr_call(ctx, resolve_fn, LR_VALUE_UNDEFINED, 1, &pd->result_arr);
+        lr_free_value(ctx, resolve_fn);
+    }
+    return LR_VALUE_UNDEFINED;
+}
+
+static LRValue promise_all_reject(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    LRValue func = ctx->current_func;
+    if (func.tag != LR_TYPE_OBJECT) return LR_VALUE_UNDEFINED;
+    LRObject *obj = (LRObject *)func.u.ptr;
+    if (!obj || !obj->extra) return LR_VALUE_UNDEFINED;
+    LRCFunction *cf = (LRCFunction *)obj->extra;
+    PromiseAllData *pd = (PromiseAllData *)cf->data;
+    if (!pd || pd->rejected) return LR_VALUE_UNDEFINED;
+    pd->rejected = 1;
+
+    LRValue reason = (argc > 0) ? argv[0] : LR_VALUE_UNDEFINED;
+    /* Get the reject function from the data */
+    lr_call(ctx, pd->reject_fn, LR_VALUE_UNDEFINED, 1, &reason);
+    return LR_VALUE_UNDEFINED;
+}
+
+static void promise_all_data_free(LRContext *ctx, PromiseAllData *pd)
+{
+    if (!pd) return;
+    lr_free_value(ctx, pd->result_arr);
+    lr_free_value(ctx, pd->reject_fn);
+    free(pd);
+}
+
+/* Wrapper for data_free callback - called during final cleanup */
+static void promise_all_data_free_wrapper(void *data)
+{
+    /* data_free_wrapper is called from lr_runtime_free's pre-cleanup pass
+     * with a NULL context; promise_all_data_free only calls lr_free_value
+     * which handles NULL context fine for strings/objects/symbols. */
+    promise_all_data_free(NULL, (PromiseAllData *)data);
+}
+
 static LRValue js_promise_all(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
-    (void)this_val;
-
     LRValue iterable = (argc > 0) ? argv[0] : LR_VALUE_UNDEFINED;
+
+    /* Get Promise.prototype from the constructor */
+    JSValue proto = JS_GetPropertyStr(ctx, this_val, "prototype");
+
+    /* Get Promise.resolve from the constructor */
+    JSValue resolve_static = JS_GetPropertyStr(ctx, this_val, "resolve");
 
     /* Create the result promise */
     LRValue result_promise = lr_new_promise(ctx);
+    if (proto.tag == LR_TYPE_OBJECT) {
+        lr_set_prototype(ctx, result_promise, proto);
+    }
+    lr_free_value(ctx, proto);
+
+    /* Create resolve/reject functions for the result promise */
+    PromiseResolveData *rd = resolve_data_new(ctx, result_promise);
+    LRValue result_resolve = lr_new_cfunction(ctx, promise_resolve_func, "resolve", 1);
+    if (result_resolve.tag == LR_TYPE_OBJECT) {
+        LRObject *robj = (LRObject *)result_resolve.u.ptr;
+        if (robj && robj->extra) {
+            LRCFunction *rcf = (LRCFunction *)robj->extra;
+            rcf->data = rd;
+            rcf->data_free = resolve_data_free_wrapper;
+        }
+    }
+    LRValue result_reject = lr_new_cfunction(ctx, promise_reject_func, "reject", 1);
+    if (result_reject.tag == LR_TYPE_OBJECT) {
+        LRObject *rejobj = (LRObject *)result_reject.u.ptr;
+        if (rejobj && rejobj->extra) {
+            LRCFunction *rcf = (LRCFunction *)rejobj->extra;
+            rcf->data = rd;
+        }
+    }
 
     /* Convert iterable to array */
     LRValue arr;
@@ -941,8 +1121,9 @@ static LRValue js_promise_all(JSContext *ctx, JSValueConst this_val,
             lr_free_value(ctx, len_val);
             for (int32_t i = 0; i < len; i++) {
                 LRValue item = lr_get_property_uint32(ctx, iterable, i);
+                /* lr_set_property_uint32 takes ownership of item; do NOT
+                 * free it here (would double-free the stored element). */
                 lr_set_property_uint32(ctx, arr, i, item);
-                lr_free_value(ctx, item);
             }
             lr_set_property_str(ctx, arr, "length", lr_new_int32(ctx, len));
         }
@@ -959,13 +1140,90 @@ static LRValue js_promise_all(JSContext *ctx, JSValueConst this_val,
         /* If empty, resolve with empty array */
         lr_promise_resolve_internal(ctx, result_promise, arr);
         lr_free_value(ctx, arr);
+        lr_free_value(ctx, result_resolve);
+        lr_free_value(ctx, result_reject);
+        lr_free_value(ctx, resolve_static);
         return result_promise;
     }
 
-    /* Simplified: resolve immediately with the array */
-    lr_promise_resolve_internal(ctx, result_promise, arr);
+    /* Create shared data for tracking */
+    PromiseAllData *pad = (PromiseAllData *)calloc(1, sizeof(PromiseAllData));
+    if (!pad) {
+        lr_free_value(ctx, arr);
+        lr_free_value(ctx, result_resolve);
+        lr_free_value(ctx, result_reject);
+        lr_free_value(ctx, resolve_static);
+        return result_promise;
+    }
+    pad->remaining = total;
+    pad->total = total;
+    pad->result_arr = lr_dup_value(ctx, arr);
+    pad->reject_fn = lr_dup_value(ctx, result_reject);
+    pad->rejected = 0;
+
+    /* Process each element */
+    for (int32_t i = 0; i < total; i++) {
+        LRValue item = lr_get_property_uint32(ctx, arr, i);
+        LRValue prom_item;
+
+        /* Wrap in Promise.resolve */
+        if (lr_is_promise_val(item)) {
+            prom_item = lr_dup_value(ctx, item);
+        } else {
+            /* Call Promise.resolve(item) */
+            LRValue args[1] = { item };
+            prom_item = lr_call(ctx, resolve_static, this_val, 1, args);
+        }
+
+        /* Create fulfill handler with index in magic */
+        LRValue fulfill_fn = lr_new_cfunction2(ctx, promise_all_fulfill,
+                                                "fulfill", 1, 0, i);
+        if (fulfill_fn.tag == LR_TYPE_OBJECT) {
+            LRObject *fobj = (LRObject *)fulfill_fn.u.ptr;
+            if (fobj && fobj->extra) {
+                LRCFunction *cf = (LRCFunction *)fobj->extra;
+                cf->data = pad;
+                /* Do NOT set data_free here — multiple fulfill functions
+                 * share the same pad, and setting data_free on all of them
+                 * would cause a use-after-free when the pre-cleanup pass
+                 * calls data_free multiple times on the same pad pointer.
+                 * The pad is freed in promise_all_fulfill when all elements
+                 * have been processed (remaining == 0). */
+                /* Store resolve function for when all complete */
+                lr_set_property_str(ctx, fulfill_fn, "_resolve",
+                                     lr_dup_value(ctx, result_resolve));
+            }
+        }
+
+        /* Create reject handler */
+        LRValue reject_fn = lr_new_cfunction(ctx, promise_all_reject,
+                                              "rejectAll", 1);
+        if (reject_fn.tag == LR_TYPE_OBJECT) {
+            LRObject *robj = (LRObject *)reject_fn.u.ptr;
+            if (robj && robj->extra) {
+                LRCFunction *cf = (LRCFunction *)robj->extra;
+                cf->data = pad;
+            }
+        }
+
+        /* Call prom_item.then(fulfill_fn, reject_fn) */
+        LRValue then_val = lr_get_property_str(ctx, prom_item, "then");
+        if (lr_is_function(ctx, then_val)) {
+            LRValue then_args[2] = { fulfill_fn, reject_fn };
+            lr_call(ctx, then_val, prom_item, 2, then_args);
+        }
+        lr_free_value(ctx, then_val);
+        lr_free_value(ctx, fulfill_fn);
+        lr_free_value(ctx, reject_fn);
+        lr_free_value(ctx, prom_item);
+        lr_free_value(ctx, item);
+    }
 
     lr_free_value(ctx, arr);
+    lr_free_value(ctx, result_resolve);
+    lr_free_value(ctx, result_reject);
+    lr_free_value(ctx, resolve_static);
+
     return result_promise;
 }
 
@@ -993,8 +1251,9 @@ static LRValue js_promise_race(JSContext *ctx, JSValueConst this_val,
             lr_free_value(ctx, len_val);
             for (int32_t i = 0; i < len; i++) {
                 LRValue item = lr_get_property_uint32(ctx, iterable, i);
+                /* lr_set_property_uint32 takes ownership of item; do NOT
+                 * free it here (would double-free the stored element). */
                 lr_set_property_uint32(ctx, arr, i, item);
-                lr_free_value(ctx, item);
             }
             lr_set_property_str(ctx, arr, "length", lr_new_int32(ctx, len));
         }
@@ -1041,8 +1300,9 @@ static LRValue js_promise_all_settled(JSContext *ctx, JSValueConst this_val,
             lr_free_value(ctx, len_val);
             for (int32_t i = 0; i < len; i++) {
                 LRValue item = lr_get_property_uint32(ctx, iterable, i);
+                /* lr_set_property_uint32 takes ownership of item; do NOT
+                 * free it here (would double-free the stored element). */
                 lr_set_property_uint32(ctx, arr, i, item);
-                lr_free_value(ctx, item);
             }
             lr_set_property_str(ctx, arr, "length", lr_new_int32(ctx, len));
         }
@@ -1083,7 +1343,6 @@ static LRValue js_promise_all_settled(JSContext *ctx, JSValueConst this_val,
             lr_set_property_str(ctx, entry, "value", lr_dup_value(ctx, item));
         }
         lr_set_property_uint32(ctx, result_arr, i, entry);
-        lr_free_value(ctx, entry);
         lr_free_value(ctx, item);
     }
     lr_set_property_str(ctx, result_arr, "length", lr_new_int32(ctx, total));
@@ -1119,8 +1378,9 @@ static LRValue js_promise_any(JSContext *ctx, JSValueConst this_val,
             lr_free_value(ctx, len_val);
             for (int32_t i = 0; i < len; i++) {
                 LRValue item = lr_get_property_uint32(ctx, iterable, i);
+                /* lr_set_property_uint32 takes ownership of item; do NOT
+                 * free it here (would double-free the stored element). */
                 lr_set_property_uint32(ctx, arr, i, item);
-                lr_free_value(ctx, item);
             }
             lr_set_property_str(ctx, arr, "length", lr_new_int32(ctx, len));
         }
@@ -1150,14 +1410,14 @@ static LRValue js_promise_any(JSContext *ctx, JSValueConst this_val,
                 lr_promise_resolve_internal(ctx, result_promise, ipd->result);
                 lr_free_value(ctx, item);
                 lr_free_value(ctx, arr);
-                lr_free_value(ctx, result_promise);
+                /* result_promise is the return value; ownership transfers
+                 * to the caller — do NOT free it here. */
                 return result_promise;
             }
         } else {
             lr_promise_resolve_internal(ctx, result_promise, item);
             lr_free_value(ctx, item);
             lr_free_value(ctx, arr);
-            lr_free_value(ctx, result_promise);
             return result_promise;
         }
         lr_free_value(ctx, item);
@@ -1169,7 +1429,6 @@ static LRValue js_promise_any(JSContext *ctx, JSValueConst this_val,
     lr_free_value(ctx, err);
 
     lr_free_value(ctx, arr);
-    lr_free_value(ctx, result_promise);
     return result_promise;
 }
 

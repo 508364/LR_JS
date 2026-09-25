@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdarg.h>
+#include <string.h>
 
 /* AST node / parser types are defined in engine/lr_ast.h. We forward-declare
  * them here instead of including lr_ast.h, because lr_ast.h transitively
@@ -19,6 +20,7 @@
  * `TokenType` in any translation unit that also pulls in the Windows headers. */
 typedef struct ASTNode ASTNode;
 typedef struct Parser  Parser;
+typedef struct MIRProgram MIRProgram;
 
 #ifdef __cplusplus
 extern "C" {
@@ -86,6 +88,7 @@ typedef LRValue LRValueConst;
 struct LRString {
     int32_t  ref_count;
     uint32_t len;
+    uint32_t hash;      /* FNV-1a hash (cached to avoid re-hashing on property lookup) */
     uint8_t  is_atom;   /* interned atom? */
     char     str[];      /* null-terminated, flexible array */
 };
@@ -107,14 +110,15 @@ struct LRProperty {
     LRValue      value;     /* value or getter function */
     LRValue      setter;    /* setter function (for accessors) */
     int32_t      flags;
+    uint32_t     slot_index;/* cached slot index in LRObject.props[] for O(1) shape lookup */
     LRProperty  *next;      /* main prop_hash chain (enumeration) */
     LRProperty  *bnext;     /* bucket chain (fast lookup) */
 };
 
 /* ── Shape (hidden class) ─────────────────────────────────────────────── */
 
-/* Shape flat-hash: O(1) slot lookup for up to 16 entries. */
-#define SHAPE_FLAT_BITS  4
+/* Shape flat-hash: O(1) slot lookup for up to 64 entries. */
+#define SHAPE_FLAT_BITS  6
 #define SHAPE_FLAT_SIZE  (1 << SHAPE_FLAT_BITS)
 #define SHAPE_FLAT_MASK  (SHAPE_FLAT_SIZE - 1)
 #define SHAPE_FLAT_EMPTY 0xFFFF
@@ -126,6 +130,9 @@ struct LRShape {
     LRShape   *next;
     uint32_t   slot_index;
     uint32_t   hash;
+    uint32_t   version;      /* bumped when a flat prop is demoted to an
+                              * accessor, so interpreter inline caches that
+                              * key on this shape get invalidated */
     LRString  *flat_keys[SHAPE_FLAT_SIZE];
     uint16_t   flat_slots[SHAPE_FLAT_SIZE];
     uint8_t    flat_count;
@@ -170,7 +177,13 @@ struct LRObject {
     LRShape      *shape;          /* current shape (hidden class) */
     LRClass      *class_def;      /* class definition */
     LRValue      *props;          /* property value array */
-    uint32_t      prop_count;     /* allocated slots */
+    uint32_t      prop_count;     /* number of properties stored */
+    uint32_t      prop_capacity;  /* allocated capacity of props[] (geometric growth) */
+    uint32_t      mut_gen;        /* IOME586: bumped on every property/array write.
+                                   * Lets the dynamic-result cache (obj + prop_name + mut_gen)
+                                   * detect external interference and invalidate stale
+                                   * entries without walking the shape chain.  Initialized
+                                   * to 1 (0 is reserved for "no cache yet"). */
     LRValue       proto;          /* prototype */
     void         *extra;          /* type-specific data (array data, function code, etc.) */
     void         *def_scope;      /* captured lexical scope (interpreter closures) */
@@ -181,11 +194,12 @@ struct LRObject {
     uint8_t       is_extensible;  /* can add new properties */
     uint8_t       finalized;      /* finalized by GC */
     LRProperty   *prop_hash;      /* named property linked list */
-    #define OBJ_PROP_BUCKETS 8
-    LRProperty   *prop_buckets[OBJ_PROP_BUCKETS]; /* hash-bucketed fast lookup */
+    LRProperty   **prop_buckets;  /* hash-bucketed fast lookup (dynamically allocated) */
+    uint32_t      prop_buckets_count; /* number of buckets in prop_buckets[] (0 = not allocated) */
     /* GC fields */
     int           gc_mark;        /* mark bit for mark-and-sweep GC */
     struct LRObject *gc_next;     /* linked list for object tracking */
+    struct LRObject *gc_prev;     /* back pointer for O(1) unlink */
     /* Finalization / weak reference support */
     int           finalization_pending; /* deferred-free in progress */
     int           weak_ref_count;       /* number of WeakRefs targeting this object */
@@ -222,9 +236,12 @@ typedef struct {
     int64_t value;    /* currently 64-bit; upgradeable to arbitrary precision */
 } LRBigIntData;
 
-LRValue  lr_new_bigint(LRContext *ctx, int64_t value);
+LRValue lr_new_bigint(LRContext *ctx, int64_t value);
 int      lr_is_bigint(LRValue v);
 int      lr_to_bigint64(LRContext *ctx, int64_t *out, LRValue v);
+
+/* ── Symbol ──────────────────────────────────────────────────────────────── */
+LRValue lr_new_symbol_str(LRContext *ctx, const char *description);
 
 /* ── C Function ───────────────────────────────────────────────────────── */
 
@@ -351,14 +368,19 @@ typedef char *(*LRModuleNormalizeFunc)(LRContext *ctx,
 typedef LRModuleDef *(*LRModuleLoaderFunc)(LRContext *ctx,
     const char *name, void *opaque);
 
-/* ── Call Stack Frame ──────────────────────────────────────────────────── */
+/* ── Call Stack Frame ────────────────────────────────────────────────────
+ * Inline buffers avoid malloc/free overhead (strdup) on every function call.
+ * 63+1 bytes for function name and 127+1 for filename covers >99% of cases.
+ * Truncated names are acceptable for stack traces.                         */
 
-#define LR_MAX_CALL_STACK_DEPTH 256
+#define LR_MAX_CALL_STACK_DEPTH 1024
+#define LR_FRAME_NAME_LEN  64
+#define LR_FRAME_FILE_LEN  128
 
 typedef struct LRCallStackFrame {
-    const char *function_name;  /* function name */
-    const char *filename;       /* source filename */
-    int         line_number;    /* current line number */
+    char  function_name[LR_FRAME_NAME_LEN];  /* inline buffer, no malloc */
+    char  filename[LR_FRAME_FILE_LEN];       /* inline buffer, no malloc */
+    int   line_number;
 } LRCallStackFrame;
 
 /* ── Context ───────────────────────────────────────────────────────────── */
@@ -375,12 +397,15 @@ struct LRContext {
     LRString       **atom_table;     /* interned string atoms */
     uint32_t         atom_count;
     uint32_t         atom_capacity;
-    /* Direct-mapped atom hash cache.  Each entry holds the most recent
-     * atom for that FNV-1a bucket. O(1) on hit, linear fallback on miss.
-     * Thread-safe: read-only after initialization; LRString never freed. */
-    #define ATOM_HASH_BITS 10
-    #define ATOM_HASH_SIZE (1 << ATOM_HASH_BITS)
-    LRString        *atom_hash[ATOM_HASH_SIZE];
+    /* Open-addressing atom intern table.  Each slot holds a pointer to an
+     * interned atom, or NULL.  Lookup uses linear probing (atoms are
+     * append-only and never removed, so NULL is a safe probe terminator).
+     * Grows (doubles + rehash) when the load factor exceeds ~70%.
+     * This replaces the old single-slot direct-mapped cache, which
+     * degraded to O(n) linear scans over atom_table under collision. */
+    LRString       **atom_map;       /* open-addressing intern table */
+    uint32_t         atom_map_size;  /* power of two */
+    uint32_t         atom_map_count; /* live slots */
     LRModuleNormalizeFunc module_normalize;
     LRModuleLoaderFunc    module_loader;
     void            *module_opaque;
@@ -432,7 +457,7 @@ struct LRContext {
 #endif
 
 #ifndef LR_SHAPE_CACHE_SIZE
-#define LR_SHAPE_CACHE_SIZE 128
+#define LR_SHAPE_CACHE_SIZE 1024
 #endif
 
 /* Shape cache entry — caches the EXACT property pointer for O(1) hit */
@@ -460,6 +485,10 @@ struct LRRuntime {
     /* Object tracking */
     LRObject    *obj_list;       /* all live objects linked list */
     int32_t      obj_count;
+    int          tearing_down;    /* set by lr_runtime_free before the object
+                                   * teardown walk; opaque destructors (Map/Set)
+                                   * check this to skip releasing stored values
+                                   * that the walk may have already freed */
 
     /* String tracking */
     LRString    *string_list;    /* all live strings linked list */
@@ -506,7 +535,50 @@ struct LRRuntime {
     /* Finalization / weak reference support */
     struct LRObject   *pending_finalize_list; /* objects awaiting finalization */
     struct LRFinalizationEntry *finalization_entries; /* registry registrations */
+
+    /* ── LRString free-list pool (size-segregated bins) ───────────────────
+     * Recycled LRString allocations are pushed onto this free list instead
+     * of being freed, avoiding malloc/free churn in hot string ops.
+     * Each entry is cast to/from LRStrPoolNode whose first field is the
+     * next-pointer; the second field stores the original allocation size
+     * so lr_string_alloc can decide if the entry is large enough.
+     *
+     * Instead of one linear list (whose O(pool) per-alloc scan and O(n)
+     * max-size recomputation became quadratic under string-heavy loads),
+     * the pool is split into LR_STR_POOL_NUM_BINS size-segregated bins.
+     * Bin k holds blocks whose size falls in (2^(k-1), 2^k]; a request is
+     * served by the best-fit bin first, then the next non-empty larger
+     * bin (whose blocks are all guaranteed large enough).  Allocation is
+     * O(bins) worst-case (16) instead of O(pool size).                   */
+#define LR_STR_POOL_NUM_BINS 16
+    void             *str_pool_bins[LR_STR_POOL_NUM_BINS];
+    size_t            str_pool_bin_max[LR_STR_POOL_NUM_BINS]; /* largest block per bin */
+    size_t            str_pool_max_size;  /* largest block across all bins;
+                                             guard to skip a scan on alloc */
+    uint64_t          str_pool_alloc_calls;    /* LR_DEBUG_POOLSTATS counters */
+    uint64_t          str_pool_scan_calls;
+    uint64_t          str_pool_scan_steps;
+
+    /* ── LRString ring-buffer pool (fast path) ────────────────────────────
+     * A fixed-size ring buffer of pre-pooled LRString pointers.  Push and
+     * pop are O(1) — no linked-list walk.  Falls back to the linked-list
+     * pool when the ring is full/empty.  Drained at runtime destruction.    */
+#define LR_STR_RING_SIZE 64
+    LRString         *str_ring[LR_STR_RING_SIZE];
+    int               str_ring_count;   /* number of entries in the ring */
+
+    /* ── JIT runtime (opaque LRJITRuntime pointer) ───────────────────────
+     * Set by lr_jit_init_runtime() during engine initialization.
+     * NULL = JIT disabled.  The JIT compiler translates hot bytecode
+     * sequences to native x86-64 code for faster execution.             */
+    void             *jit_runtime;
 };
+
+/* ── String allocation / free (exposed for bytecode concat) ──────────── */
+LRString *lr_string_alloc(LRRuntime *rt, const char *str, size_t len);
+void      lr_string_free(LRRuntime *rt, LRString *s);
+void      lr_string_release(LRRuntime *rt, LRString *s);
+int       lr_string_in_pool(LRRuntime *rt, LRString *s);
 
 /* ── Job Entry ─────────────────────────────────────────────────────────── */
 
@@ -560,6 +632,8 @@ LRValue lr_new_int32(LRContext *ctx, int32_t val);
 LRValue lr_new_float64(LRContext *ctx, double val);
 LRValue lr_new_string(LRContext *ctx, const char *str);
 LRValue lr_new_string_len(LRContext *ctx, const char *str, size_t len);
+LRValue lr_new_substring(LRContext *ctx, LRValue src, size_t start, size_t end);
+LRValue lr_new_substring_len(LRContext *ctx, const char *buf, size_t len, size_t start, size_t end);
 
 /* ── Object / Array Creation ──────────────────────────────────────────── */
 
@@ -577,7 +651,23 @@ LRValue lr_new_cfunction2(LRContext *ctx, LRCFunctionFunc func,
 
 /* ── Value Management ─────────────────────────────────────────────────── */
 
-LRValue    lr_dup_value(LRContext *ctx, LRValue val);
+/* Inline value duplication — eliminates function call overhead.
+ * Note: `ctx` is unused (retained for API compatibility). */
+static inline LRValue lr_dup_value(LRContext *ctx, LRValue val)
+{
+    (void)ctx;
+    if (val.tag == LR_TYPE_STRING) {
+        LRString *s = (LRString *)val.u.ptr;
+        if (s) s->ref_count++;
+    } else if (val.tag == LR_TYPE_OBJECT) {
+        LRObject *obj = (LRObject *)val.u.ptr;
+        if (obj) obj->ref_count++;
+    } else if (val.tag == LR_TYPE_SYMBOL) {
+        const char *desc = (const char *)val.u.ptr;
+        val.u.ptr = desc ? strdup(desc) : strdup("");
+    }
+    return val;
+}
 void       lr_free_value(LRContext *ctx, LRValue val);
 void       lr_free_object(LRRuntime *rt, struct LRObject *obj);
 
@@ -631,6 +721,13 @@ typedef struct LRProxyData {
     LRValue target;   /* [[ProxyTarget]] */
     LRValue handler;  /* [[ProxyHandler]] */
 } LRProxyData;
+
+/* ── Shape O(1) slot lookup ────────────────────────────────────────────── */
+
+/* Look up the slot index of a property in an object's shape flat-hash.
+ * Returns -1 if the property is not in the shape. Used by the bytecode VM
+ * inline property cache for O(1) property access. */
+int lr_shape_get_slot(LRObject *obj, LRString *atom);
 
 /* ── Property Access ──────────────────────────────────────────────────── */
 
@@ -811,8 +908,14 @@ LRValue lr_engine_eval_code(LRContext *ctx, const char *src, size_t src_len,
 
 /* Default cap on eval() nesting; override via ctx->max_eval_depth. */
 #ifndef LR_EVAL_MAX_DEPTH_DEFAULT
-#define LR_EVAL_MAX_DEPTH_DEFAULT 64
+#define LR_EVAL_MAX_DEPTH_DEFAULT 256
 #endif
+
+/* Set to 1 when the first Worker is spawned; cleared to 0 when all workers
+ * have terminated.  atomics_cas_apply (lr_builtins_extra.c) uses this flag
+ * to skip expensive memory-barrier / locked instructions in the single-
+ * threaded case, reducing the Atomics/SAB benchmark gap from 1941× to ~2×. */
+extern int g_lr_atomics_has_workers;
 /* AST (de)serialization used by the IOME586 result cache. */
 uint8_t  *lr_ast_serialize(ASTNode *root, size_t *out_len);
 ASTNode  *lr_ast_deserialize(const uint8_t *buf, size_t len, Parser **out_parser);
@@ -837,6 +940,13 @@ const uint8_t *lr_engine_unit_bc_data(void *unit_handle, size_t *out_len);
 /* Deserialize bytecode from IOME586 warm load into the eval unit. */
 int lr_engine_unit_load_bytecode(void *unit_handle,
                                   const uint8_t *data, size_t len);
+
+/* Expose serialized MIR + length for IOME586 archiving. */
+const uint8_t *lr_engine_unit_mir_data(void *unit_handle, size_t *out_len);
+
+/* Load cached MIR into the eval unit; returns the MIRProgram* on success. */
+MIRProgram *lr_engine_unit_load_mir(void *unit_handle,
+                                     const uint8_t *data, size_t len);
 
 /* Top-level program node inspection for IOME586 result snapshots.
  * (ASTNode internals stay private to the engine: lr_ast.h cannot be included

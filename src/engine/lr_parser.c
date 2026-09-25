@@ -6,6 +6,7 @@
  * with operator precedence climbing for expressions.
  */
 #include "lr_ast.h"
+#include "../lr_platform.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -15,7 +16,7 @@
 /* ── Memory Allocation Helpers ────────────────────────────────────────── */
 
 /* Check if a token type can be used as a property name (identifier or contextual keyword) */
-static int is_prop_name_token(TokenType type)
+static int is_prop_name_token(LRTokType type)
 {
     /* Identifiers, private names, literal keywords, and ALL reserved
      * words are valid property names after '.' (e.g. p.catch, o.default).
@@ -24,6 +25,22 @@ static int is_prop_name_token(TokenType type)
     if (type == TOK_BOOL_LIT || type == TOK_NULL_LIT || type == TOK_UNDEFINED_LIT) return 1;
     if (type >= TOK_LET && type <= TOK_SET) return 1;
     return 0;
+}
+
+/* Contextual keywords that may be used as plain identifiers
+ * (get/set/static/of/from/as/async). They only carry special meaning in
+ * specific grammar positions (accessors, for-of, class bodies, imports).
+ * When one appears in a binding/name position it must be treated as a
+ * regular identifier, per the ECMAScript contextual-keyword rules. */
+static int is_ctx_ident_tok(LRTokType type)
+{
+    switch (type) {
+    case TOK_GET: case TOK_SET: case TOK_STATIC: case TOK_OF:
+    case TOK_FROM: case TOK_AS:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 static void *p_malloc(size_t size)
@@ -128,7 +145,7 @@ static void parser_error_token(Parser *parser, Token tok, const char *fmt, ...)
 
 /* ── Token Matching ───────────────────────────────────────────────────── */
 
-static Token expect_token(Parser *parser, TokenType type)
+static Token expect_token(Parser *parser, LRTokType type)
 {
     Token t = lexer_next(parser->lexer);
     if (t.type != type) {
@@ -138,7 +155,7 @@ static Token expect_token(Parser *parser, TokenType type)
     return t;
 }
 
-static int match_token(Parser *parser, TokenType type)
+static int match_token(Parser *parser, LRTokType type)
 {
     Token t = lexer_peek(parser->lexer);
     if (t.type == type) {
@@ -148,7 +165,7 @@ static int match_token(Parser *parser, TokenType type)
     return 0;
 }
 
-static int peek_token(Parser *parser, TokenType type)
+static int peek_token(Parser *parser, LRTokType type)
 {
     Token t = lexer_peek(parser->lexer);
     return t.type == type;
@@ -191,7 +208,7 @@ static void lex_state_restore(Lexer *lex, LexState st)
 }
 
 /* Check if current token is an assignment operator */
-static int is_assign_op(TokenType type)
+static int is_assign_op(LRTokType type)
 {
     switch (type) {
     case TOK_ASSIGN:
@@ -217,7 +234,7 @@ static int is_assign_op(TokenType type)
 }
 
 /* Get operator string from token type */
-static const char *get_op_str(TokenType type)
+static const char *get_op_str(LRTokType type)
 {
     switch (type) {
     case TOK_PLUS: return "+";
@@ -266,7 +283,7 @@ static const char *get_op_str(TokenType type)
 }
 
 /* Get binary operator precedence (higher = binds tighter) */
-static int get_precedence(TokenType type, int is_left)
+static int get_precedence(LRTokType type, int is_left)
 {
     (void)is_left;
     switch (type) {
@@ -344,12 +361,12 @@ ASTNode *ast_alloc(ASTNodeType type)
 
 /* Cached literal nodes for common values (singletons, used to avoid allocations).
  * These are allocated once and reused. */
-static ASTNode *cached_true_node = NULL;
-static ASTNode *cached_false_node = NULL;
-static ASTNode *cached_null_node = NULL;
-static ASTNode *cached_undefined_node = NULL;
-static ASTNode *cached_zero_node = NULL;
-static ASTNode *cached_one_node = NULL;
+static LR_THREAD_LOCAL ASTNode *cached_true_node = NULL;
+static LR_THREAD_LOCAL ASTNode *cached_false_node = NULL;
+static LR_THREAD_LOCAL ASTNode *cached_null_node = NULL;
+static LR_THREAD_LOCAL ASTNode *cached_undefined_node = NULL;
+static LR_THREAD_LOCAL ASTNode *cached_zero_node = NULL;
+static LR_THREAD_LOCAL ASTNode *cached_one_node = NULL;
 
 /* Initialize cached literal nodes (called once at first parse) */
 static void init_cached_literals(void)
@@ -486,7 +503,7 @@ static ASTNode *parse_primary_expr(Parser *parser);
 static ASTNode *parse_postfix_expr(Parser *parser, ASTNode *left);
 static ASTNode *parse_unary_expr(Parser *parser);
 static ASTNode *parse_block(Parser *parser);
-static ASTNode *parse_var_declaration(Parser *parser, TokenType decl_type, int allow_no_init);
+static ASTNode *parse_var_declaration(Parser *parser, LRTokType decl_type, int allow_no_init);
 static ASTNode *parse_function(Parser *parser, int is_async, int is_generator, int is_decl);
 static ASTNode **parse_params(Parser *parser);
 static ASTNode *parse_array_literal(Parser *parser);
@@ -994,6 +1011,20 @@ static ASTNode *parse_primary_expr(Parser *parser)
         if (n) n->token = t;
         return n;
     }
+    case TOK_GET: case TOK_SET: case TOK_STATIC: case TOK_OF:
+    case TOK_FROM: case TOK_AS: {
+        /* Contextual keywords used as plain identifiers
+         * (e.g. `const set = ...; set.add(...)`) */
+        char *name = NULL;
+        if (t.start && t.len > 0) {
+            name = (char *)p_malloc(t.len + 1);
+            if (name) { memcpy(name, t.start, t.len); name[t.len] = '\0'; }
+        }
+        ASTNode *n = ast_identifier(parser, name ? name : "");
+        if (n) n->token = t;
+        if (name) p_free(name);
+        return n;
+    }
     case TOK_IMPORT: {
         /* import() dynamic import or import.meta */
         if (peek_token(parser, TOK_DOT)) {
@@ -1414,6 +1445,61 @@ static ASTNode *parse_object_literal(Parser *parser)
     int cap = 0;
 
     while (!parser->has_error && !peek_token(parser, TOK_RBRACE)) {
+        if (peek_token(parser, TOK_MUL)) {
+            /* Generator method: *name() {} / *[key]() {} */
+            lexer_skip(parser->lexer); /* consume '*' */
+            int gen_computed = 0;
+            ASTNode *gen_key = NULL;
+            char *gen_key_name = NULL;
+            if (match_token(parser, TOK_LBRACKET)) {
+                gen_computed = 1;
+                gen_key = parse_expression(parser);
+                expect_token(parser, TOK_RBRACKET);
+            } else {
+                Token kt = lexer_next(parser->lexer);
+                if (kt.type == TOK_STRING) {
+                    gen_key = ast_literal_string(parser, kt.str_val ? kt.str_val : "");
+                    token_free_data(&kt);
+                } else if (kt.type == TOK_NUMBER) {
+                    gen_key = ast_literal_number(parser, kt.num_val);
+                } else if (kt.type == TOK_IDENTIFIER || is_ctx_ident_tok(kt.type) ||
+                           kt.type == TOK_ASYNC) {
+                    if (kt.start && kt.len > 0) {
+                        gen_key_name = (char *)p_malloc(kt.len + 1);
+                        if (gen_key_name) {
+                            memcpy(gen_key_name, kt.start, kt.len);
+                            gen_key_name[kt.len] = '\0';
+                        }
+                    }
+                    gen_key = ast_identifier(parser, gen_key_name ? gen_key_name : "");
+                } else {
+                    parser_error_token(parser, kt, "expected generator method name");
+                    break;
+                }
+            }
+            ASTNode *func = parse_function(parser, 0, 1, 0);
+            if (func && func->type == AST_FUNC_EXPR && gen_key_name) {
+                func->u.func.name = strdup(gen_key_name);
+            }
+            ASTNode *gen_prop = ast_alloc(AST_PROPERTY);
+            if (gen_prop) {
+                gen_prop->u.property.key = gen_key;
+                gen_prop->u.property.val = func;
+                gen_prop->u.property.computed = gen_computed;
+                gen_prop->u.property.shorthand = 0;
+            }
+            if (gen_prop) {
+                if (n->u.object.nprops >= cap) {
+                    cap = cap ? cap * 2 : 4;
+                    n->u.object.props = (ASTNode **)p_realloc(n->u.object.props,
+                        cap * sizeof(ASTNode *));
+                }
+                n->u.object.props[n->u.object.nprops++] = gen_prop;
+            }
+            if (gen_key_name) p_free(gen_key_name);
+            if (!match_token(parser, TOK_COMMA)) break;
+            continue;
+        }
         if (peek_token(parser, TOK_ELLIPSIS)) {
             /* Spread property */
             lexer_skip(parser->lexer);
@@ -1565,10 +1651,9 @@ static ASTNode *parse_object_literal(Parser *parser)
                 /* Regular property: identifier or shorthand */
                 Token id_tok = lexer_next(parser->lexer);
                 if (id_tok.type != TOK_IDENTIFIER) {
-                    if (id_tok.type == TOK_GET || id_tok.type == TOK_SET ||
-                        id_tok.type == TOK_STATIC || id_tok.type == TOK_ASYNC) {
-                        /* These can be method names or keywords */
-                        /* For simplicity, treat as identifier */
+                    if (is_ctx_ident_tok(id_tok.type) || id_tok.type == TOK_ASYNC) {
+                        /* Contextual keywords (get/set/static/of/from/as/
+                         * async) can be property or method names */
                     } else {
                         parser_error_token(parser, id_tok, "expected property name");
                         if (prop) ast_free_ex(prop, parser);
@@ -1698,6 +1783,10 @@ static int parse_template_body(Parser *parser, Token first,
                 parts[nparts++] = next.str_val; /* transfer ownership */
                 /* another interpolation follows: continue */
             } else if (next.type == TOK_TEMPLATE_END) {
+                if (nparts >= parts_cap) {
+                    parts_cap = parts_cap ? parts_cap * 2 : 4;
+                    parts = (char **)p_realloc(parts, parts_cap * sizeof(char *));
+                }
                 parts[nparts++] = next.str_val; /* transfer ownership */
                 break;
             } else if (next.type == TOK_EOF) {
@@ -1847,7 +1936,7 @@ static ASTNode **parse_params(Parser *parser)
         } else {
             /* Regular parameter */
             Token name_tok = lexer_next(parser->lexer);
-            if (name_tok.type != TOK_IDENTIFIER) {
+            if (name_tok.type != TOK_IDENTIFIER && !is_ctx_ident_tok(name_tok.type)) {
                 parser_error_token(parser, name_tok, "expected parameter name");
             }
             char *name = NULL;
@@ -1930,7 +2019,7 @@ static ASTNode *parse_pattern(Parser *parser)
                 elem = parse_pattern(parser);
             } else {
                 Token id_tok = lexer_next(parser->lexer);
-                if (id_tok.type != TOK_IDENTIFIER) {
+                if (id_tok.type != TOK_IDENTIFIER && !is_ctx_ident_tok(id_tok.type)) {
                     parser_error_token(parser, id_tok, "expected identifier in destructuring pattern");
                 }
                 char *name = NULL;
@@ -2017,7 +2106,7 @@ static ASTNode *parse_pattern(Parser *parser)
                         target = parse_pattern(parser);
                     } else {
                         Token id_tok = lexer_next(parser->lexer);
-                        if (id_tok.type != TOK_IDENTIFIER) {
+                        if (id_tok.type != TOK_IDENTIFIER && !is_ctx_ident_tok(id_tok.type)) {
                             parser_error_token(parser, id_tok, "expected identifier in destructuring pattern");
                         }
                         char *name = NULL;
@@ -2116,6 +2205,11 @@ static ASTNode *parse_block(Parser *parser)
     expect_token(parser, TOK_LBRACE);
 
     while (!parser->has_error && !peek_token(parser, TOK_RBRACE)) {
+        /* Start position of the CURRENT token (peek_token() above already
+         * skipped past it), so the empty-statement fallback below can tell
+         * whether a NULL result actually consumed anything. */
+        Token _cur = lexer_peek(parser->lexer);
+        size_t before = (size_t)(_cur.start - parser->lexer->src);
         ASTNode *stmt = parse_statement(parser);
         if (stmt) {
             if (count >= cap) {
@@ -2124,7 +2218,17 @@ static ASTNode *parse_block(Parser *parser)
             }
             stmts[count++] = stmt;
         } else if (!parser->has_error) {
-            break;
+            /* Empty statement (e.g. ';') returns NULL. If input advanced,
+             * just continue; otherwise consume one token to avoid a hang.
+             * Compare against the current token's START position (not the
+             * post-peek pos), because peek_token() in the loop condition has
+             * already skipped past the token — using parser->lexer->pos would
+             * make `pos == before` even after that token was consumed and
+             * wrongly drop the following real token. */
+            if (parser->lexer->pos == before) {
+                Token t = lexer_next(parser->lexer);
+                if (t.type == TOK_EOF) break;
+            }
         }
     }
 
@@ -2136,7 +2240,7 @@ static ASTNode *parse_block(Parser *parser)
 
 /* ── Variable Declaration ─────────────────────────────────────────────── */
 
-static ASTNode *parse_var_declaration(Parser *parser, TokenType decl_type, int allow_no_init)
+static ASTNode *parse_var_declaration(Parser *parser, LRTokType decl_type, int allow_no_init)
 {
     ASTNode *n = ast_alloc(AST_VAR_DECL);
     if (!n) return NULL;
@@ -2157,9 +2261,11 @@ static ASTNode *parse_var_declaration(Parser *parser, TokenType decl_type, int a
             /* Destructuring declaration */
             var = parse_pattern(parser);
         } else {
-            /* Simple identifier */
+            /* Simple identifier (also accept contextual keywords like
+             * `const set = ...` — get/set/static/of/from/as are valid
+             * binding names outside their special grammar positions) */
             Token name_tok = lexer_next(parser->lexer);
-            if (name_tok.type != TOK_IDENTIFIER) {
+            if (name_tok.type != TOK_IDENTIFIER && !is_ctx_ident_tok(name_tok.type)) {
                 parser_error_token(parser, name_tok, "expected variable name in declaration");
                 break;
             }
@@ -2213,7 +2319,7 @@ ASTNode *parse_statement(Parser *parser)
     case TOK_LET:
     case TOK_CONST:
     case TOK_VAR: {
-        TokenType decl = t.type;
+        LRTokType decl = t.type;
         lexer_skip(parser->lexer);
         ASTNode *n = parse_var_declaration(parser, decl, 0);
         /* Semicolon is optional for var declarations (ASI) */
@@ -2275,7 +2381,7 @@ ASTNode *parse_statement(Parser *parser)
         /* Check for var/let/const declaration */
         if (peek_token(parser, TOK_VAR) || peek_token(parser, TOK_LET) ||
             peek_token(parser, TOK_CONST)) {
-            TokenType decl_type = lexer_next(parser->lexer).type;
+            LRTokType decl_type = lexer_next(parser->lexer).type;
             n->u.for_stmt.init = parse_var_declaration(parser, decl_type, 1);
         } else if (!peek_token(parser, TOK_SEMICOLON)) {
             n->u.for_stmt.init = parse_expression(parser);
@@ -2912,7 +3018,7 @@ static ASTNode *parse_export_decl(Parser *parser)
     /* export var/let/const/function/class declaration */
     if (peek_token(parser, TOK_VAR) || peek_token(parser, TOK_LET) ||
         peek_token(parser, TOK_CONST)) {
-        TokenType decl_type = lexer_next(parser->lexer).type;
+        LRTokType decl_type = lexer_next(parser->lexer).type;
         n->u.export_decl.specifiers = (ASTNode **)p_malloc(sizeof(ASTNode *));
         n->u.export_decl.specifiers[0] = parse_var_declaration(parser, decl_type, 0);
         n->u.export_decl.nspec = 1;
@@ -3227,7 +3333,7 @@ void parser_init(Parser *parser, Lexer *lexer)
     memset(parser->intern_table, 0, sizeof(parser->intern_table));
 
     /* Initialize cached literal nodes (once) */
-    static int cached_literals_initialized = 0;
+    static LR_THREAD_LOCAL int cached_literals_initialized = 0;
     if (!cached_literals_initialized) {
         init_cached_literals();
         cached_literals_initialized = 1;
@@ -4093,7 +4199,7 @@ static ASTNode *deser_node(DeserState *st, Parser *intern)
     ASTNode *node = ast_alloc((ASTNodeType)t);
     if (!node) { st->error = 1; return NULL; }
 
-    node->token.type    = (TokenType)read_u16(st);
+    node->token.type    = (LRTokType)read_u16(st);
     node->token.line    = read_u32(st);
     node->token.col     = read_u32(st);
     node->token.num_val = read_f64(st);

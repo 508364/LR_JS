@@ -29,6 +29,7 @@ LR_Scheduler *lr_scheduler_create(LR_ThreadPool *pool)
     sched->next_task_id = 1;
     sched->running = 0;
     pthread_mutex_init(&sched->mutex, NULL);
+    pthread_cond_init(&sched->sched_cond, NULL);
 
     return sched;
 }
@@ -75,6 +76,7 @@ int lr_scheduler_schedule(LR_Scheduler *sched, LR_Task *task,
     lr_scheduler_insert_task(sched, st);
     sched->tasks_scheduled++;
 
+    pthread_cond_signal(&sched->sched_cond);
     pthread_mutex_unlock(&sched->mutex);
     return st->id;
 }
@@ -103,6 +105,7 @@ int lr_scheduler_schedule_delayed(LR_Scheduler *sched, LR_Task *task,
     lr_scheduler_insert_task(sched, st);
     sched->tasks_scheduled++;
 
+    pthread_cond_signal(&sched->sched_cond);
     pthread_mutex_unlock(&sched->mutex);
     return st->id;
 }
@@ -215,7 +218,7 @@ int lr_scheduler_process(LR_Scheduler *sched)
     return executed;
 }
 
-/* ── Event loop ────────────────────────────────────────────────────────── */
+/* ── Event loop (condition-variable-based, no busy-waiting) ────────────── */
 
 int lr_scheduler_run(LR_Scheduler *sched)
 {
@@ -224,21 +227,29 @@ int lr_scheduler_run(LR_Scheduler *sched)
     sched->running = 1;
 
     while (sched->running) {
-        int executed = lr_scheduler_process(sched);
+        lr_scheduler_process(sched);
 
-        if (executed == 0) {
-            /* No tasks ready, sleep briefly */
-            lr_sleep_ms(1);
-        }
-
-        /* Check if there are pending tasks */
         pthread_mutex_lock(&sched->mutex);
-        int has_tasks = (sched->task_head != NULL);
-        pthread_mutex_unlock(&sched->mutex);
-
-        if (!has_tasks) {
-            lr_sleep_ms(10);  /* 10ms sleep when idle */
+        if (sched->running && sched->task_head == NULL) {
+            /* No tasks at all — wait indefinitely for a new schedule */
+            pthread_cond_wait(&sched->sched_cond, &sched->mutex);
+        } else if (sched->running && sched->task_head) {
+            /* Tasks exist but none are ready yet — wait for the next one */
+            int64_t now = get_time_us();
+            int64_t wait_us = sched->task_head->next_run_us - now;
+            if (wait_us > 0) {
+                struct timespec ts;
+                ts.tv_sec = now / 1000000 + wait_us / 1000000;
+                ts.tv_nsec = (now % 1000000 + wait_us % 1000000) * 1000;
+                if (ts.tv_nsec >= 1000000000L) {
+                    ts.tv_sec++;
+                    ts.tv_nsec -= 1000000000L;
+                }
+                pthread_cond_timedwait(&sched->sched_cond,
+                                       &sched->mutex, &ts);
+            }
         }
+        pthread_mutex_unlock(&sched->mutex);
     }
 
     return 0;
@@ -254,9 +265,31 @@ int lr_scheduler_run_for(LR_Scheduler *sched, int64_t timeout_us)
     while (sched->running) {
         lr_scheduler_process(sched);
 
-        if (get_time_us() - start >= timeout_us) break;
+        int64_t elapsed = get_time_us() - start;
+        if (elapsed >= timeout_us) break;
 
-        lr_sleep_ms(1);
+        pthread_mutex_lock(&sched->mutex);
+        if (sched->running && sched->task_head == NULL) {
+            struct timespec ts;
+            int64_t rem = timeout_us - elapsed;
+            ts.tv_sec = rem / 1000000;
+            ts.tv_nsec = (rem % 1000000) * 1000;
+            pthread_cond_timedwait(&sched->sched_cond,
+                                   &sched->mutex, &ts);
+        } else if (sched->running && sched->task_head) {
+            int64_t now = get_time_us();
+            int64_t wait_us = sched->task_head->next_run_us - now;
+            if (wait_us > 0) {
+                int64_t rem = timeout_us - elapsed;
+                if (wait_us > rem) wait_us = rem;
+                struct timespec ts;
+                ts.tv_sec = wait_us / 1000000;
+                ts.tv_nsec = (wait_us % 1000000) * 1000;
+                pthread_cond_timedwait(&sched->sched_cond,
+                                       &sched->mutex, &ts);
+            }
+        }
+        pthread_mutex_unlock(&sched->mutex);
     }
 
     return 0;
@@ -266,6 +299,9 @@ void lr_scheduler_stop(LR_Scheduler *sched)
 {
     if (!sched) return;
     sched->running = 0;
+    pthread_mutex_lock(&sched->mutex);
+    pthread_cond_signal(&sched->sched_cond);
+    pthread_mutex_unlock(&sched->mutex);
 }
 
 int lr_scheduler_pending_count(LR_Scheduler *sched)
@@ -298,6 +334,7 @@ void lr_scheduler_destroy(LR_Scheduler *sched)
         st = next;
     }
 
+    pthread_cond_destroy(&sched->sched_cond);
     pthread_mutex_destroy(&sched->mutex);
     free(sched);
 }

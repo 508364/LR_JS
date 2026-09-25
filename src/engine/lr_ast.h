@@ -144,11 +144,19 @@ struct ASTNode {
         struct { ASTNode *arg; } await_expr;
         struct { ASTNode *arg; int is_delegate; } yield_expr;
     } u;
+    /* Cached compiled bytecode for function/arrow bodies (set by
+     * bc_get_or_compile_func).  Lets the inline-call fast path read the
+     * compiled BCProgram with a single load instead of a function call
+     * plus a 4-entry inline-cache walk on every call.  Only meaningful
+     * for AST_FUNC_DECL / AST_FUNC_EXPR / AST_ARROW; NULL otherwise. */
+    void *bc_prog_cache;
 };
 
 /* ── AST Node Pool ──────────────────────────────────────────────────────── */
 
-#define LR_AST_NODE_POOL_SIZE 4096
+/* LARGE_SCRIPT: increased AST node pool from 4096 to 65536 to handle
+ * large scripts without falling back to individual malloc per node. */
+#define LR_AST_NODE_POOL_SIZE 65536
 
 typedef struct {
     ASTNode  nodes[LR_AST_NODE_POOL_SIZE];

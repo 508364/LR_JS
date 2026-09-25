@@ -14,7 +14,7 @@
 #   build/bin/  → lr_js.exe / lr_js
 
 cmake_minimum_required(VERSION 3.14)
-project(lr_js VERSION 0.1.1 LANGUAGES C)
+project(lr_js VERSION 0.2.0 LANGUAGES C)
 
 # ── C Standard ────────────────────────────────────────────────────────────
 
@@ -29,18 +29,36 @@ if(MSVC)
     set(LR_COMPILER_MSVC ON)
     # MSVC C11 mode
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /std:c11")
-    # Disable noisy warnings
-    add_compile_options(/wd4996 /wd4244 /wd4267 /wd4100 /wd4127 /wd4013 /wd4101 /wd4113 /wd4133)
-    # Set source and execution character sets to UTF-8 (fixes C4819)
-    add_compile_options(/utf-8)
-    # Define NOMINMAX to avoid Windows.h min/max macros
-    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+    # MSVC does not define NDEBUG automatically in Release
+    add_compile_definitions(NDEBUG)
 elseif(WIN32)
     set(LR_PLATFORM_WINDOWS ON)
     set(LR_COMPILER_MSVC OFF)
+    # Define NOMINMAX to avoid Windows.h min/max macros
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+    # For MinGW Makefiles on Windows, default to Release if CMAKE_BUILD_TYPE is empty
+    # This ensures NDEBUG is always defined unless user explicitly passes -D CMAKE_BUILD_TYPE=Debug
+    if(NOT CMAKE_BUILD_TYPE)
+        set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
+    endif()
+    if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+        add_compile_definitions(NDEBUG)
+        # Disable JIT debug logging in Release builds
+        add_compile_definitions(LR_DEBUG_JIT=0)
+    endif()
 else()
     set(LR_PLATFORM_WINDOWS OFF)
     set(LR_COMPILER_MSVC OFF)
+    # Enable LTO for cross-TU inlining (hot path functions like scope_new_inline_fast)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -flto")
+    endif()
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -flto")
+    set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} -flto")
+    # Suppress warnings on GCC/Clang
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        add_compile_options(-Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-format -Wno-sign-compare)
+    endif()
     # GCC/Clang flags
     # The following noisy categories are suppressed to keep the build log clean.
     # This mirrors the lenient policy already applied on MSVC (which disables a
@@ -93,6 +111,8 @@ set(LR_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/engine
+    ${CMAKE_SOURCE_DIR}/src/pcre2
+    ${CMAKE_SOURCE_DIR}/sljit/sljit_src
 )
 
 # ── Engine Sources ────────────────────────────────────────────────────────
@@ -102,6 +122,48 @@ set(LR_ENGINE_SRCS
     src/engine/lr_lexer.c
     src/engine/lr_parser.c
     src/engine/lr_interp.c
+    src/engine/lr_jit_v2.c
+    src/engine/mir/lr_jit_mir.c
+    src/engine/mir/lr_jit_codegen.c
+    # SLJIT JIT backend (sljitLir.c includes all needed allocators and utils)
+    sljit/sljit_src/sljitLir.c
+)
+
+# ── PCRE2 Embedded Sources ────────────────────────────────────────────────
+
+set(LR_PCRE2_SRCS
+    src/pcre2/pcre2_auto_possess.c
+    src/pcre2/pcre2_chartables.c
+    src/pcre2/pcre2_chkdint.c
+    src/pcre2/pcre2_compile.c
+    src/pcre2/pcre2_compile_cgroup.c
+    src/pcre2/pcre2_compile_class.c
+    src/pcre2/pcre2_config.c
+    src/pcre2/pcre2_context.c
+    src/pcre2/pcre2_convert.c
+    src/pcre2/pcre2_dfa_match.c
+    src/pcre2/pcre2_error.c
+    src/pcre2/pcre2_extuni.c
+    src/pcre2/pcre2_find_bracket.c
+    src/pcre2/pcre2_maketables.c
+    src/pcre2/pcre2_match.c
+    src/pcre2/pcre2_match_data.c
+    src/pcre2/pcre2_match_next.c
+    src/pcre2/pcre2_newline.c
+    src/pcre2/pcre2_ord2utf.c
+    src/pcre2/pcre2_pattern_info.c
+    src/pcre2/pcre2_script_run.c
+    src/pcre2/pcre2_string_utils.c
+    src/pcre2/pcre2_study.c
+    src/pcre2/pcre2_substitute.c
+    src/pcre2/pcre2_substring.c
+    src/pcre2/pcre2_tables.c
+    src/pcre2/pcre2_ucd.c
+    src/pcre2/pcre2_valid_utf.c
+    src/pcre2/pcre2_xclass.c
+    src/pcre2/pcre2_jit_compile.c
+    src/pcre2/pcre2_serialize.c
+    src/pcre2/pcre2posix.c
 )
 
 # ── Runtime Sources ───────────────────────────────────────────────────────
@@ -124,9 +186,16 @@ set(LR_RUNTIME_SRCS
     src/lr_renderer_egl.c
     src/lr_canvas.c
     src/lr_canvas_webgl.c
+    src/lr_dom.c
     src/lr_scheduler.c
     src/lr_perf_opt.c
-    src/engine/lr_bytecode.c
+    src/engine/lr_bytecode_cache.c
+    src/engine/lr_bytecode_emit.c
+    src/engine/lr_bytecode_compile.c
+    src/engine/lr_bytecode_value.c
+    src/engine/lr_bytecode_exec.c
+    src/engine/lr_bytecode_serialize.c
+    src/engine/lr_bytecode_disasm.c
     src/lr_worker.c
     src/lr_gc.c
     src/lr_iome586.c
@@ -141,13 +210,13 @@ set(LR_RUNTIME_SRCS
     src/lr_builtins_extra.c
 )
 
-# MSVC lacks <regex.h>; provide the built-in POSIX-compatible regex engine.
-# On other platforms the system <regex.h> is used, so we must not compile
-# this translation unit there (it would duplicate the libc symbols).
-if(MSVC)
-    list(APPEND LR_RUNTIME_SRCS src/lr_regex.c)
-    # Windows POSIX relay: provides dirent/utsname/sysinfo/popen wrappers so
-    # the Unix-oriented modules below link under MSVC.
+# Built-in PCRE2-based regex engine (replaces system <regex.h> on all
+# platforms for full compatibility with modern regex features).
+list(APPEND LR_RUNTIME_SRCS src/lr_regex.c)
+
+# Windows POSIX relay: provides dirent/utsname/sysinfo/popen wrappers so
+# the Unix-oriented modules below link under MSVC and MinGW.
+if(WIN32)
     list(APPEND LR_RUNTIME_SRCS src/lr_posix_win.c)
 endif()
 
@@ -172,29 +241,46 @@ set(LR_CLI_SRCS
 add_library(lr_engine STATIC ${LR_ENGINE_SRCS})
 target_include_directories(lr_engine PUBLIC ${LR_INCLUDE_DIRS})
 target_compile_definitions(lr_engine PRIVATE LR_JS_BUILD_STATIC)
+target_compile_definitions(lr_engine PRIVATE SLJIT_DEBUG=0 SLJIT_VERBOSE=1 SLJIT_ARGUMENT_CHECKS=0)
+target_compile_definitions(lr_engine PRIVATE LR_JIT_ENABLED=1)
 
 # ── Internal static library: lr_js_core ───────────────────────────────────
 
-add_library(lr_js_core STATIC ${LR_RUNTIME_SRCS})
+add_library(lr_js_core STATIC
+    ${LR_RUNTIME_SRCS}
+    ${LR_PCRE2_SRCS}
+)
 target_include_directories(lr_js_core PUBLIC ${LR_INCLUDE_DIRS})
 target_link_libraries(lr_js_core PUBLIC lr_engine)
 target_compile_definitions(lr_js_core PRIVATE LR_JS_BUILD_STATIC)
+# PCRE2 sources need HAVE_CONFIG_H to include config.h
+# and PCRE2_CODE_UNIT_WIDTH=8 for the 8-bit library
+target_compile_definitions(lr_js_core PRIVATE HAVE_CONFIG_H)
+target_compile_definitions(lr_js_core PRIVATE PCRE2_CODE_UNIT_WIDTH=8)
 
 # ── Public static library: lr_js_static ───────────────────────────────────
 
 add_library(lr_js_static STATIC
     ${LR_ENGINE_SRCS}
     ${LR_RUNTIME_SRCS}
+    ${LR_PCRE2_SRCS}
 )
 target_include_directories(lr_js_static PUBLIC ${LR_INCLUDE_DIRS})
 target_compile_definitions(lr_js_static PUBLIC LR_JS_BUILD_STATIC)
+target_compile_definitions(lr_js_static PRIVATE HAVE_CONFIG_H)
+target_compile_definitions(lr_js_static PRIVATE PCRE2_CODE_UNIT_WIDTH=8)
+target_compile_definitions(lr_js_static PRIVATE PCRE2_STATIC)
+target_compile_definitions(lr_js_static PRIVATE SLJIT_DEBUG=0 SLJIT_VERBOSE=1 SLJIT_ARGUMENT_CHECKS=0)
 # On MSVC, link ws2_32 for sockets
 if(LR_PLATFORM_WINDOWS)
     target_link_libraries(lr_js_static PUBLIC ws2_32 ntdll)
     if(NOT LR_COMPILER_MSVC)
-        # MinGW: uses libwinpthread and needs explicit -lm
         target_link_libraries(lr_js_static PUBLIC pthread m)
     endif()
+    message(STATUS "JIT enabled: MIR frontend + SLJIT backend (Windows)")
+else()
+    target_link_libraries(lr_js_static PUBLIC m)
+    message(STATUS "JIT enabled: MIR frontend + SLJIT backend (Unix)")
 endif()
 
 # ── Public shared/DLL library: lr_js_shared ───────────────────────────────
@@ -202,10 +288,16 @@ endif()
 add_library(lr_js_shared SHARED
     ${LR_ENGINE_SRCS}
     ${LR_RUNTIME_SRCS}
+    ${LR_PCRE2_SRCS}
 )
 target_include_directories(lr_js_shared PUBLIC ${LR_INCLUDE_DIRS})
 target_compile_definitions(lr_js_shared PRIVATE LR_JS_BUILD_DLL)
 target_compile_definitions(lr_js_shared PUBLIC LR_JS_USE_DLL)
+target_compile_definitions(lr_js_shared PRIVATE HAVE_CONFIG_H)
+target_compile_definitions(lr_js_shared PRIVATE PCRE2_CODE_UNIT_WIDTH=8)
+target_compile_definitions(lr_js_shared PRIVATE PCRE2_STATIC)
+target_compile_definitions(lr_js_shared PRIVATE SLJIT_DEBUG=0 SLJIT_VERBOSE=1 SLJIT_ARGUMENT_CHECKS=0)
+target_compile_definitions(lr_js_shared PRIVATE LR_JIT_ENABLED=1)
 if(LR_PLATFORM_WINDOWS)
     target_link_libraries(lr_js_shared PUBLIC ws2_32 ntdll)
     if(NOT LR_COMPILER_MSVC)
@@ -229,6 +321,14 @@ if(LR_PLATFORM_WINDOWS)
     target_link_libraries(lr_js PRIVATE ws2_32 ntdll)
     if(NOT LR_COMPILER_MSVC)
         target_link_libraries(lr_js PRIVATE pthread m)
+    endif()
+    # Deep JS recursion (e.g. depth-500 tail recursion in the stress tests)
+    # C-recurses through interp_bc_call_function/bc_execute with ~4KB+ alloca per frame.
+    # The default 1MB PE stack overflows at ~250 frames; give the CLI a 16MB stack.
+    if(LR_COMPILER_MSVC)
+        target_link_options(lr_js PRIVATE "/STACK:16777216")
+    else()
+        target_link_options(lr_js PRIVATE "-Wl,--stack,16777216")
     endif()
 endif()
 

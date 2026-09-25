@@ -55,6 +55,16 @@ static void set_array_length(JSContext *ctx, JSValue arr, int32_t len)
         LRObject *o = (LRObject *)arr.u.ptr;
         if (o->type == LR_OBJ_ARRAY && o->extra) {
             LRArrayData *ad = (LRArrayData *)o->extra;
+            if ((uint32_t)len > ad->capacity) {
+                uint32_t new_cap = ad->capacity;
+                while (new_cap < (uint32_t)len) new_cap = new_cap ? new_cap * 2 : 4;
+                LRValue *ne = (LRValue *)realloc(ad->elements, sizeof(LRValue) * new_cap);
+                if (ne) {
+                    memset(ne + ad->capacity, 0, sizeof(LRValue) * (new_cap - ad->capacity));
+                    ad->elements = ne;
+                    ad->capacity = new_cap;
+                }
+            }
             ad->length = (uint32_t)len;
         }
     }
@@ -711,7 +721,20 @@ static JSValue js_object_proto_has_own_property(JSContext *ctx, JSValue this_val
     const char *prop = JS_ToCString(ctx, argv[0]);
     if (!prop) return JS_EXCEPTION;
     JSString *atom = JS_NewAtom(ctx, prop);
-    int result = JS_HasProperty(ctx, this_val, atom);
+    /* hasOwnProperty must report OWN properties only (incl. non-enumerable),
+     * NOT inherited ones from the prototype chain. */
+    JSPropertyEnum *tab = NULL;
+    uint32_t len = 0;
+    int result = 0;
+    if (JS_GetOwnPropertyNames(ctx, &tab, &len, this_val, JS_GPN_STRING_MASK) == 0) {
+        for (uint32_t i = 0; i < len; i++) {
+            if (tab[i].atom == atom) {
+                result = 1;
+                break;
+            }
+        }
+        JS_FreePropertyEnum(ctx, tab, len);
+    }
     JS_FreeCString(ctx, prop);
     return JS_NewBool(ctx, result);
 }
@@ -1900,9 +1923,6 @@ static JSValue js_array_proto_shift(JSContext *ctx, JSValue this_val,
 static JSValue js_array_proto_slice(JSContext *ctx, JSValue this_val,
                                      int argc, JSValue *argv)
 {
-    if (!JS_IsArray(ctx, this_val)) {
-        return JS_ThrowTypeError(ctx, "Array.prototype.slice called on non-array");
-    }
     int32_t len = get_array_length(ctx, this_val);
     int32_t start = 0, end = len;
 
@@ -2261,7 +2281,63 @@ static JSValue js_array_proto_unshift(JSContext *ctx, JSValue this_val,
     return JS_NewInt32(ctx, len);
 }
 
-/* ── Array.prototype.values ────────────────────────────────────────────── */
+/* ── Array Iterator ────────────────────────────────────────────────────── */
+
+typedef struct ArrayIteratorData {
+    LRValue array_obj;  /* owned reference to the source array */
+    int32_t index;
+    int     done;
+} ArrayIteratorData;
+
+static void array_iterator_data_free(void *ptr) {
+    ArrayIteratorData *it = (ArrayIteratorData *)ptr;
+    if (!it) return;
+    if (it->array_obj.tag != LR_TYPE_UNDEFINED) {
+        lr_free_value(NULL, it->array_obj);
+    }
+    free(it);
+}
+
+static LRValue js_array_iterator_next(LRContext *ctx, LRValue this_val,
+                                       int argc, LRValue *argv)
+{
+    (void)argc; (void)argv;
+    if (this_val.tag != LR_TYPE_OBJECT) {
+        return JS_ThrowTypeError(ctx, "Iterator next called on non-object");
+    }
+    ArrayIteratorData *it = (ArrayIteratorData *)lr_get_opaque(this_val);
+    if (!it) {
+        return JS_ThrowTypeError(ctx, "Array iterator has no data");
+    }
+    LRValue result = JS_NewObject(ctx);
+    if (it->done) {
+        lr_set_property_str(ctx, result, "value", LR_VALUE_UNDEFINED);
+        lr_set_property_str(ctx, result, "done", LR_VALUE_TRUE);
+        return result;
+    }
+    int32_t len = 0;
+    LRValue lv = lr_get_property_str(ctx, it->array_obj, "length");
+    lr_to_int32(ctx, &len, lv);
+    lr_free_value(ctx, lv);
+    if ((uint32_t)it->index >= (uint32_t)len) {
+        it->done = 1;
+        lr_set_property_str(ctx, result, "value", LR_VALUE_UNDEFINED);
+        lr_set_property_str(ctx, result, "done", LR_VALUE_TRUE);
+        return result;
+    }
+    LRValue val = lr_get_property_uint32(ctx, it->array_obj, (uint32_t)it->index);
+    it->index++;
+    lr_set_property_str(ctx, result, "value", val);
+    lr_set_property_str(ctx, result, "done", LR_VALUE_FALSE);
+    return result;
+}
+
+static LRValue js_array_iterator_symbol_iter(LRContext *ctx, LRValue this_val,
+                                              int argc, LRValue *argv)
+{
+    (void)argc; (void)argv;
+    return lr_dup_value(ctx, this_val);
+}
 
 static JSValue js_array_proto_values(JSContext *ctx, JSValue this_val,
                                       int argc, JSValue *argv)
@@ -2272,17 +2348,24 @@ static JSValue js_array_proto_values(JSContext *ctx, JSValue this_val,
         return JS_ThrowTypeError(ctx, "Array.prototype.values called on non-array");
     }
     int32_t len = get_array_length(ctx, this_val);
-    JSValue arr = JS_NewArray(ctx);
-    for (int32_t i = 0; i < len; i++) {
-        JSValue val = JS_GetPropertyUint32(ctx, this_val, i);
-        if (!JS_IsUndefined(val)) {
-            JS_SetPropertyUint32(ctx, arr, i, val);
-        } else {
-            JS_FreeValue(ctx, val);
-        }
+
+    /* Create a fresh Array Iterator object per spec. */
+    LRValue iter_obj = JS_NewObject(ctx);
+    ArrayIteratorData *it_data = (ArrayIteratorData *)malloc(sizeof(ArrayIteratorData));
+    if (!it_data) {
+        JS_FreeValue(ctx, iter_obj);
+        return JS_ThrowRangeError(ctx, "memory allocation failed");
     }
-    set_array_length(ctx, arr, len);
-    return arr;
+    it_data->array_obj = lr_dup_value(ctx, this_val);
+    it_data->index = 0;
+    it_data->done = 0;
+    lr_set_opaque_with_free(iter_obj, it_data, array_iterator_data_free);
+
+    lr_set_property_str(ctx, iter_obj, "next",
+        lr_new_cfunction(ctx, js_array_iterator_next, "next", 0));
+    lr_set_property_str(ctx, iter_obj, "Symbol.iterator",
+        lr_new_cfunction(ctx, js_array_iterator_symbol_iter, "Symbol.iterator", 0));
+    return iter_obj;
 }
 
 /* ── Array.prototype.with ──────────────────────────────────────────────── */
@@ -2622,6 +2705,47 @@ static JSValue js_string_proto_match(JSContext *ctx, JSValue this_val,
                                       int argc, JSValue *argv)
 {
     if (argc < 1) return JS_NULL;
+
+    /* If the argument is a RegExp-like object (has a callable `exec`), use it. */
+    if (JS_IsObject(argv[0])) {
+        JSValue exec_fn = JS_GetPropertyStr(ctx, argv[0], "exec");
+        int is_regex = is_callable(ctx, exec_fn);
+        if (is_regex) {
+            /* Check global flag for full match-all behavior */
+            JSValue g = JS_GetPropertyStr(ctx, argv[0], "global");
+            int is_global = JS_ToBool(ctx, g);
+            JS_FreeValue(ctx, g);
+
+            if (is_global) {
+                /* Global: collect all matches in an array */
+                JS_SetPropertyStr(ctx, argv[0], "lastIndex", JS_NewInt32(ctx, 0));
+                JSValue arr = JS_NewArray(ctx);
+                int32_t idx = 0;
+                for (int guard = 0; guard < 100000; guard++) {
+                    JSValue m = lr_call(ctx, exec_fn, argv[0], 1, &this_val);
+                    if (JS_IsException(m) || JS_IsNull(m) || JS_IsUndefined(m)) {
+                        JS_FreeValue(ctx, m);
+                        break;
+                    }
+                    /* Extract match[0] = the full matched string */
+                    JSValue m0 = JS_GetPropertyUint32(ctx, m, 0);
+                    /* lr_set_property_uint32 takes ownership of m0 */
+                    JS_SetPropertyUint32(ctx, arr, idx++, m0);
+                    JS_FreeValue(ctx, m);
+                }
+                set_array_length(ctx, arr, idx);
+                JS_FreeValue(ctx, exec_fn);
+                return arr;
+            } else {
+                /* Non-global: single exec call */
+                JSValue result = lr_call(ctx, exec_fn, argv[0], 1, &this_val);
+                JS_FreeValue(ctx, exec_fn);
+                return result;
+            }
+        }
+        JS_FreeValue(ctx, exec_fn);
+    }
+
     const char *str = JS_ToCString(ctx, this_val);
     const char *pattern = JS_ToCString(ctx, argv[0]);
     if (!str || !pattern) {
@@ -2715,6 +2839,101 @@ static JSValue js_string_proto_match_all(JSContext *ctx, JSValue this_val,
 
 /* ── String.prototype.replace ──────────────────────────────────────────── */
 
+/* Build a replacement string from a literal template, substituting the
+ * special sequences $$, $&, $`, $', and $N (capturing group N). Returns a
+ * malloc'd string, or NULL on allocation failure. `match_array` is the RegExp
+ * match result (element 0 = full match, 1.. = groups). */
+static char *build_replace_template(JSContext *ctx, JSValue match_array,
+                                    const char *tpl)
+{
+    /* Get input string and match index for $` and $' support. */
+    JSValue input_val = JS_GetPropertyStr(ctx, match_array, "input");
+    const char *input_str = JS_ToCString(ctx, input_val);
+    JS_FreeValue(ctx, input_val);
+    if (!input_str) input_str = "";
+
+    JSValue idx_val = JS_GetPropertyStr(ctx, match_array, "index");
+    int32_t match_idx = 0;
+    if (!JS_IsUndefined(idx_val)) {
+        JS_ToInt32(ctx, &match_idx, idx_val);
+    }
+    JS_FreeValue(ctx, idx_val);
+
+    /* Compute the output length, then fill. */
+    size_t out_len = 0;
+    const char *p = tpl;
+    while (*p) {
+        if (*p == '$' && p[1] != '\0') {
+            char c = p[1];
+            if (c == '$') { out_len++; p += 2; continue; }
+            if (c == '&') { out_len += 16; p += 2; continue; }
+            if (c == '`' || c == '\'') {
+                /* Estimate max length for prefix/suffix */
+                out_len += strlen(input_str) + 1; p += 2; continue;
+            }
+            if (c >= '0' && c <= '9') {
+                out_len += 16; p += 2; continue;
+            }
+        }
+        out_len++;
+        p++;
+    }
+    char *out = (char *)malloc(out_len + 1);
+    if (!out) {
+        JS_FreeCString(ctx, input_str);
+        return NULL;
+    }
+    size_t o = 0;
+    p = tpl;
+    /* Match string (group 0) for $& / group access. */
+    JSValue g0 = JS_GetPropertyUint32(ctx, match_array, 0);
+    const char *whole = JS_ToCString(ctx, g0);
+    if (!whole) whole = "";
+    size_t whole_len = strlen(whole);
+    while (*p) {
+        if (*p == '$' && p[1] != '\0') {
+            char c = p[1];
+            if (c == '$') { out[o++] = '$'; p += 2; continue; }
+            if (c == '&') {
+                memcpy(out + o, whole, whole_len); o += whole_len; p += 2; continue;
+            }
+            if (c == '`') {
+                /* $` = everything before the match */
+                if (match_idx > 0) {
+                    memcpy(out + o, input_str, (size_t)match_idx);
+                    o += (size_t)match_idx;
+                }
+                p += 2; continue;
+            }
+            if (c == '\'') {
+                /* $' = everything after the match */
+                size_t after_pos = (size_t)match_idx + whole_len;
+                const char *after = input_str + after_pos;
+                size_t after_len = strlen(after);
+                memcpy(out + o, after, after_len);
+                o += after_len;
+                p += 2; continue;
+            }
+            if (c >= '0' && c <= '9') {
+                int n = c - '0';
+                if (n < 10) {
+                    JSValue gV = JS_GetPropertyUint32(ctx, match_array, (uint32_t)n);
+                    const char *gs = JS_ToCString(ctx, gV);
+                    if (gs) { size_t gl = strlen(gs); memcpy(out + o, gs, gl); o += gl; JS_FreeCString(ctx, gs); }
+                    JS_FreeValue(ctx, gV);
+                }
+                p += 2; continue;
+            }
+        }
+        out[o++] = *p;
+        p++;
+    }
+    out[o] = '\0';
+    JS_FreeCString(ctx, whole);
+    JS_FreeCString(ctx, input_str);
+    return out;
+}
+
 static JSValue js_string_proto_replace(JSContext *ctx, JSValue this_val,
                                         int argc, JSValue *argv)
 {
@@ -2722,86 +2941,217 @@ static JSValue js_string_proto_replace(JSContext *ctx, JSValue this_val,
     const char *str = JS_ToCString(ctx, this_val);
     if (!str) return JS_EXCEPTION;
 
-    JSValue search_val = argv[0];
-    JSValue replace_val = argv[1];
-    const char *search_str = NULL;
-    int is_func = is_callable(ctx, replace_val);
+    JSValue repl = argv[1];
+    int is_func = is_callable(ctx, repl);
 
-    if (!JS_IsFunction(ctx, search_val) && !JS_IsObject(search_val)) {
-        search_str = JS_ToCString(ctx, search_val);
+    /* A RegExp-like object exposes a callable `exec` method. */
+    int is_regex = 0;
+    JSValue exec_fn = JS_UNDEFINED;
+    if (JS_IsObject(argv[0])) {
+        exec_fn = JS_GetPropertyStr(ctx, argv[0], "exec");
+        is_regex = is_callable(ctx, exec_fn);
+        if (!is_regex) JS_FreeValue(ctx, exec_fn);
+    }
+
+    const char *search_str = NULL;
+    if (!is_regex) {
+        search_str = JS_ToCString(ctx, argv[0]);
         if (!search_str) { JS_FreeCString(ctx, str); return JS_EXCEPTION; }
     }
 
-    const char *found = NULL;
-    if (search_str) {
-        found = strstr(str, search_str);
+    /* Check if regex has global flag for multi-replace */
+    int is_global = 0;
+    if (is_regex) {
+        JSValue g = JS_GetPropertyStr(ctx, argv[0], "global");
+        is_global = JS_ToBool(ctx, g);
+        JS_FreeValue(ctx, g);
     }
 
-    if (found) {
-        size_t prefix_len = (size_t)(found - str);
-        size_t search_len = search_str ? strlen(search_str) : 0;
-        size_t suffix_len = strlen(found + search_len);
+    /* Build result by processing all matches (or just the first for non-global).
+     * For regex: call exec() on the full original string repeatedly, letting
+     * lastIndex naturally advance. This matches V8 behavior. */
+    JSValue result;
+    char *accum = NULL;
+    size_t accum_len = 0;
+    size_t pos = 0;
 
-        char *result_str = NULL;
-        if (is_func) {
-            JSValue match_args[3];
-            match_args[0] = JS_NewString(ctx, found);
-            match_args[1] = JS_NewInt32(ctx, (int32_t)prefix_len);
-            match_args[2] = JS_DupValue(ctx, this_val);
-            JSValue replacement = JS_Call(ctx, replace_val, JS_UNDEFINED, 3, match_args);
-            JS_FreeValue(ctx, match_args[0]);
-            JS_FreeValue(ctx, match_args[1]);
-            JS_FreeValue(ctx, match_args[2]);
-            if (JS_IsException(replacement)) {
+    while (pos <= strlen(str)) {
+        int has_match = 0;
+        size_t cur_match_start = 0, cur_match_end = 0;
+        LRValue cur_match_array = LR_VALUE_UNDEFINED;
+
+        if (is_regex) {
+            JSValue m = lr_call(ctx, exec_fn, argv[0], 1, &this_val);
+            if (JS_IsException(m)) {
+                if (accum) free(accum);
                 if (search_str) JS_FreeCString(ctx, search_str);
                 JS_FreeCString(ctx, str);
                 return JS_EXCEPTION;
             }
-            const char *repl_str = JS_ToCString(ctx, replacement);
-            if (!repl_str) {
-                JS_FreeValue(ctx, replacement);
-                if (search_str) JS_FreeCString(ctx, search_str);
-                JS_FreeCString(ctx, str);
-                return JS_EXCEPTION;
+            if (!JS_IsNull(m) && !JS_IsUndefined(m)) {
+                cur_match_array = m;
+                has_match = 1;
+                JSValue idx = JS_GetPropertyStr(ctx, m, "index");
+                int32_t mv = 0;
+                if (JS_ToInt32(ctx, &mv, idx) < 0) mv = 0;
+                JS_FreeValue(ctx, idx);
+                cur_match_start = (size_t)mv;
+                JSValue m0 = JS_GetPropertyUint32(ctx, m, 0);
+                const char *m0s = JS_ToCString(ctx, m0);
+                cur_match_end = cur_match_start + (m0s ? strlen(m0s) : 0);
+                if (m0s) JS_FreeCString(ctx, m0s);
+                JS_FreeValue(ctx, m0);
+            } else {
+                JS_FreeValue(ctx, m);
             }
-            size_t repl_len = strlen(repl_str);
-            result_str = (char *)malloc(prefix_len + repl_len + suffix_len + 1);
-            if (result_str) {
-                memcpy(result_str, str, prefix_len);
-                memcpy(result_str + prefix_len, repl_str, repl_len);
-                memcpy(result_str + prefix_len + repl_len, found + search_len, suffix_len + 1);
-            }
-            JS_FreeCString(ctx, repl_str);
-            JS_FreeValue(ctx, replacement);
         } else {
-            const char *repl_str = JS_ToCString(ctx, replace_val);
-            if (!repl_str) {
-                if (search_str) JS_FreeCString(ctx, search_str);
-                JS_FreeCString(ctx, str);
-                return JS_EXCEPTION;
+            const char *found = search_str ? strstr(str + pos, search_str) : NULL;
+            if (found) {
+                cur_match_start = (size_t)(found - str);
+                cur_match_end = cur_match_start + strlen(search_str);
+                has_match = 1;
+                cur_match_array = JS_NewArray(ctx);
+                size_t mlen = cur_match_end - cur_match_start;
+                char *msub = (char *)malloc(mlen + 1);
+                if (msub) {
+                    memcpy(msub, str + cur_match_start, mlen);
+                    msub[mlen] = '\0';
+                }
+                JS_SetPropertyUint32(ctx, cur_match_array, 0,
+                                     JS_NewString(ctx, msub ? msub : ""));
+                free(msub);
             }
-            size_t repl_len = strlen(repl_str);
-            result_str = (char *)malloc(prefix_len + repl_len + suffix_len + 1);
-            if (result_str) {
-                memcpy(result_str, str, prefix_len);
-                memcpy(result_str + prefix_len, repl_str, repl_len);
-                memcpy(result_str + prefix_len + repl_len, found + search_len, suffix_len + 1);
-            }
-            JS_FreeCString(ctx, repl_str);
         }
 
-        if (search_str) JS_FreeCString(ctx, search_str);
-        JS_FreeCString(ctx, str);
+        if (!has_match) {
+            /* Append remaining string */
+            size_t remaining = strlen(str) - pos;
+            if (remaining > 0) {
+                char *new_accum = (char *)realloc(accum, accum_len + remaining + 1);
+                if (!new_accum) {
+                    if (accum) free(accum);
+                    if (search_str) JS_FreeCString(ctx, search_str);
+                    if (cur_match_array.tag != LR_TYPE_UNDEFINED) JS_FreeValue(ctx, cur_match_array);
+                    JS_FreeCString(ctx, str);
+                    return JS_EXCEPTION;
+                }
+                accum = new_accum;
+                memcpy(accum + accum_len, str + pos, remaining);
+                accum_len += remaining;
+                accum[accum_len] = '\0';
+            }
+            break;
+        }
 
-        if (!result_str) return JS_EXCEPTION;
-        JSValue result = JS_NewString(ctx, result_str);
-        free(result_str);
-        return result;
+
+        /* Compute replacement for this match */
+        char *repl_copy = NULL;
+        if (is_func) {
+            int32_t group_count = 1;
+            if (cur_match_array.tag != LR_TYPE_UNDEFINED && JS_IsObject(cur_match_array)) {
+                JSValue glen = JS_GetPropertyStr(ctx, cur_match_array, "length");
+                if (JS_ToInt32(ctx, &group_count, glen) < 0) group_count = 1;
+                JS_FreeValue(ctx, glen);
+                if (group_count < 1) group_count = 1;
+            }
+            int nargs = group_count + 2;
+            JSValue *args = (JSValue *)malloc(sizeof(JSValue) * (size_t)nargs);
+            if (!args) {
+                if (cur_match_array.tag != LR_TYPE_UNDEFINED) JS_FreeValue(ctx, cur_match_array);
+                break;
+            }
+            for (int i = 0; i < nargs; i++) args[i] = JS_UNDEFINED;
+            for (int i = 0; i < group_count; i++)
+                args[i] = JS_GetPropertyUint32(ctx, cur_match_array, (uint32_t)i);
+            args[nargs - 2] = JS_NewInt32(ctx, (int32_t)cur_match_start);
+            args[nargs - 1] = JS_DupValue(ctx, this_val);
+
+            JSValue rv = JS_Call(ctx, repl, JS_UNDEFINED, nargs, args);
+            for (int i = 0; i < nargs; i++) JS_FreeValue(ctx, args[i]);
+            free(args);
+            if (JS_IsException(rv)) {
+                if (cur_match_array.tag != LR_TYPE_UNDEFINED) JS_FreeValue(ctx, cur_match_array);
+                break;
+            }
+            const char *r = JS_ToCString(ctx, rv);
+            if (r) {
+                size_t rl = strlen(r);
+                repl_copy = (char *)malloc(rl + 1);
+                if (repl_copy) memcpy(repl_copy, r, rl + 1);
+                JS_FreeCString(ctx, r);
+            }
+            JS_FreeValue(ctx, rv);
+        }
+
+        if (!repl_copy && !is_func) {
+            const char *template_cstr = JS_ToCString(ctx, repl);
+            if (!template_cstr) {
+                if (cur_match_array.tag != LR_TYPE_UNDEFINED) JS_FreeValue(ctx, cur_match_array);
+                break;
+            }
+            repl_copy = build_replace_template(ctx, cur_match_array, template_cstr);
+            JS_FreeCString(ctx, template_cstr);
+        }
+
+        if (!repl_copy) {
+            repl_copy = (char *)malloc(1);
+            if (repl_copy) repl_copy[0] = '\0';
+        }
+
+        /* Append prefix and replacement */
+        size_t prefix_len = cur_match_start - pos;
+        char *new_accum = (char *)realloc(accum, accum_len + prefix_len + strlen(repl_copy) + 1);
+        if (!new_accum) {
+            if (repl_copy != (char*)"\0") free(repl_copy);
+            if (accum) free(accum);
+            if (cur_match_array.tag != LR_TYPE_UNDEFINED) JS_FreeValue(ctx, cur_match_array);
+            if (search_str) JS_FreeCString(ctx, search_str);
+            JS_FreeCString(ctx, str);
+            return JS_EXCEPTION;
+        }
+        accum = new_accum;
+        memcpy(accum + accum_len, str + pos, prefix_len);
+        accum_len += prefix_len;
+        memcpy(accum + accum_len, repl_copy, strlen(repl_copy));
+        accum_len += strlen(repl_copy);
+        accum[accum_len] = '\0';
+        free(repl_copy);
+
+        if (cur_match_array.tag != LR_TYPE_UNDEFINED) JS_FreeValue(ctx, cur_match_array);
+
+        pos = cur_match_end;
+
+        /* For non-global regex, stop after first match */
+        if (!is_regex || !is_global) {
+            /* Append remaining string after the match */
+            size_t remaining = strlen(str) - pos;
+            if (remaining > 0) {
+                char *new_accum = (char *)realloc(accum, accum_len + remaining + 1);
+                if (!new_accum) {
+                    if (cur_match_array.tag != LR_TYPE_UNDEFINED) JS_FreeValue(ctx, cur_match_array);
+                    if (accum) free(accum);
+                    if (search_str) JS_FreeCString(ctx, search_str);
+                    JS_FreeCString(ctx, str);
+                    return JS_EXCEPTION;
+                }
+                accum = new_accum;
+                memcpy(accum + accum_len, str + pos, remaining);
+                accum_len += remaining;
+                accum[accum_len] = '\0';
+            }
+            break;
+        }
     }
 
     if (search_str) JS_FreeCString(ctx, search_str);
-    JSValue result = JS_NewString(ctx, str);
     JS_FreeCString(ctx, str);
+
+    if (!accum) {
+        result = JS_NewString(ctx, str ? "" : "");
+    } else {
+        result = JS_NewString(ctx, accum);
+    }
+    if (accum) free(accum);
     return result;
 }
 
@@ -3146,25 +3496,26 @@ static JSValue js_string_proto_trim(JSContext *ctx, JSValue this_val,
 {
     (void)argc;
     (void)argv;
-    const char *str = JS_ToCString(ctx, this_val);
-    if (!str) return JS_EXCEPTION;
-    /* Skip leading whitespace */
-    while (*str && (*str == ' ' || *str == '\t' || *str == '\n' ||
-                    *str == '\r' || *str == '\f' || *str == '\v')) {
-        str++;
+    const char *cstr = JS_ToCString(ctx, this_val);
+    if (!cstr) return JS_EXCEPTION;
+    /* Skip leading whitespace (keep cstr for JS_FreeCString) */
+    const char *p = cstr;
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\n' ||
+                    *p == '\r' || *p == '\f' || *p == '\v')) {
+        p++;
     }
     /* Find end */
-    size_t len = strlen(str);
-    while (len > 0 && (str[len - 1] == ' ' || str[len - 1] == '\t' ||
-                       str[len - 1] == '\n' || str[len - 1] == '\r' ||
-                       str[len - 1] == '\f' || str[len - 1] == '\v')) {
+    size_t len = strlen(p);
+    while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t' ||
+                       p[len - 1] == '\n' || p[len - 1] == '\r' ||
+                       p[len - 1] == '\f' || p[len - 1] == '\v')) {
         len--;
     }
     char *buf = (char *)malloc(len + 1);
-    if (!buf) { JS_FreeCString(ctx, str); return JS_EXCEPTION; }
-    memcpy(buf, str, len);
+    if (!buf) { JS_FreeCString(ctx, cstr); return JS_EXCEPTION; }
+    memcpy(buf, p, len);
     buf[len] = '\0';
-    JS_FreeCString(ctx, str);
+    JS_FreeCString(ctx, cstr);
     JSValue result = JS_NewString(ctx, buf);
     free(buf);
     return result;
@@ -4052,6 +4403,151 @@ static JSValue js_function_constructor(JSContext *ctx, JSValue this_val,
 
 /* ── eval ──────────────────────────────────────────────────────────────── */
 
+/* ── Global parseInt / parseFloat / isFinite / isNaN ───────────────────── */
+
+/* digit value of a character, or -1 if not a valid base-36 digit */
+static int lr_digit_val(char ch)
+{
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'z') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'Z') return ch - 'A' + 10;
+    return -1;
+}
+
+static JSValue js_global_parse_int(JSContext *ctx, JSValue this_val,
+                                   int argc, JSValue *argv)
+{
+    (void)this_val;
+    if (argc < 1) return JS_NewFloat64(ctx, NAN);
+    const char *c = JS_ToCString(ctx, argv[0]);
+    if (!c) return JS_NewFloat64(ctx, NAN);
+    const char *p = c;
+    while (*p && isspace((unsigned char)*p)) p++;
+    int sign = 1;
+    if (*p == '-' || *p == '+') {
+        if (*p == '-') sign = -1;
+        p++;
+    }
+    /* radix: ToInt32; radix 0 (auto-detect) means 10, or 16 with an 0x prefix */
+    int32_t radix = 0;
+    if (argc > 1) {
+        JS_ToInt32(ctx, &radix, argv[1]);
+        if (radix != 0 && (radix < 2 || radix > 36)) {
+            JS_FreeCString(ctx, c);
+            return JS_NewFloat64(ctx, NAN);
+        }
+    }
+    int base = radix ? radix : 10;
+    /* 0x/0X prefix recognized only for radix 16 or default-detection (radix 0) */
+    if (radix == 0 || radix == 16) {
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+            p += 2;
+            base = 16;
+        }
+    }
+    double result = 0.0;
+    int any = 0;
+    while (*p) {
+        int d = lr_digit_val(*p);
+        if (d < 0 || d >= base) break;
+        result = result * base + d;
+        any = 1;
+        p++;
+    }
+    JS_FreeCString(ctx, c);
+    if (!any) return JS_NewFloat64(ctx, NAN);
+    return JS_NewFloat64(ctx, sign < 0 ? -result : result);
+}
+
+static JSValue js_global_parse_float(JSContext *ctx, JSValue this_val,
+                                     int argc, JSValue *argv)
+{
+    (void)this_val;
+    if (argc < 1) return JS_NewFloat64(ctx, NAN);
+    const char *c = JS_ToCString(ctx, argv[0]);
+    if (!c) return JS_NewFloat64(ctx, NAN);
+
+    /* skip leading whitespace */
+    const char *p = c;
+    while (*p && isspace((unsigned char)*p)) p++;
+    int neg = 0;
+    if (*p == '+' || *p == '-') {
+        neg = (*p == '-');
+        p++;
+    }
+    const char *start = p;
+
+    /* case-insensitive "Infinity" */
+    {
+        static const char inf[] = "Infinity";
+        int i;
+        for (i = 0; i < 8; i++) {
+            char a = start[i], b = inf[i];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+        }
+        if (i == 8) {
+            JS_FreeCString(ctx, c);
+            return JS_NewFloat64(ctx, neg ? -INFINITY : INFINITY);
+        }
+    }
+
+    /* scan the longest valid decimal literal prefix (digits, '.' , exponent) */
+    int seen_digit = 0;
+    const char *cur = start;
+    const char *end = start;
+    if (*cur == '.') cur++; /* allow ".5" */
+    while (*cur) {
+        if (*cur >= '0' && *cur <= '9') {
+            seen_digit = 1;
+            cur++;
+            end = cur;
+        } else if (*cur == '.') {
+            cur++; /* a 2nd '.' is left for strtod to stop at */
+        } else if ((*cur == 'e' || *cur == 'E') && seen_digit) {
+            const char *save = cur;
+            cur++;
+            if (*cur == '+' || *cur == '-') cur++;
+            const char *ds = cur;
+            while (*cur >= '0' && *cur <= '9') cur++;
+            if (cur > ds) end = cur;
+            else { cur = save; break; } /* "1e" -> valid prefix is "1" */
+        } else {
+            break;
+        }
+    }
+
+    size_t len = (size_t)(end - start);
+    char *buf = (char *)malloc(len + 1);
+    if (len) memcpy(buf, start, len);
+    buf[len] = '\0';
+    double v = strtod(buf, NULL);
+    free(buf);
+    JS_FreeCString(ctx, c);
+    if (!seen_digit) return JS_NewFloat64(ctx, NAN);
+    return JS_NewFloat64(ctx, neg ? -v : v);
+}
+
+static JSValue js_global_is_finite(JSContext *ctx, JSValue this_val,
+                                   int argc, JSValue *argv)
+{
+    (void)this_val;
+    if (argc < 1) return JS_FALSE;
+    double d;
+    if (JS_ToFloat64(ctx, &d, argv[0]) < 0) return JS_FALSE;
+    return JS_NewBool(ctx, !isnan(d) && !isinf(d));
+}
+
+static JSValue js_global_is_nan(JSContext *ctx, JSValue this_val,
+                                int argc, JSValue *argv)
+{
+    (void)this_val;
+    double d = NAN;
+    if (argc >= 1 && JS_ToFloat64(ctx, &d, argv[0]) < 0) d = NAN;
+    return JS_NewBool(ctx, isnan(d));
+}
+
 static JSValue js_global_eval(JSContext *ctx, JSValue this_val,
                               int argc, JSValue *argv)
 {
@@ -4087,6 +4583,20 @@ void lr_builtins_core_init(LR_Runtime *rt)
     JSContext *ctx = rt->lr_ctx;
     JSValue global = JS_GetGlobalObject(ctx);
 
+    /* ── Function.prototype (early init) ──────────────────────────────── */
+    /* Must be created BEFORE Object.prototype so that all C functions
+     * (Object.prototype.toString, Array.prototype.slice, etc.) inherit
+     * Function.prototype and thus have .call, .apply, .bind.
+     *
+     * At this point ctx->object_proto is not set yet, so func_proto's
+     * prototype defaults to the global object. We fix it to Object.prototype
+     * after creating Object below. */
+    {
+        JSValue func_proto = JS_NewObject(ctx);
+        ctx->function_proto = JS_DupValue(ctx, func_proto);
+        /* Keep func_proto alive on the stack — we finish it below. */
+    }
+
     /* ── Object ────────────────────────────────────────────────────────── */
     {
         JSValue obj_ctor = JS_NewCFunction(ctx, js_object_constructor, "Object", 1);
@@ -4109,6 +4619,33 @@ void lr_builtins_core_init(LR_Runtime *rt)
         JS_SetPropertyStr(ctx, global, "Object", obj_ctor);
     }
 
+    /* ── Function (finish) ─────────────────────────────────────────────── */
+    /* Now that ctx->object_proto is set, fix func_proto's [[Prototype]] and
+     * register the prototype methods (call, apply, bind, toString). */
+    {
+        /* Retrieve the func_proto we created during early init */
+        JSValue func_proto = JS_DupValue(ctx, ctx->function_proto);
+
+        /* Fix [[Prototype]] to Object.prototype (was set to global obj) */
+        JS_SetPrototype(ctx, func_proto, JS_DupValue(ctx, ctx->object_proto));
+
+        /* Set prototype methods (call, apply, bind, toString) */
+        JS_SetPropertyFunctionList(ctx, func_proto, js_function_proto_funcs,
+            sizeof(js_function_proto_funcs) / sizeof(js_function_proto_funcs[0]));
+
+        /* Create Function constructor as a C function */
+        JSValue func_ctor = JS_NewCFunction(ctx, js_function_constructor, "Function", 1);
+
+        /* Wire up constructor <-> prototype */
+        JS_SetPropertyStr(ctx, func_ctor, "prototype", JS_DupValue(ctx, func_proto));
+        JS_SetPropertyStr(ctx, func_proto, "constructor", JS_DupValue(ctx, func_ctor));
+
+        /* Register Function as a global */
+        JS_SetPropertyStr(ctx, global, "Function", func_ctor);
+
+        JS_FreeValue(ctx, func_proto);
+    }
+
     /* ── Array ─────────────────────────────────────────────────────────── */
     {
         JSValue arr_ctor = JS_NewCFunction(ctx, js_array_constructor, "Array", 1);
@@ -4122,6 +4659,18 @@ void lr_builtins_core_init(LR_Runtime *rt)
 
         JS_SetPropertyStr(ctx, arr_ctor, "prototype", JS_DupValue(ctx, arr_proto));
         JS_SetPropertyStr(ctx, arr_proto, "constructor", JS_DupValue(ctx, arr_ctor));
+
+        /* Array.prototype["Symbol.iterator"] — needed for [...arr] and next() tests */
+        JSValue sym_iter = JS_GetPropertyStr(ctx, global, "Symbol");
+        if (!JS_IsException(sym_iter) && !JS_IsUndefined(sym_iter)) {
+            JSValue sym_iterator = JS_GetPropertyStr(ctx, sym_iter, "iterator");
+            if (!JS_IsException(sym_iterator) && !JS_IsUndefined(sym_iterator)) {
+                JS_FreeValue(ctx, sym_iterator);
+            }
+            JS_FreeValue(ctx, sym_iter);
+        }
+        lr_set_property_str(ctx, arr_proto, "Symbol.iterator",
+            lr_new_cfunction(ctx, js_array_proto_values, "values", 0));
 
         /* Store Array.prototype for fast lookup in lr_new_array */
         ctx->array_proto = JS_DupValue(ctx, arr_proto);
@@ -4203,34 +4752,19 @@ void lr_builtins_core_init(LR_Runtime *rt)
         JS_SetPropertyStr(ctx, global, "Error", error_ctor);
     }
 
-    /* ── Function ──────────────────────────────────────────────────────── */
-    {
-        /* Function.prototype is a regular object (not a function) per spec */
-        JSValue func_proto = JS_NewObject(ctx);
-
-        /* Set prototype methods (call, apply, bind, toString) */
-        JS_SetPropertyFunctionList(ctx, func_proto, js_function_proto_funcs,
-            sizeof(js_function_proto_funcs) / sizeof(js_function_proto_funcs[0]));
-
-        /* Create Function constructor as a C function */
-        JSValue func_ctor = JS_NewCFunction(ctx, js_function_constructor, "Function", 1);
-
-        /* Wire up constructor <-> prototype */
-        JS_SetPropertyStr(ctx, func_ctor, "prototype", JS_DupValue(ctx, func_proto));
-        JS_SetPropertyStr(ctx, func_proto, "constructor", JS_DupValue(ctx, func_ctor));
-
-        /* Store Function.prototype for fast lookup */
-        ctx->function_proto = JS_DupValue(ctx, func_proto);
-
-        /* Register Function as a global */
-        JS_SetPropertyStr(ctx, global, "Function", func_ctor);
-    }
-
     /* ── eval ──────────────────────────────────────────────────────────
      * Registered last so it is present regardless of which constructors
      * above were already installed. */
     JS_SetPropertyStr(ctx, global, "eval",
                       JS_NewCFunction(ctx, js_global_eval, "eval", 1));
+    JS_SetPropertyStr(ctx, global, "parseInt",
+                      JS_NewCFunction(ctx, js_global_parse_int, "parseInt", 2));
+    JS_SetPropertyStr(ctx, global, "parseFloat",
+                      JS_NewCFunction(ctx, js_global_parse_float, "parseFloat", 1));
+    JS_SetPropertyStr(ctx, global, "isFinite",
+                      JS_NewCFunction(ctx, js_global_is_finite, "isFinite", 1));
+    JS_SetPropertyStr(ctx, global, "isNaN",
+                      JS_NewCFunction(ctx, js_global_is_nan, "isNaN", 1));
 
     JS_FreeValue(ctx, global);
 

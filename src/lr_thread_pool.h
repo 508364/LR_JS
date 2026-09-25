@@ -72,43 +72,59 @@ struct LR_Task {
 /* ── Worker state ──────────────────────────────────────────────────────── */
 
 typedef struct LR_Worker {
+    /* ── Hot path: read/written on every task pop ──────────────────────── */
+    LR_LFQueue        task_queue;         /* lock-free MPSC queue         */
+    volatile int      running;            /* worker is alive              */
+    volatile int      should_stop;        /* shutdown signal              */
+    int               worker_id;          /* index in pool                */
+    LR_CACHE_PAD;                         /* isolate hot from cold        */
+
+    /* ── Warm path: thread handle, signal, runtime, pool ptr ──────────── */
     pthread_t         thread;
-    int               worker_id;
-    volatile int      running;
-    volatile int      should_stop;
-
-    /* Per-worker JS isolation */
-    LR_Runtime       *runtime;
-
-    /* Worker-local lock-free task queue (MPSC) */
-    LR_LFQueue        task_queue;
-
-    /* Condition variable for waking up sleeping worker.
-     * The queue itself is lock-free; this is only for signaling. */
     pthread_mutex_t   signal_mutex;
     pthread_cond_t    signal_cond;
+    LR_Runtime       *runtime;
+    struct LR_ThreadPool *pool;           /* back-pointer for work-stealing */
 
-    /* Stats */
+    /* ── Cold path: stats, rarely read ─────────────────────────────────── */
     volatile int64_t  tasks_completed;
     volatile int64_t  total_exec_time_us;
-} LR_Worker;
+} LR_CACHE_ALIGNED LR_Worker;
 
 /* ── Thread pool ───────────────────────────────────────────────────────── */
 
 struct LR_ThreadPool {
+    /* ── Hot path: task distribution ───────────────────────────────────── */
     int               num_workers;
-    LR_Worker       **workers;
     volatile int      running;
-    int               round_robin_idx;
+    volatile int      round_robin_idx;   /* CAS-protected, no mutex */
+    LR_CACHE_PAD;
 
-    /* Global task counter */
-    int               next_task_id;
-    pthread_mutex_t   id_mutex;
+    /* ── Worker array (separate cache line) ────────────────────────────── */
+    LR_Worker       **workers;
+
+    /* ── Work-stealing state ──────────────────────────────────────────────
+     * When a worker runs out of tasks in its own queue, it tries to steal
+     * from the busiest neighbour.  steal_attempts tracks load imbalance.    */
+    volatile int64_t  steal_attempts;
+    volatile int64_t  steal_successes;
+    LR_CACHE_PAD2;
+
+    /* Global task counter — atomic, no mutex needed */
+    volatile int32_t  next_task_id;
+
+    /* ── Completion notification ──────────────────────────────────────────
+     * Replaces busy-wait polling in lr_thread_pool_wait_all.
+     * tasks_pending is incremented on submit, decremented on completion.
+     * wait_all uses the condition variable instead of 1ms polling.         */
+    volatile int64_t  tasks_pending;     /* atomic counter */
+    pthread_mutex_t   done_mutex;
+    pthread_cond_t    done_cond;
 
     /* Stats */
     volatile int64_t  tasks_submitted;
     volatile int64_t  tasks_completed;
-};
+} LR_CACHE_ALIGNED;
 
 /* ── API ───────────────────────────────────────────────────────────────── */
 

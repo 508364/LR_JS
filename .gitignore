@@ -53,7 +53,7 @@ dkms.conf
 
 .gitignore
 
-build/*
+build*/
 build_cmake/
 Project-Record/
 /build_linux
@@ -67,4 +67,39 @@ Project-Record/
 TASKS.md
 build_log.txt
 /tests
+/test/
 /build_mingw
+build_err.txt
+
+# Debug / profiling artifacts
+gmon.out
+lr_runtime.i
+re_timing
+re_timing.c
+jit*.asm
+jit*.bin
+jit*.gdb
+jit_dump_*.bin
+fix_labels.awk
+iome586_cache/
+tmp_*.txt
+err.txt
+out.txt
+output*.log
+crash_log.txt
+jit_debug.log
+jit_analysis.txt
+sljitUtils.obj
+*.bak*
+debug_logs/
+
+# Nested upstream repos (must never be uploaded with this repo)
+/quickjs
+/v8
+/git-github
+
+# Debug artifacts directory
+/_debug/
+
+# Benchmarks directory
+/bench/

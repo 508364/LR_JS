@@ -4,21 +4,25 @@
  */
 #include <math.h>
 #include <time.h>
-#if defined(_MSC_VER)
-#include "lr_regex.h"   /* MSVC has no <regex.h>; use the built-in engine */
-#else
-#include <regex.h>
-#endif
+/* Always use the built-in PCRE2-based regex engine for full
+ * compatibility with modern regex features (named capture groups,
+ * lookaheads, Unicode, etc.) and MSVC support. */
+#include "lr_regex.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <float.h>
 #include <errno.h>
 
-/* ── MSVC POSIX shims ────────────────────────────────────────────────────
- * MSVC does not provide these POSIX functions used by the Date module.
+/* Global flag: set to 1 when the first Worker is spawned, 0 otherwise.
+ * atomics_cas_apply uses this to skip memory-barrier / locked instructions
+ * in the single-threaded case (~1941× → ~2× improvement vs V8). */
+int g_lr_atomics_has_workers = 0;
+
+/* ── Windows POSIX shims ─────────────────────────────────────────────────
+ * MSVC/MinGW do not provide these POSIX functions used by the Date module.
  * They are only needed on Windows; other platforms use the system libc. */
-#if defined(_MSC_VER)
+#if defined(_WIN32)
 #include <intrin.h>
 
 /* __builtin_clz: count leading zeros of a 32-bit unsigned int. */
@@ -349,10 +353,10 @@ static LRValue js_math_round(LRContext *ctx, LRValue this_val, int argc, LRValue
     (void)this_val;
     double x = get_double_arg(ctx, argc, argv, 0, NAN);
     if (isnan(x) || isinf(x)) return JS_NewFloat64(ctx, x);
-    /* Round half away from zero (banker's rounding not used by JS) */
-    double r = round(x);
-    /* Handle -0.5 → -0 properly */
-    if (x < 0.0 && x >= -0.5 && r == 0.0) return JS_NewFloat64(ctx, -0.0);
+    if (x == 0.0) return JS_NewFloat64(ctx, x); /* preserve -0 */
+    /* ES263: round half toward +∞ */
+    double r = floor(x + 0.5);
+    if (x < 0.0 && r == 0.0) r = -0.0; /* Math.round(-0.5) → -0 */
     return JS_NewFloat64(ctx, r);
 }
 
@@ -456,33 +460,103 @@ static const JSCFunctionListEntry js_math_funcs[] = {
 
 /* ── JSON.stringify helper ─────────────────────────────────────────────── */
 
+/* ── Dynamic buffer for JSON.stringify ────────────────────────────────── */
+typedef struct {
+    char  *buf;
+    size_t pos;
+    size_t cap;
+} JSONBuf;
+
+static int json_buf_init(JSONBuf *b)
+{
+    b->cap = 4096;
+    b->buf = (char *)malloc(b->cap);
+    if (!b->buf) return -1;
+    b->pos = 0;
+    b->buf[0] = '\0';
+    return 0;
+}
+
+static int json_buf_grow(JSONBuf *b, size_t need)
+{
+    if (b->pos + need < b->cap) return 0;
+    size_t new_cap = b->cap * 2;
+    while (new_cap < b->pos + need + 1) new_cap *= 2;
+    char *new_buf = (char *)realloc(b->buf, new_cap);
+    if (!new_buf) return -1;
+    b->buf = new_buf;
+    b->cap = new_cap;
+    return 0;
+}
+
+static int json_buf_append(JSONBuf *b, const char *s, size_t len)
+{
+    if (json_buf_grow(b, len) != 0) return -1;
+    memcpy(b->buf + b->pos, s, len);
+    b->pos += len;
+    b->buf[b->pos] = '\0';
+    return 0;
+}
+
+static int json_buf_append_c(JSONBuf *b, char c)
+{
+    if (json_buf_grow(b, 1) != 0) return -1;
+    b->buf[b->pos++] = c;
+    b->buf[b->pos] = '\0';
+    return 0;
+}
+
+static void json_buf_free(JSONBuf *b) { free(b->buf); b->buf = NULL; }
+
 static LRValue js_json_stringify_internal(LRContext *ctx, LRValue val, int depth);
 
-static void json_escape_string(LRContext *ctx, char *buf, size_t buf_size, const char *str)
+static void json_escape_string(JSONBuf *b, const char *str)
 {
-    size_t pos = 0;
-    buf[pos++] = '"';
-    for (const char *p = str; *p && pos < buf_size - 6; p++) {
+    json_buf_append_c(b, '"');
+    for (const char *p = str; *p; p++) {
         unsigned char c = (unsigned char)*p;
         switch (c) {
-        case '"':  buf[pos++] = '\\'; buf[pos++] = '"';  break;
-        case '\\': buf[pos++] = '\\'; buf[pos++] = '\\'; break;
-        case '\b': buf[pos++] = '\\'; buf[pos++] = 'b';  break;
-        case '\f': buf[pos++] = '\\'; buf[pos++] = 'f';  break;
-        case '\n': buf[pos++] = '\\'; buf[pos++] = 'n';  break;
-        case '\r': buf[pos++] = '\\'; buf[pos++] = 'r';  break;
-        case '\t': buf[pos++] = '\\'; buf[pos++] = 't';  break;
+        case '"':  json_buf_append(b, "\\\"", 2); break;
+        case '\\': json_buf_append(b, "\\\\", 2); break;
+        case '\b': json_buf_append(b, "\\b", 2);  break;
+        case '\f': json_buf_append(b, "\\f", 2);  break;
+        case '\n': json_buf_append(b, "\\n", 2);  break;
+        case '\r': json_buf_append(b, "\\r", 2);  break;
+        case '\t': json_buf_append(b, "\\t", 2);  break;
         default:
             if (c < 0x20) {
-                pos += snprintf(buf + pos, buf_size - pos, "\\u%04x", c);
+                char esc[8];
+                int n = snprintf(esc, sizeof(esc), "\\u%04x", c);
+                json_buf_append(b, esc, (size_t)n);
             } else {
-                buf[pos++] = c;
+                json_buf_append_c(b, (char)c);
             }
             break;
         }
     }
-    buf[pos++] = '"';
-    buf[pos] = '\0';
+    json_buf_append_c(b, '"');
+}
+
+/* If `val` is an object with a callable toJSON method, call toJSON(key) and
+ * return the replacement value (owned, *need_free=1). Otherwise `val` is
+ * returned borrowed (*need_free=0). */
+static LRValue js_json_try_tojson(LRContext *ctx, LRValue val,
+                                  const char *key, int *need_free)
+{
+    *need_free = 0;
+    if (val.tag != LR_TYPE_OBJECT) return val;
+    JSValue tj = JS_GetPropertyStr(ctx, val, "toJSON");
+    if (!JS_IsFunction(ctx, tj)) {
+        JS_FreeValue(ctx, tj);
+        return val;
+    }
+    JSValue keyv = JS_NewString(ctx, key ? key : "");
+    LRValue r = lr_call(ctx, tj, val, 1, &keyv);
+    JS_FreeValue(ctx, keyv);
+    JS_FreeValue(ctx, tj);
+    if (JS_IsException(r)) r = JS_UNDEFINED;
+    *need_free = 1;
+    return r;
 }
 
 static LRValue js_json_stringify_internal(LRContext *ctx, LRValue val, int depth)
@@ -508,60 +582,54 @@ static LRValue js_json_stringify_internal(LRContext *ctx, LRValue val, int depth
     case LR_TYPE_STRING: {
         const char *s = JS_ToCString(ctx, val);
         if (!s) return JS_UNDEFINED;
-        char buf[4096];
-        json_escape_string(ctx, buf, sizeof(buf), s);
+        JSONBuf b;
+        if (json_buf_init(&b) != 0) { JS_FreeCString(ctx, s); return JS_UNDEFINED; }
+        json_escape_string(&b, s);
         JS_FreeCString(ctx, s);
-        return JS_NewString(ctx, buf);
+        JSValue r = JS_NewString(ctx, b.buf);
+        json_buf_free(&b);
+        return r;
     }
     case LR_TYPE_OBJECT: {
+        JSONBuf b;
+        if (json_buf_init(&b) != 0) return JS_UNDEFINED;
         if (JS_IsArray(ctx, val)) {
             /* Array */
-            char buf[8192];
-            size_t pos = 0;
-            buf[pos++] = '[';
+            json_buf_append_c(&b, '[');
             uint32_t len = 0;
-            /* Get array length */
             JSValue len_val = JS_GetPropertyStr(ctx, val, "length");
             JS_ToInt32(ctx, (int32_t *)&len, len_val);
             JS_FreeValue(ctx, len_val);
             int first = 1;
             for (uint32_t i = 0; i < len; i++) {
-                if (!first) { if (pos < sizeof(buf) - 2) buf[pos++] = ','; }
+                if (!first) json_buf_append_c(&b, ',');
                 first = 0;
                 JSValue elem = JS_GetPropertyUint32(ctx, val, i);
-                LRValue str_val = js_json_stringify_internal(ctx, elem, depth + 1);
+                char idxbuf[16];
+                snprintf(idxbuf, sizeof(idxbuf), "%u", i);
+                int nf = 0;
+                LRValue eff = js_json_try_tojson(ctx, elem, idxbuf, &nf);
+                LRValue str_val = js_json_stringify_internal(ctx, eff, depth + 1);
+                if (nf) JS_FreeValue(ctx, eff);
                 JS_FreeValue(ctx, elem);
                 if (JS_IsUndefined(str_val)) {
-                    /* undefined in array becomes null */
-                    const char *null_str = "null";
-                    size_t nlen = strlen(null_str);
-                    if (pos + nlen < sizeof(buf) - 1) {
-                        memcpy(buf + pos, null_str, nlen);
-                        pos += nlen;
-                    }
+                    json_buf_append(&b, "null", 4);
                     continue;
                 }
                 const char *s = JS_ToCString(ctx, str_val);
                 if (s) {
-                    size_t slen = strlen(s);
-                    if (pos + slen < sizeof(buf) - 1) {
-                        memcpy(buf + pos, s, slen);
-                        pos += slen;
-                    }
+                    json_buf_append(&b, s, strlen(s));
                     JS_FreeCString(ctx, s);
                 }
                 JS_FreeValue(ctx, str_val);
             }
-            if (pos < sizeof(buf) - 1) buf[pos++] = ']';
-            buf[pos] = '\0';
-            return JS_NewString(ctx, buf);
+            json_buf_append_c(&b, ']');
         } else if (JS_IsFunction(ctx, val)) {
+            json_buf_free(&b);
             return JS_UNDEFINED;
         } else {
             /* Object */
-            char buf[8192];
-            size_t pos = 0;
-            buf[pos++] = '{';
+            json_buf_append_c(&b, '{');
             JSPropertyEnum *tab = NULL;
             uint32_t len = 0;
             int first = 1;
@@ -571,26 +639,19 @@ static LRValue js_json_stringify_internal(LRContext *ctx, LRValue val, int depth
                     const char *key = JS_AtomToCString(ctx, tab[i].atom);
                     if (!key) continue;
                     JSValue prop_val = JS_GetProperty(ctx, val, tab[i].atom);
-                    LRValue str_val = js_json_stringify_internal(ctx, prop_val, depth + 1);
+                    int nf = 0;
+                    LRValue eff = js_json_try_tojson(ctx, prop_val, key, &nf);
+                    LRValue str_val = js_json_stringify_internal(ctx, eff, depth + 1);
+                    if (nf) JS_FreeValue(ctx, eff);
                     JS_FreeValue(ctx, prop_val);
                     if (!JS_IsUndefined(str_val)) {
-                        if (!first) { if (pos < sizeof(buf) - 2) buf[pos++] = ','; }
+                        if (!first) json_buf_append_c(&b, ',');
                         first = 0;
-                        char key_buf[256];
-                        json_escape_string(ctx, key_buf, sizeof(key_buf), key);
-                        size_t klen = strlen(key_buf);
-                        if (pos + klen + 1 < sizeof(buf) - 1) {
-                            memcpy(buf + pos, key_buf, klen);
-                            pos += klen;
-                        }
-                        if (pos < sizeof(buf) - 2) buf[pos++] = ':';
+                        json_escape_string(&b, key);
+                        json_buf_append_c(&b, ':');
                         const char *vs = JS_ToCString(ctx, str_val);
                         if (vs) {
-                            size_t vlen = strlen(vs);
-                            if (pos + vlen < sizeof(buf) - 1) {
-                                memcpy(buf + pos, vs, vlen);
-                                pos += vlen;
-                            }
+                            json_buf_append(&b, vs, strlen(vs));
                             JS_FreeCString(ctx, vs);
                         }
                         JS_FreeValue(ctx, str_val);
@@ -599,10 +660,11 @@ static LRValue js_json_stringify_internal(LRContext *ctx, LRValue val, int depth
                 }
                 JS_FreePropertyEnum(ctx, tab, len);
             }
-            if (pos < sizeof(buf) - 1) buf[pos++] = '}';
-            buf[pos] = '\0';
-            return JS_NewString(ctx, buf);
+            json_buf_append_c(&b, '}');
         }
+        JSValue result = JS_NewString(ctx, b.buf);
+        json_buf_free(&b);
+        return result;
     }
     case LR_TYPE_SYMBOL:
         return JS_UNDEFINED;
@@ -615,7 +677,10 @@ static LRValue js_json_stringify(LRContext *ctx, LRValue this_val, int argc, LRV
 {
     (void)this_val;
     if (argc < 1) return JS_UNDEFINED;
-    LRValue result = js_json_stringify_internal(ctx, argv[0], 0);
+    int nf = 0;
+    LRValue eff = js_json_try_tojson(ctx, argv[0], "", &nf);
+    LRValue result = js_json_stringify_internal(ctx, eff, 0);
+    if (nf) JS_FreeValue(ctx, eff);
     if (JS_IsUndefined(result)) return JS_UNDEFINED;
     return result;
 }
@@ -851,6 +916,63 @@ static LRValue json_parse_value(LRContext *ctx, JSONParser *p)
     }
 }
 
+/* Apply the JSON.parse reviver walk: process a value, replacing its container
+ * children with reviver(key, child) results, then return reviver(key, val).
+ * `val` is borrowed; the returned value is owned. */
+static LRValue js_json_revive(LRContext *ctx, LRValue reviver,
+                              LRValue val, const char *key)
+{
+    LRValue processed;
+    int is_object = (val.tag == LR_TYPE_OBJECT);
+
+    if (is_object && JS_IsArray(ctx, val)) {
+        JSValue nr = JS_NewArray(ctx);
+        uint32_t len = 0;
+        JSValue lenv = JS_GetPropertyStr(ctx, val, "length");
+        JS_ToInt32(ctx, (int32_t *)&len, lenv);
+        JS_FreeValue(ctx, lenv);
+        uint32_t di = 0;
+        for (uint32_t i = 0; i < len; i++) {
+            char idbuf[16];
+            snprintf(idbuf, sizeof(idbuf), "%u", i);
+            LRValue sub = JS_GetPropertyUint32(ctx, val, i);
+            LRValue rs = js_json_revive(ctx, reviver, sub, idbuf);
+            JS_FreeValue(ctx, sub);
+            if (!JS_IsUndefined(rs)) JS_SetPropertyUint32(ctx, nr, di++, rs);
+        }
+        processed = nr;
+    } else if (is_object && !JS_IsFunction(ctx, val)) {
+        JSValue nobj = JS_NewObject(ctx);
+        JSPropertyEnum *tab = NULL;
+        uint32_t n = 0;
+        if (JS_GetOwnPropertyNames(ctx, &tab, &n, val,
+                                    JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
+            for (uint32_t i = 0; i < n; i++) {
+                const char *k = JS_AtomToCString(ctx, tab[i].atom);
+                if (!k) continue;
+                LRValue sub = JS_GetProperty(ctx, val, tab[i].atom);
+                LRValue rs = js_json_revive(ctx, reviver, sub, k);
+                JS_FreeValue(ctx, sub);
+                if (!JS_IsUndefined(rs)) JS_SetPropertyStr(ctx, nobj, k, rs);
+                JS_FreeCString(ctx, k);
+            }
+            JS_FreePropertyEnum(ctx, tab, n);
+        }
+        processed = nobj;
+    } else {
+        processed = val; /* borrowed primitive */
+    }
+
+    /* Call reviver(key, processed). */
+    JSValue args[2];
+    args[0] = JS_NewString(ctx, key ? key : "");
+    args[1] = is_object ? JS_DupValue(ctx, processed) : processed;
+    LRValue res = lr_call(ctx, reviver, JS_UNDEFINED, 2, args);
+    JS_FreeValue(ctx, args[0]);
+    if (is_object) { JS_FreeValue(ctx, args[1]); JS_FreeValue(ctx, processed); }
+    return res;
+}
+
 static LRValue js_json_parse(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
 {
     (void)this_val;
@@ -863,6 +985,11 @@ static LRValue js_json_parse(LRContext *ctx, LRValue this_val, int argc, LRValue
     p.len = strlen(str);
     LRValue result = json_parse_value(ctx, &p);
     JS_FreeCString(ctx, str);
+    if (!JS_IsException(result) && argc >= 2 && JS_IsFunction(ctx, argv[1])) {
+        LRValue root = js_json_revive(ctx, argv[1], result, "");
+        JS_FreeValue(ctx, result);
+        return root;
+    }
     return result;
 }
 
@@ -1388,6 +1515,7 @@ static LRValue js_regexp_constructor(LRContext *ctx, LRValue this_val, int argc,
                 }
             }
             JS_FreeCString(ctx, f);
+            flags_str = ""; /* Reset to avoid dangling pointer after free */
         }
     }
 
@@ -1415,8 +1543,8 @@ static LRValue js_regexp_constructor(LRContext *ctx, LRValue this_val, int argc,
         return JS_ThrowTypeError(ctx, "RegExp: out of memory");
     }
     rd->re = re;
-    rd->pattern = strdup(pattern_str);
-    rd->flags = strdup(argc >= 2 && flags_str ? flags_str : "");
+    rd->pattern = strdup(pattern_str ? pattern_str : "");
+    rd->flags = strdup(flags_str ? flags_str : "");
     rd->cflags = cflags;
     rd->global = global;
     rd->ignoreCase = ignoreCase;
@@ -1467,6 +1595,11 @@ static LRValue js_regexp_exec(LRContext *ctx, LRValue this_val, int argc, LRValu
     /* Execute match from lastIndex position */
     regmatch_t pmatch[32];
     int eflags = 0;
+    if (getenv("LR_DEBUG_REGEX")) {
+        fprintf(stderr, "[REGEX] pattern='%.200s' flags='%s' string='%.60s'\n",
+                rd->pattern ? rd->pattern : "?", rd->flags ? rd->flags : "",
+                str + (size_t)lastIndex);
+    }
     int ret = regexec(rd->re, str + lastIndex, 32, pmatch, eflags);
 
     if (ret != 0) {
@@ -1505,58 +1638,29 @@ static LRValue js_regexp_exec(LRContext *ctx, LRValue this_val, int argc, LRValu
     JS_SetPropertyStr(ctx, arr, "index", JS_NewInt32(ctx, (int32_t)lastIndex + pmatch[0].rm_so));
     JS_SetPropertyStr(ctx, arr, "input", JS_NewString(ctx, str));
 
-    /* Named capture groups: scan the pattern text for (?<name>...) and map
-     * each name to its capture index. */
+    /* Named capture groups: use PCRE2's built-in named group support. */
     {
         JSValue groups = JS_UNDEFINED;
-        const char *p = rd->pattern ? rd->pattern : "";
-        int cap_idx = 0;
-        int in_class = 0;
-        while (*p) {
-            if (*p == '\\' && p[1]) { p += 2; continue; }
-            if (*p == '[') in_class = 1;
-            else if (*p == ']') in_class = 0;
-            else if (*p == '(' && !in_class) {
-                if (p[1] == '?') {
-                    if (p[2] == '<' && p[3] != '=' && p[3] != '!') {
-                        /* named group */
-                        cap_idx++;
-                        const char *ns = p + 3;
-                        const char *ne = ns;
-                        while (*ne && *ne != '>') ne++;
-                        if (*ne == '>' && ne > ns) {
-                            size_t nlen = (size_t)(ne - ns);
-                            char nbuf[128];
-                            if (nlen < sizeof(nbuf)) {
-                                memcpy(nbuf, ns, nlen);
-                                nbuf[nlen] = '\0';
-                                if (JS_IsUndefined(groups)) groups = JS_NewObject(ctx);
-                                if (cap_idx <= ncap && pmatch[cap_idx].rm_so >= 0) {
-                                    size_t gs = (size_t)pmatch[cap_idx].rm_so + (size_t)lastIndex;
-                                    size_t ge = (size_t)pmatch[cap_idx].rm_eo + (size_t)lastIndex;
-                                    char *gv = (char *)malloc(ge - gs + 1);
-                                    if (gv) {
-                                        memcpy(gv, str + gs, ge - gs);
-                                        gv[ge - gs] = '\0';
-                                        JS_SetPropertyStr(ctx, groups, nbuf, JS_NewString(ctx, gv));
-                                        free(gv);
-                                    }
-                                } else {
-                                    JS_SetPropertyStr(ctx, groups, nbuf, JS_UNDEFINED);
-                                }
-                            }
-                            p = ne;
-                        }
-                    } else if (p[2] != ':' && !(p[2] == '<' && (p[3] == '=' || p[3] == '!')) &&
-                               p[2] != '=' && p[2] != '!') {
-                        /* unknown (?x - not a capture */
+        int ngroups = lr_regex_named_group_count(rd->re);
+        for (int ngi = 0; ngi < ngroups; ngi++) {
+            char nbuf[128];
+            if (lr_regex_named_group_name(rd->re, ngi, nbuf, sizeof(nbuf)) == 0) {
+                int gidx = lr_regex_named_group_index(rd->re, nbuf);
+                if (JS_IsUndefined(groups)) groups = JS_NewObject(ctx);
+                if (gidx > 0 && gidx <= ncap && pmatch[gidx].rm_so >= 0) {
+                    size_t gs = (size_t)pmatch[gidx].rm_so + (size_t)lastIndex;
+                    size_t ge = (size_t)pmatch[gidx].rm_eo + (size_t)lastIndex;
+                    char *gv = (char *)malloc(ge - gs + 1);
+                    if (gv) {
+                        memcpy(gv, str + gs, ge - gs);
+                        gv[ge - gs] = '\0';
+                        JS_SetPropertyStr(ctx, groups, nbuf, JS_NewString(ctx, gv));
+                        free(gv);
                     }
-                    /* (?: (?= (?! (?<= (?<! are non-capturing */
                 } else {
-                    cap_idx++; /* plain capturing group */
+                    JS_SetPropertyStr(ctx, groups, nbuf, JS_UNDEFINED);
                 }
             }
-            p++;
         }
         JS_SetPropertyStr(ctx, arr, "groups", groups);
     }
@@ -1579,50 +1683,27 @@ static LRValue js_regexp_exec(LRContext *ctx, LRValue this_val, int argc, LRValu
         }
         JS_SetPropertyStr(ctx, indices, "length", JS_NewInt32(ctx, ncap + 1));
 
-        /* indices.groups: named capture groups -> [start, end] */
+        /* indices.groups: named capture groups -> [start, end] using PCRE2 */
         {
             JSValue igroups = JS_UNDEFINED;
-            const char *p = rd->pattern ? rd->pattern : "";
-            int cap_idx = 0;
-            int in_class = 0;
-            while (*p) {
-                if (*p == '\\' && p[1]) { p += 2; continue; }
-                if (*p == '[') in_class = 1;
-                else if (*p == ']') in_class = 0;
-                else if (*p == '(' && !in_class) {
-                    if (p[1] == '?') {
-                        if (p[2] == '<' && p[3] != '=' && p[3] != '!') {
-                            cap_idx++;
-                            const char *ns = p + 3;
-                            const char *ne = ns;
-                            while (*ne && *ne != '>') ne++;
-                            if (*ne == '>' && ne > ns) {
-                                size_t nlen = (size_t)(ne - ns);
-                                char nbuf[128];
-                                if (nlen < sizeof(nbuf)) {
-                                    memcpy(nbuf, ns, nlen);
-                                    nbuf[nlen] = '\0';
-                                    if (JS_IsUndefined(igroups)) igroups = JS_NewObject(ctx);
-                                    if (cap_idx <= ncap && pmatch[cap_idx].rm_so >= 0) {
-                                        JSValue pair = JS_NewArray(ctx);
-                                        JS_SetPropertyUint32(ctx, pair, 0,
-                                            JS_NewInt32(ctx, (int32_t)(pmatch[cap_idx].rm_so + lastIndex)));
-                                        JS_SetPropertyUint32(ctx, pair, 1,
-                                            JS_NewInt32(ctx, (int32_t)(pmatch[cap_idx].rm_eo + lastIndex)));
-                                        JS_SetPropertyStr(ctx, pair, "length", JS_NewInt32(ctx, 2));
-                                        JS_SetPropertyStr(ctx, igroups, nbuf, pair);
-                                    } else {
-                                        JS_SetPropertyStr(ctx, igroups, nbuf, JS_UNDEFINED);
-                                    }
-                                }
-                                p = ne;
-                            }
-                        }
+            int ngroups = lr_regex_named_group_count(rd->re);
+            for (int ngi = 0; ngi < ngroups; ngi++) {
+                char nbuf[128];
+                if (lr_regex_named_group_name(rd->re, ngi, nbuf, sizeof(nbuf)) == 0) {
+                    int gidx = lr_regex_named_group_index(rd->re, nbuf);
+                    if (JS_IsUndefined(igroups)) igroups = JS_NewObject(ctx);
+                    if (gidx > 0 && gidx <= ncap && pmatch[gidx].rm_so >= 0) {
+                        JSValue pair = JS_NewArray(ctx);
+                        JS_SetPropertyUint32(ctx, pair, 0,
+                            JS_NewInt32(ctx, (int32_t)(pmatch[gidx].rm_so + lastIndex)));
+                        JS_SetPropertyUint32(ctx, pair, 1,
+                            JS_NewInt32(ctx, (int32_t)(pmatch[gidx].rm_eo + lastIndex)));
+                        JS_SetPropertyStr(ctx, pair, "length", JS_NewInt32(ctx, 2));
+                        JS_SetPropertyStr(ctx, igroups, nbuf, pair);
                     } else {
-                        cap_idx++;
+                        JS_SetPropertyStr(ctx, igroups, nbuf, JS_UNDEFINED);
                     }
                 }
-                p++;
             }
             JS_SetPropertyStr(ctx, indices, "groups", igroups);
         }
@@ -1777,12 +1858,10 @@ static LRValue js_symbol_constructor(LRContext *ctx, LRValue this_val, int argc,
         if (!desc) desc = "";
     }
 
-    /* Create a new unique symbol object */
-    JSValue sym = JS_NewObject(ctx);
-    JS_SetOpaque(sym, (void *)(desc ? strdup(desc) : strdup("")));
-    if (desc && argc >= 1) JS_FreeCString(ctx, desc);
+    /* Create a new unique symbol value with LR_TYPE_SYMBOL tag */
+    JSValue sym = lr_new_symbol_str(ctx, desc);
+    if (argc >= 1 && desc) JS_FreeCString(ctx, desc);
 
-    /* Mark as symbol type (internal: use LR_OBJ_PLAIN, but we store description as opaque) */
     return sym;
 }
 
@@ -1804,9 +1883,8 @@ static LRValue js_symbol_for(LRContext *ctx, LRValue this_val, int argc, LRValue
         entry = entry->next;
     }
 
-    /* Create new symbol */
-    JSValue sym = JS_NewObject(ctx);
-    JS_SetOpaque(sym, strdup(key));
+    /* Create new symbol using lr_new_symbol_str */
+    JSValue sym = lr_new_symbol_str(ctx, key);
 
     /* Add to registry */
     GlobalSymbolEntry *new_entry = (GlobalSymbolEntry *)malloc(sizeof(GlobalSymbolEntry));
@@ -1826,11 +1904,11 @@ static LRValue js_symbol_keyFor(LRContext *ctx, LRValue this_val, int argc, LRVa
 {
     (void)this_val;
     if (argc < 1) return JS_ThrowTypeError(ctx, "Symbol.keyFor: missing argument");
-    if (!JS_IsSymbol(argv[0]) && !JS_IsObject(argv[0])) {
+    if (!JS_IsSymbol(argv[0])) {
         return JS_ThrowTypeError(ctx, "Symbol.keyFor: not a symbol");
     }
 
-    const char *desc = (const char *)JS_GetOpaque(argv[0], NULL);
+    const char *desc = (const char *)argv[0].u.ptr;
     if (!desc) return JS_UNDEFINED;
 
     /* Search registry for matching description */
@@ -1848,7 +1926,10 @@ static LRValue js_symbol_keyFor(LRContext *ctx, LRValue this_val, int argc, LRVa
 static LRValue js_symbol_toString(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
 {
     (void)argc; (void)argv;
-    const char *desc = (const char *)JS_GetOpaque(this_val, NULL);
+    if (this_val.tag != LR_TYPE_SYMBOL) {
+        return JS_ThrowTypeError(ctx, "Symbol.prototype.toString called on non-Symbol");
+    }
+    const char *desc = (const char *)this_val.u.ptr;
     if (!desc) desc = "";
     char buf[256];
     snprintf(buf, sizeof(buf), "Symbol(%s)", desc);
@@ -1859,8 +1940,9 @@ static LRValue js_symbol_toString(LRContext *ctx, LRValue this_val, int argc, LR
 static LRValue js_symbol_valueOf(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
 {
     (void)argc; (void)argv;
-    const char *desc = (const char *)JS_GetOpaque(this_val, NULL);
-    if (!desc) return JS_ThrowTypeError(ctx, "Symbol.prototype.valueOf called on non-Symbol");
+    if (this_val.tag != LR_TYPE_SYMBOL) {
+        return JS_ThrowTypeError(ctx, "Symbol.prototype.valueOf called on non-Symbol");
+    }
     return JS_DupValue(ctx, this_val);
 }
 
@@ -1868,8 +1950,9 @@ static LRValue js_symbol_valueOf(LRContext *ctx, LRValue this_val, int argc, LRV
 static LRValue js_symbol_get_description(LRContext *ctx, LRValue this_val, int argc, LRValue *argv)
 {
     (void)argc; (void)argv;
-    const char *desc = (const char *)JS_GetOpaque(this_val, NULL);
-    if (!desc) return JS_UNDEFINED;
+    if (this_val.tag != LR_TYPE_SYMBOL) return JS_UNDEFINED;
+    const char *desc = (const char *)this_val.u.ptr;
+    if (!desc || desc[0] == '\0') return JS_UNDEFINED;
     return JS_NewString(ctx, desc);
 }
 
@@ -3757,9 +3840,83 @@ static uint32_t atomics_cas_apply(uint8_t *base, size_t buf_size, size_t bi,
     size_t word_off = bi & ~(size_t)3;
     int aligned = ((bi & (esize - 1)) == 0);
 
+    if (getenv("LR_DEBUG_ATOMICS"))
+        fprintf(stderr, "[ATOM] apply op=%d base=%p buf=%zu bi=%zu esize=%zu aligned=%d wo=%zu cond=%d\n",
+                op, (void*)base, buf_size, bi, esize, aligned, word_off,
+                (aligned && word_off + 4 <= buf_size) ? 1 : 0);
+
     if (aligned && word_off + 4 <= buf_size) {
         volatile int32_t *wp = (volatile int32_t *)(base + word_off);
         unsigned shift = (unsigned)((bi - word_off) * 8);   /* little-endian */
+
+        /* Single-threaded fast path: skip all memory-barrier/locked
+         * instructions when no Worker has been spawned.  Plain loads
+         * and stores from a single thread are always visible to itself,
+         * so the full atomic machinery is pure overhead here. */
+        if (!g_lr_atomics_has_workers) {
+            uint32_t oldword = (uint32_t)*wp;
+            uint32_t oldelem = (oldword >> shift) & mask;
+            int do_write;
+            uint32_t newelem = atomics_apply_op(op, oldelem, v, e, &do_write) & mask;
+            if (do_write) {
+                uint32_t newword = (oldword & ~(mask << shift)) | (newelem << shift);
+                *wp = (int32_t)newword;
+            }
+            return oldelem;
+        }
+
+        /* Fast path for 4-byte aligned access (Int32Array) */
+        if (esize == 4) {
+            /* load: just return current value */
+            if (op == 7) {
+                return (uint32_t)lr_atomic_load_32(wp);
+            }
+            /* CAS loop for 4-byte operations.
+             * NOTE: do NOT pre-filter with atomics_apply_op(op, 0, ...) here.
+             * compareExchange must decide match/mismatch against the *real*
+             * in-memory value, not a fake old=0; pre-filtering with old=0 makes
+             * every expected!=0 compareExchange look like a non-match, which
+             * skips the CAS write and corrupts the element (Atomics.compareExchange
+             * then only reads, never replaces). */
+            switch (op) {
+            case 0: /* add */
+                return (uint32_t)lr_atomic_fetch_add_32(wp, (int32_t)v);
+            case 1: /* sub */
+                return (uint32_t)lr_atomic_fetch_add_32(wp, -(int32_t)v);
+            case 2: /* and */
+                for (;;) {
+                    uint32_t ow = (uint32_t)lr_atomic_load_32(wp);
+                    if ((uint32_t)lr_atomic_cas_32(wp, (int32_t)ow, (int32_t)(ow & v)) == ow)
+                        return ow;
+                }
+            case 3: /* or */
+                for (;;) {
+                    uint32_t ow = (uint32_t)lr_atomic_load_32(wp);
+                    if ((uint32_t)lr_atomic_cas_32(wp, (int32_t)ow, (int32_t)(ow | v)) == ow)
+                        return ow;
+                }
+            case 4: /* xor */
+                for (;;) {
+                    uint32_t ow = (uint32_t)lr_atomic_load_32(wp);
+                    if ((uint32_t)lr_atomic_cas_32(wp, (int32_t)ow, (int32_t)(ow ^ v)) == ow)
+                        return ow;
+                }
+            case 5: /* exchange */
+                return (uint32_t)lr_atomic_xchg_32(wp, (int32_t)v);
+            case 6: /* compareExchange */
+                if (getenv("LR_DEBUG_ATOMICS")) {
+                    fprintf(stderr, "[ATOM] CE wp=%p *wp=%d e=%d v=%d\n",
+                            (void*)wp, (int)lr_atomic_load_32(wp), (int)e, (int)v);
+                }
+                return (uint32_t)lr_atomic_cas_32(wp, (int32_t)e, (int32_t)v);
+            case 8: /* store */
+                lr_atomic_store_32(wp, (int32_t)v);
+                return v;
+            default:
+                break;
+            }
+        }
+        /* Generic CAS loop for sub-4-byte access */
         for (;;) {
             uint32_t oldword = (uint32_t)lr_atomic_load_32(wp);
             uint32_t oldelem = (oldword >> shift) & mask;
@@ -3813,11 +3970,11 @@ static LRValue atomics_op(LRContext *ctx, LRValue ta, LRValue index, LRValue val
     uint8_t *base = atomics_prepare(ctx, ta, index, &tad, &bi, &buf_size);
     if (!base) return JS_EXCEPTION;
 
-    double dv = 0, de = 0;
-    if (value.tag != LR_TYPE_UNDEFINED)    JS_ToFloat64(ctx, &dv, value);
-    if (expected.tag != LR_TYPE_UNDEFINED) JS_ToFloat64(ctx, &de, expected);
-    uint32_t v = (uint32_t)(int64_t)dv;
-    uint32_t e = (uint32_t)(int64_t)de;
+    int32_t iv = 0, ie = 0;
+    if (value.tag != LR_TYPE_UNDEFINED)    JS_ToInt32(ctx, &iv, value);
+    if (expected.tag != LR_TYPE_UNDEFINED) JS_ToInt32(ctx, &ie, expected);
+    uint32_t v = (uint32_t)iv;
+    uint32_t e = (uint32_t)ie;
 
     uint32_t old = atomics_cas_apply(base, buf_size, bi,
                                      tad->element_size, op, v, e);
@@ -3980,6 +4137,137 @@ static const JSCFunctionListEntry js_atomics_funcs[] = {
     JS_CFUNC_DEF("notify",          3, js_atomics_notify),
 };
 
+/* ── IOME586 Distillation JS API ────────────────────────────────────────── */
+
+static JSValue js_iome586_distill(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    LR_Runtime *rt = (LR_Runtime *)JS_GetContextOpaque(ctx);
+    if (!rt) return JS_ThrowTypeError(ctx, "IOME586.distill: no runtime");
+
+    /* arg 0: source text */
+    if (argc < 1 || !JS_IsString(argv[0]))
+        return JS_ThrowTypeError(ctx, "IOME586.distill: first argument must be a string");
+    const char *source = JS_ToCString(ctx, argv[0]);
+    if (!source) return JS_ThrowTypeError(ctx, "IOME586.distill: failed to read source");
+    size_t source_len = strlen(source);
+
+    /* arg 1: options (optional) */
+    LR_DistillConfig cfg;
+    lr_iome586_distill_config_default(&cfg);
+    if (argc >= 2 && JS_IsObject(argv[1])) {
+        JSValue sv = JS_GetPropertyStr(ctx, argv[1], "sandboxes");
+        if (JS_IsNumber(sv)) {
+            int32_t tmp;
+            JS_ToInt32(ctx, &tmp, sv);
+            cfg.max_sandboxes = tmp;
+        }
+        JS_FreeValue(ctx, sv);
+
+        JSValue rv = JS_GetPropertyStr(ctx, argv[1], "rounds");
+        if (JS_IsNumber(rv)) {
+            int32_t tmp;
+            JS_ToInt32(ctx, &tmp, rv);
+            cfg.max_rounds = tmp;
+        }
+        JS_FreeValue(ctx, rv);
+
+        JSValue tv = JS_GetPropertyStr(ctx, argv[1], "timeout");
+        if (JS_IsNumber(tv)) {
+            int32_t tmp;
+            JS_ToInt32(ctx, &tmp, tv);
+            cfg.timeout_ms = tmp;
+        }
+        JS_FreeValue(ctx, tv);
+    }
+
+    /* Run distillation */
+    LR_DistillResult *result = lr_iome586_distill_run(rt, source, source_len, &cfg);
+    JS_FreeCString(ctx, source);
+
+    if (!result)
+        return JS_ThrowTypeError(ctx, "IOME586.distill: distillation failed");
+
+    /* Build JS result object */
+    JSValue obj = JS_NewObject(ctx);
+
+    /* total_ms */
+    JS_SetPropertyStr(ctx, obj, "total_ms", JS_NewFloat64(ctx, result->total_ms));
+
+    /* total_positions */
+    JS_SetPropertyStr(ctx, obj, "total_positions", JS_NewInt32(ctx, result->total_positions));
+
+    /* combined (string) */
+    if (result->combined) {
+        JS_SetPropertyStr(ctx, obj, "combined",
+                          JS_NewString(ctx, result->combined));
+    }
+
+    /* rounds array */
+    JSValue rounds_arr = JS_NewArray(ctx);
+    for (int32_t r = 0; r < result->num_rounds; r++) {
+        JSValue rnd = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, rnd, "elapsed_ms",
+                          JS_NewFloat64(ctx, result->rounds[r].elapsed_ms));
+        JS_SetPropertyStr(ctx, rnd, "num_sandboxes",
+                          JS_NewInt32(ctx, result->rounds[r].num_sandboxes));
+
+        /* chunks array */
+        JSValue chunks = JS_NewArray(ctx);
+        for (int32_t c = 0; c < result->rounds[r].num_chunks; c++) {
+            if (result->rounds[r].results[c]) {
+                JS_SetPropertyUint32(ctx, chunks, (uint32_t)c,
+                    JS_NewString(ctx, result->rounds[r].results[c]));
+            }
+        }
+        JS_SetPropertyStr(ctx, rnd, "chunks", chunks);
+        JS_SetPropertyUint32(ctx, rounds_arr, (uint32_t)r, rnd);
+    }
+    JS_SetPropertyStr(ctx, obj, "rounds", rounds_arr);
+
+    lr_iome586_distill_result_free(result);
+    return obj;
+}
+
+static JSValue js_iome586_analyze(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    if (argc < 1 || !JS_IsString(argv[0]))
+        return JS_ThrowTypeError(ctx, "IOME586.analyze: first argument must be a string");
+
+    const char *source = JS_ToCString(ctx, argv[0]);
+    if (!source) return JS_ThrowTypeError(ctx, "IOME586.analyze: failed to read source");
+    size_t source_len = strlen(source);
+
+    LR_DistillAnalysis *analysis = lr_iome586_distill_analyze(NULL, source, source_len);
+    JS_FreeCString(ctx, source);
+
+    if (!analysis)
+        return JS_ThrowTypeError(ctx, "IOME586.analyze: analysis failed");
+
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "num_positions",
+                      JS_NewInt32(ctx, analysis->num_positions));
+
+    JSValue positions = JS_NewArray(ctx);
+    for (int32_t i = 0; i < analysis->num_positions; i++) {
+        JSValue pos = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, pos, "line", JS_NewInt32(ctx, analysis->positions[i].line));
+        JS_SetPropertyStr(ctx, pos, "column", JS_NewInt32(ctx, analysis->positions[i].column));
+        if (analysis->positions[i].source_text) {
+            JS_SetPropertyStr(ctx, pos, "source_text",
+                              JS_NewString(ctx, analysis->positions[i].source_text));
+        }
+        JS_SetPropertyUint32(ctx, positions, (uint32_t)i, pos);
+    }
+    JS_SetPropertyStr(ctx, obj, "positions", positions);
+
+    lr_iome586_distill_analysis_free(analysis);
+    return obj;
+}
+
 /* ========================================================================
  *  9. INITIALIZATION FUNCTION
  * ======================================================================== */
@@ -4102,8 +4390,7 @@ void lr_builtins_extra_init(LR_Runtime *rt)
 
         /* Well-known symbols */
         #define SYMBOL_WELL_KNOWN(name) do { \
-            JSValue s = JS_NewObject(ctx); \
-            JS_SetOpaque(s, strdup("Symbol." name)); \
+            JSValue s = lr_new_symbol_str(ctx, "Symbol." name); \
             JS_SetPropertyStr(ctx, sym_ctor, name, s); \
         } while(0)
 
@@ -4323,6 +4610,22 @@ void lr_builtins_extra_init(LR_Runtime *rt)
         JS_FreeValue(ctx, atomics_obj);
     }
 
+    /* ── Register IOME586 (distillation engine) ────────────────────────── */
+    {
+        JSValue iome586_obj = JS_NewObject(ctx);
+
+        /* distill(source, options) – run distillation pipeline */
+        JSValue distill_fn = JS_NewCFunction(ctx, js_iome586_distill, "distill", 2);
+        JS_SetPropertyStr(ctx, iome586_obj, "distill", distill_fn);
+
+        /* analyze(source) – analyze script for parallelizable positions */
+        JSValue analyze_fn = JS_NewCFunction(ctx, js_iome586_analyze, "analyze", 1);
+        JS_SetPropertyStr(ctx, iome586_obj, "analyze", analyze_fn);
+
+        JS_SetPropertyStr(ctx, global, "IOME586", JS_DupValue(ctx, iome586_obj));
+        JS_FreeValue(ctx, iome586_obj);
+    }
+
     JS_FreeValue(ctx, global);
-    lr_log(rt, LR_LOG_DEBUG, "Extra built-in objects initialized (Math, JSON, Date, RegExp, Symbol, Error subclasses, WeakMap, WeakSet, TypedArray, DataView)");
+    lr_log(rt, LR_LOG_DEBUG, "Extra built-in objects initialized (Math, JSON, Date, RegExp, Symbol, Error subclasses, WeakMap, WeakSet, TypedArray, DataView, IOME586)");
 }

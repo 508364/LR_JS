@@ -119,7 +119,7 @@ static void lexer_skip_whitespace(Lexer *lex)
 
 /* ── Token Construction ───────────────────────────────────────────────── */
 
-static Token make_token_from(Lexer *lex, TokenType type, size_t start_pos)
+static Token make_token_from(Lexer *lex, LRTokType type, size_t start_pos)
 {
     Token t;
     t.type = type;
@@ -172,7 +172,7 @@ static Token make_error(Lexer *lex, const char *msg)
 
 /* ── Keyword Lookup ───────────────────────────────────────────────────── */
 
-static TokenType lookup_keyword(const char *str, size_t len)
+static LRTokType lookup_keyword(const char *str, size_t len)
 {
     if (len == 0) return TOK_IDENTIFIER;
     /* Use a simple switch on first char + length for speed */
@@ -664,7 +664,7 @@ Token lexer_next(Lexer *lex)
         }
 
         size_t ident_len = lex->pos - start;
-        TokenType kw = lookup_keyword(lex->src + start, ident_len);
+        LRTokType kw = lookup_keyword(lex->src + start, ident_len);
 
         if (kw == TOK_BOOL_LIT) {
             Token t = make_token_from(lex, TOK_BOOL_LIT, start);
@@ -977,7 +977,7 @@ void lexer_skip(Lexer *lex)
 
 /* ── Utility Functions ────────────────────────────────────────────────── */
 
-const char *token_type_name(TokenType type)
+const char *token_type_name(LRTokType type)
 {
     switch (type) {
     case TOK_EOF: return "EOF";

@@ -8,6 +8,28 @@
 #include "lr_platform.h"
 #include "lr_runtime.h"
 
+/* ── High-resolution monotonic time source ────────────────────────────── */
+/* NOTE: clock() on many Unix systems has only 10ms granularity
+ * (CLOCKS_PER_SEC == 100), which destroys benchmark accuracy. Use
+ * clock_gettime(CLOCK_MONOTONIC) where available (ns resolution) and
+ * fall back to clock() only when neither is present. */
+
+static double lr_hires_now_ms(void)
+{
+#if defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#elif defined(_WIN32)
+    LARGE_INTEGER freq, cnt;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&cnt);
+    return (double)cnt.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+    return (double)clock() * 1000.0 / CLOCKS_PER_SEC;
+#endif
+}
+
 /* ── Performance data ─────────────────────────────────────────────────── */
 
 typedef struct {
@@ -19,8 +41,7 @@ static PerfData *perf_get_data(LR_Runtime *rt)
     static PerfData data;
     static int initialized = 0;
     if (!initialized) {
-        clock_t now = clock();
-        data.start_time_ms = (double)now * 1000.0 / CLOCKS_PER_SEC;
+        data.start_time_ms = lr_hires_now_ms();
         initialized = 1;
     }
     return &data;
@@ -33,8 +54,7 @@ static JSValue lr_performance_now(JSContext *ctx, JSValueConst this_val,
 {
     LR_Runtime *rt = JS_GetContextOpaque(ctx);
     PerfData *perf = perf_get_data(rt);
-    clock_t now = clock();
-    double now_ms = (double)now * 1000.0 / CLOCKS_PER_SEC;
+    double now_ms = lr_hires_now_ms();
     double elapsed = now_ms - perf->start_time_ms;
     return JS_NewFloat64(ctx, elapsed);
 }
@@ -51,8 +71,7 @@ static JSValue lr_performance_mark(JSContext *ctx, JSValueConst this_val,
 
     LR_Runtime *rt = JS_GetContextOpaque(ctx);
     PerfData *perf = perf_get_data(rt);
-    clock_t now = clock();
-    double now_ms = (double)now * 1000.0 / CLOCKS_PER_SEC;
+    double now_ms = lr_hires_now_ms();
     double elapsed = now_ms - perf->start_time_ms;
 
     /* Store mark in a global marks object */
@@ -93,8 +112,7 @@ static JSValue lr_performance_measure(JSContext *ctx, JSValueConst this_val,
 
     LR_Runtime *rt = JS_GetContextOpaque(ctx);
     PerfData *perf = perf_get_data(rt);
-    clock_t now = clock();
-    double now_ms = (double)now * 1000.0 / CLOCKS_PER_SEC;
+    double now_ms = lr_hires_now_ms();
     double elapsed = now_ms - perf->start_time_ms;
 
     double start_time = 0;

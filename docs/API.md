@@ -1,31 +1,31 @@
-# L/R_JS API Reference
+# L/R\_JS API Reference
 
 > 全功能轻量级浏览器 JS 运行器 | Pure C | ES2022+ | Multithreaded | Async Sandbox
 
----
+***
 
 ## 1. 概述
 
-L/R_JS 是一个用纯 C 语言实现的轻量级浏览器 JavaScript 运行器，支持 ES2022+ 特性，提供多线程、多任务、异步沙箱执行环境，内建高性能 JS 引擎。
+L/R\_JS 是一个用纯 C 语言实现的轻量级浏览器 JavaScript 运行器，支持 ES2022+ 特性，提供多线程、多任务、异步沙箱执行环境，内建高性能 JS 引擎。
 
-**v0.1.1+**：执行引擎为直接/间接线程式字节码 VM，AST 树遍历已退役。函数体字节码执行（bc_body_cache MRU O(1)），arguments 惰性创建，Array reduce C 直读，BC_PUSH_THIS opcode，AST 依赖分析并行拆分（`--parallel N` 1-16），IOME586 字节码预热缓存 + CAS 预编译。基准 2796→1861ms (-33%)，vs V8 45×。
+**v0.2.0**：执行引擎为直接/间接线程式字节码 VM，AST 树遍历已退役。闭包变量缓存（P0）、基于形状的属性 IC、纯函数 memoization、`Atomics.compareExchange` 正确性验证。基准 stress\_test\_noawait.js 3996ms vs V8 198ms (20.1×)，stress\_run.js 148ms vs V8 15ms (9.9×)。SAB 校验和与 V8 完全一致（32145560）。
 
 ### 1.1 支持平台
 
-| 平台 | 架构 | 编译器 | 最低版本 |
-|------|------|--------|----------|
-| **Linux** | x86_64, x86, aarch64, armv7 | GCC 9+, Clang 12+ | kernel 3.10+ |
-| **macOS** | x86_64, arm64 (Apple Silicon) | Clang 14+ | macOS 11+ |
-| **Windows** | x86_64, x86, aarch64 | MSVC 2022+, MinGW-w64 | Windows 7+ |
-| **FreeBSD** | x86_64, aarch64 | Clang 14+ | FreeBSD 13+ |
-| **OpenBSD** | x86_64, aarch64 | Clang 14+ | OpenBSD 7.0+ |
-| **NetBSD** | x86_64, aarch64 | GCC 10+ | NetBSD 9.0+ |
-| **Android** | aarch64, armv7, x86_64 | NDK r25+ | API 24+ |
-| **iOS** | arm64 | Xcode 15+ | iOS 14+ |
+| 平台          | 架构                             | 编译器                                                                                  | 最低版本         |
+| ----------- | ------------------------------ | ------------------------------------------------------------------------------------ | ------------ |
+| **Linux**   | x86\_64, x86, aarch64, armv7   | GCC 9+, Clang 12+                                                                    | kernel 3.10+ |
+| **macOS**   | x86\_64, arm64 (Apple Silicon) | Clang 14+                                                                            | macOS 11+    |
+| **Windows** | x86\_64, x86, aarch64          | MSVC 2022+, [MinGW-w64](https://www.mingw-w64.org/)（**推荐**，GCC computed goto 快 4-6×） | Windows 7+   |
+| **FreeBSD** | x86\_64, aarch64               | Clang 14+                                                                            | FreeBSD 13+  |
+| **OpenBSD** | x86\_64, aarch64               | Clang 14+                                                                            | OpenBSD 7.0+ |
+| **NetBSD**  | x86\_64, aarch64               | GCC 10+                                                                              | NetBSD 9.0+  |
+| **Android** | aarch64, armv7, x86\_64        | NDK r25+                                                                             | API 24+      |
+| **iOS**     | arm64                          | Xcode 15+                                                                            | iOS 14+      |
 
 ### 1.2 通过条件编译支持跨平台
 
-```c
+```C
 // 内存检测
 #ifdef __linux__
     // /proc/meminfo
@@ -52,7 +52,7 @@ L/R_JS 是一个用纯 C 语言实现的轻量级浏览器 JavaScript 运行器�
 #endif
 ```
 
----
+***
 
 ## 2. 快速开始
 
@@ -121,66 +121,67 @@ cl myapp.c /I path\to\LR_JS\include /link path\to\LR_JS\build\lr_js.lib
 gcc -o myapp.exe myapp.c -I/path/to/LR_JS/include -L/path/to/LR_JS/build -llr_js -lpthread -lws2_32
 ```
 
----
+***
 
 ## 3. 核心 API
 
 ### 3.1 运行时管理
 
-| 函数 | 说明 |
-|------|------|
+| 函数                                           | 说明    |
+| -------------------------------------------- | ----- |
 | `LR_Runtime *lr_runtime_new(LR_Config *cfg)` | 创建运行时 |
-| `void lr_runtime_free(LR_Runtime *rt)` | 销毁运行时 |
-| `const char *lr_version(void)` | 获取版本号 |
+| `void lr_runtime_free(LR_Runtime *rt)`       | 销毁运行时 |
+| `const char *lr_version(void)`               | 获取版本号 |
 
 ### 3.2 脚本执行
 
-| 函数 | 说明 |
-|------|------|
-| `int lr_eval(rt, src, len, filename)` | 执行字符串脚本 |
-| `int lr_eval_file(rt, filename)` | 执行文件脚本 |
-| `int lr_eval_module(rt, src, len, filename)` | 执行 ES Module |
-| `int lr_eval_module_file(rt, filename)` | 执行 ES Module 文件 |
+| 函数                                           | 说明              |
+| -------------------------------------------- | --------------- |
+| `int lr_eval(rt, src, len, filename)`        | 执行字符串脚本         |
+| `int lr_eval_file(rt, filename)`             | 执行文件脚本          |
+| `int lr_eval_module(rt, src, len, filename)` | 执行 ES Module    |
+| `int lr_eval_module_file(rt, filename)`      | 执行 ES Module 文件 |
 
 ### 3.3 事件循环
 
-| 函数 | 说明 |
-|------|------|
-| `int lr_event_loop_pending(rt)` | 检查是否有待处理任务 |
-| `void lr_event_loop_run(rt)` | 运行事件循环 |
-| `void lr_event_loop_stop(rt)` | 停止事件循环 |
+| 函数                                                              | 说明                                      |
+| --------------------------------------------------------------- | --------------------------------------- |
+| `int lr_event_loop_run(LR_Runtime *rt)`                         | 运行事件循环直到无待处理任务，成功返回 0，错误返回 -1           |
+| `int lr_event_loop_run_timeout(LR_Runtime *rt, int timeout_ms)` | 运行事件循环最多 `timeout_ms` 毫秒，成功返回 0，错误返回 -1 |
+| `int lr_event_loop_pending(LR_Runtime *rt)`                     | 检查事件循环是否有待处理任务                          |
+| `void lr_event_loop_stop(LR_Runtime *rt)`                       | 在下一次迭代时停止事件循环                           |
 
 ### 3.4 内存管理
 
-| 函数 | 说明 |
-|------|------|
-| `void lr_gc(rt)` | 手动触发 GC |
-| `void lr_gc_print_stats(rt, fp)` | 打印 GC 统计 |
-| `void lr_gc_reset_stats(rt)` | 重置 GC 统计 |
-| `void lr_compute_memory_usage(rt, usage)` | 获取内存使用详情 |
-| `void lr_dump_memory_usage(rt, fp)` | 打印内存使用详情 |
-| `int64_t lr_get_available_memory(void)` | 获取系统可用内存 |
-| `int lr_check_system_memory(min_bytes)` | 检查系统内存是否充足 |
+| 函数                                        | 说明         |
+| ----------------------------------------- | ---------- |
+| `void lr_gc(rt)`                          | 手动触发 GC    |
+| `void lr_gc_print_stats(rt, fp)`          | 打印 GC 统计   |
+| `void lr_gc_reset_stats(rt)`              | 重置 GC 统计   |
+| `void lr_compute_memory_usage(rt, usage)` | 获取内存使用详情   |
+| `void lr_dump_memory_usage(rt, fp)`       | 打印内存使用详情   |
+| `int64_t lr_get_available_memory(void)`   | 获取系统可用内存   |
+| `int lr_check_system_memory(min_bytes)`   | 检查系统内存是否充足 |
 
 ### 3.5 IOME586 结果缓存
 
-| 函数 | 说明 |
-|------|------|
+| 函数                                     | 说明                              |
+| -------------------------------------- | ------------------------------- |
 | `void lr_bytecode_cache_stats(rt, fp)` | 打印缓存统计（内部封装 `lr_iome586_stats`） |
-| `void lr_bytecode_cache_clear(rt)` | 清空缓存（内部封装 `lr_iome586_clear`） |
+| `void lr_bytecode_cache_clear(rt)`     | 清空缓存（内部封装 `lr_iome586_clear`）   |
 
 ### 3.6 错误处理
 
-| 函数 | 说明 |
-|------|------|
+| 函数                                     | 说明        |
+| -------------------------------------- | --------- |
 | `int lr_get_last_error(rt, buf, size)` | 获取最后的错误信息 |
-| `void lr_clear_last_error(rt)` | 清除错误状态 |
+| `void lr_clear_last_error(rt)`         | 清除错误状态    |
 
----
+***
 
 ## 4. 配置结构
 
-### 4.1 LR_Config
+### 4.1 LR\_Config
 
 ```c
 typedef struct LR_Config {
@@ -211,15 +212,35 @@ typedef struct LR_Config {
     // 执行
     int     timeout_ms;             // 执行超时, 0=无限制
     int     strict_mode;            // 严格模式
-    int     debug_mode;             // 调试模式
+    int     debug_mode;             // 调试模式（保留字段）
 
     // 日志
-    int     log_level;              // 日志级别: 0=关闭, 1=错误, 2=警告, 3=信息, 4=调试
+    LR_LogLevel log_level;          // 日志级别: LR_LOG_NONE, LR_LOG_ERROR, LR_LOG_WARN, LR_LOG_INFO, LR_LOG_DEBUG
     FILE   *log_file;               // 日志输出文件, NULL=stderr
 
     // 编译
     int     dump_bytecode;          // 导出字节码
     int     strip_debug_info;       // 剥离调试信息
+
+    // 多线程
+    int     enable_thread_pool;     // 启用多线程执行
+    int     thread_pool_size;       // Worker 线程数 (0=自动)
+    int     enable_sandbox;         // 启用沙箱隔离
+
+    // 性能优化
+    int     enable_perf_optimizations; // 字节码缓存、并发 GC 等
+
+    // 渲染器
+    int     enable_renderer;        // 启用渲染器桥接
+
+    // 模块解析
+    const char **module_paths;      // NULL 结尾的搜索路径数组
+    int     module_paths_count;     // 路径数量
+
+    // I/O 重定向
+    FILE   *stdin_override;         // 标准输入重定向
+    FILE   *stdout_override;        // 标准输出重定向
+    FILE   *stderr_override;        // 标准错误重定向
 } LR_Config;
 ```
 
@@ -267,7 +288,7 @@ typedef struct LR_MemoryUsage {
 } LR_MemoryUsage;
 ```
 
----
+***
 
 ## 5. 沙箱 API
 
@@ -338,11 +359,13 @@ lr_sandbox_destroy(mgr, sb);
 ```
 
 示例：
+
 ```
 ./sandbox_logs/2026-07-19-3-a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6.log
 ```
 
 日志格式：
+
 ```
 [2026-07-19 14:30:25.123456] [INFO ] [eval:1] Sandbox created: my-sandbox (uuid=a1b2c3d4-...)
 [2026-07-19 14:30:25.234567] [INFO ] [eval:1] Eval started: <sandbox>
@@ -352,6 +375,7 @@ lr_sandbox_destroy(mgr, sb);
 ```
 
 日志 API：
+
 ```c
 // 写入日志 (线程安全, 非阻塞)
 lr_slog_info(sb->log, eval_id, "Custom message: %s", "value");
@@ -365,7 +389,7 @@ lr_sandbox_log_flush(sb->log);
 lr_sandbox_log_stats(sb->log, stdout);
 ```
 
----
+***
 
 ## 6. IOME586 结果缓存
 
@@ -383,6 +407,7 @@ lr_sandbox_log_stats(sb->log, stdout);
 缓存命中的模块行为与冷跑完全一致。
 
 **热路径 = 静态还原 + 动态重跑**（这是缓存能覆盖全量 ES2022 的关键）：
+
 - **静态部分直接还原**：`lr_iome586_restore_globals` 还原全局变量绑定快照，原语全局变量立即就位；
 - **动态部分重新跑**：对反序列化的 AST 重新执行。解释器重建函数/类绑定（保持可调用）、
   重跑 I/O 与副作用、重算原语，因此无论脚本多"动态"，结果始终正确。
@@ -395,6 +420,7 @@ XOR（历史版本的 KEYED 归档仍可被兼容加载）。文件描述区以�
 版本号的副本。
 
 **容器格式**（魔数 `"IOME586\0"`）：
+
 ```
 Magic          "IOME586\0"     8 bytes
 ContainerVer   uint32          4 bytes
@@ -414,6 +440,7 @@ Payload        variable                  (LZ4 压缩；无加密，CRC32/SourceH
 ```
 
 **安全模型（v0.1.0 加固）**：
+
 - **敏感值排除**：快照跳过名称命中敏感词（token/secret/password/credential/apikey/
   auth/bearer/cookie/session/private 等）的全局绑定，避免令牌/密钥随缓存落盘泄露。
 - **字符串可控**：`snapshot_strings` 默认开启（记录字符串字面量绑定）；`--iome586-no-strings`
@@ -423,7 +450,6 @@ Payload        variable                  (LZ4 压缩；无加密，CRC32/SourceH
 - **BOM 基线重映射保护**：运行时在注册完内建 API 后捕获一份"已存在全局属性"基线，
   还原时跳过这些属于引擎/BOM 的名称，避免缓存恢复污染内建 API。
 
-
 **Payload 内为命名条目**（`u16 name_len|name|u32 data_len|data`），相当于压缩包内的
 多个二进制文件：`meta`（元信息）、`path`（解释路径/方法）、`config`（配置）、
 `init`（初始化内容与结果）、`ast`（序列化 AST）、`nodes`（每级节点结果）、
@@ -431,24 +457,24 @@ Payload        variable                  (LZ4 压缩；无加密，CRC32/SourceH
 
 #### 6.1.0 缓存了哪些内容？能否直接恢复？（v0.1.1）
 
-| 缓存项 | 存放位置 | 是否持久化 | 暖跑能否直接恢复 |
-|--------|----------|-----------|------------------|
-| JS 脚本名称 | header/`meta` | ✅ | ✅ 直接读取 |
-| JS 脚本哈希（`source_hash`） | header | ✅ | ✅ 直接读取（用于命中校验） |
-| 状态（写入中 / 已归档） | header `status` | ✅ | ✅ 直接读取；`writing` 视为脏归档并丢弃 |
-| 时间（`created_at` / 源文件 `mtime`） | header | ✅ | ✅ 直接读取 |
-| 优化比值（`opt_ratio_x1e6`） | header | ✅ | ✅ 直接读取（15% 规则判定） |
-| 版本号（容器版本 + 引擎版本 FNV-1a32） | header | ✅ | ✅ 直接读取；不匹配即整包作废 |
-| 校验码（`payload_crc32`） | header | ✅ | ✅ 直接读取校验 |
-| JS 脚本的解释路径 | `path` | ✅ | ✅ 直接恢复 |
-| 配置 | `config` | ✅ | ✅ 直接恢复 |
-| 初始化内容与结果 | `init` | ✅ | ✅ 直接恢复 |
-| 每一级节点的结果 | `nodes` | ✅ | ⚠️ 恢复为**记录**（用于比对/统计），不直接跳过求值 |
-| AST | `ast`（`LRA` v3） | ✅ | ✅ 直接恢复，跳过词法/语法分析 |
-| 字节码 | `bytecode`（`LRBC` v2） | ✅ | ⚠️ 仅当程序**不含 AST 节点引用**时可直接恢复；否则反序列化返回 `NULL`，由 AST 重新编译（毫秒级） |
-| 状态机状态 | `state` | ✅ | ✅ 直接恢复 |
-| 运行状态 | `state` | ✅ | ⚠️ 恢复为元信息；执行仍从头开始，不做“断点续跑” |
-| 全局变量绑定对象 | `globals` | ✅（`snapshot_strings` 默认开） | ❌ 默认**不恢复**（`restore_globals=0`）；需显式 `--iome586-restore-globals` 才注入 |
+| 缓存项                            | 存放位置                  | 是否持久化                     | 暖跑能否直接恢复                                                             |
+| ------------------------------ | --------------------- | ------------------------- | -------------------------------------------------------------------- |
+| JS 脚本名称                        | header/`meta`         | ✅                         | ✅ 直接读取                                                               |
+| JS 脚本哈希（`source_hash`）         | header                | ✅                         | ✅ 直接读取（用于命中校验）                                                       |
+| 状态（写入中 / 已归档）                  | header `status`       | ✅                         | ✅ 直接读取；`writing` 视为脏归档并丢弃                                            |
+| 时间（`created_at` / 源文件 `mtime`） | header                | ✅                         | ✅ 直接读取                                                               |
+| 优化比值（`opt_ratio_x1e6`）         | header                | ✅                         | ✅ 直接读取（15% 规则判定）                                                     |
+| 版本号（容器版本 + 引擎版本 FNV-1a32）      | header                | ✅                         | ✅ 直接读取；不匹配即整包作废                                                      |
+| 校验码（`payload_crc32`）           | header                | ✅                         | ✅ 直接读取校验                                                             |
+| JS 脚本的解释路径                     | `path`                | ✅                         | ✅ 直接恢复                                                               |
+| 配置                             | `config`              | ✅                         | ✅ 直接恢复                                                               |
+| 初始化内容与结果                       | `init`                | ✅                         | ✅ 直接恢复                                                               |
+| 每一级节点的结果                       | `nodes`               | ✅                         | ⚠️ 恢复为**记录**（用于比对/统计），不直接跳过求值                                        |
+| AST                            | `ast`（`LRA` v3）       | ✅                         | ✅ 直接恢复，跳过词法/语法分析                                                     |
+| 字节码                            | `bytecode`（`LRBC` v2） | ✅                         | ⚠️ 仅当程序**不含 AST 节点引用**时可直接恢复；否则反序列化返回 `NULL`，由 AST 重新编译（毫秒级）         |
+| 状态机状态                          | `state`               | ✅                         | ✅ 直接恢复                                                               |
+| 运行状态                           | `state`               | ✅                         | ⚠️ 恢复为元信息；执行仍从头开始，不做“断点续跑”                                           |
+| 全局变量绑定对象                       | `globals`             | ✅（`snapshot_strings` 默认开） | ❌ 默认**不恢复**（`restore_globals=0`）；需显式 `--iome586-restore-globals` 才注入 |
 
 结论：**结构性内容（AST、字节码、路径、配置、初始化、元信息、状态机状态）可直接恢复**；
 **运行期语义状态（全局变量绑定、执行进度）默认不恢复**，而是重新执行以保证语义正确
@@ -463,22 +489,22 @@ Payload        variable                  (LZ4 压缩；无加密，CRC32/SourceH
 反序列化时校验魔数与版本号，若不匹配（魔数非法或版本不兼容）直接返回 `NULL`，
 归档被拒绝加载并删除，下次运行自动重新冷跑并重建缓存（见 §6.4）。
 
-**字面量序列化（`AST_LITERAL`）采用显式类型标记 `ltag`**，取值 5 类：
+**字面量序列化（`AST_LITERAL`）采用显式类型标记** **`ltag`**，取值 5 类：
 
-| `ltag` | 类型 | 反序列化处理 |
-|--------|------|--------------|
-| 0 | bool（`true`/`false`） | 读 `u32` 布尔值，仅写入 `u.bool_val.val` |
-| 1 | string | 读字符串载荷 |
-| 2 | number（`double`） | 读 `f64` 数值 |
-| 3 | `null` | 置 `u.number.num = 0.0`，标记 `TOK_NULL_LIT` |
-| 4 | `undefined` | 置 `u.number.num = -1.0`，标记 `TOK_UNDEFINED_LIT` |
+| `ltag` | 类型                   | 反序列化处理                                         |
+| ------ | -------------------- | ---------------------------------------------- |
+| 0      | bool（`true`/`false`） | 读 `u32` 布尔值，仅写入 `u.bool_val.val`               |
+| 1      | string               | 读字符串载荷                                         |
+| 2      | number（`double`）     | 读 `f64` 数值                                     |
+| 3      | `null`               | 置 `u.number.num = 0.0`，标记 `TOK_NULL_LIT`       |
+| 4      | `undefined`          | 置 `u.number.num = -1.0`，标记 `TOK_UNDEFINED_LIT` |
 
-> **已知修复（v0.7.0 / `LRA` v3）**：早期版本在反序列化 bool 字面量时，写入
+> **已知修复（v0.7.0 /** **`LRA`** **v3）**：早期版本在反序列化 bool 字面量时，写入
 > `u.bool_val.val` 后又写入 `u.number.num`（`double`）。由于 `bool_val` 与 `number`
 > 在 `ASTNode` 的 union 中内存重叠，`double 1.0` 的低 4 字节为零，会把 `true`
 > 覆盖成 `false`。后果是暖跑中 `let ok = true` 变成 `false`，导致 `if(!ok) throw`
 > 误触发、丢弃后续语句（如缓存命中后末句 `MODULE TEST OK` 丢失）。v3 改为反序列化
-> bool 时**只写 `bool_val.val`**，与解析期的常量节点（仅设 `bool_val.val`）保持一致，
+> bool 时**只写** **`bool_val.val`**，与解析期的常量节点（仅设 `bool_val.val`）保持一致，
 > 该 bug 已彻底修复并验证（冷/暖跑输出一致）。
 
 ### 6.2 API
@@ -499,7 +525,7 @@ lr_bytecode_cache_clear(rt);           // 封装 lr_iome586_clear
 
 ### 6.3 缓存策略
 
-- **15% 规则**：解析耗时收益 (parse_us / total_us) 低于 15% 时不缓存，commit 时自动丢弃归档
+- **15% 规则**：解析耗时收益 (parse\_us / total\_us) 低于 15% 时不缓存，commit 时自动丢弃归档
 - **边运行边缓存**：`lr_iome586_begin`（WRITING）→ 执行 → `lr_iome586_commit`（ARCHIVED）；执行抛异常时 `lr_iome586_abort` 回滚
 - **BOM 支持**：加载脚本时自动剥离 UTF-8 BOM，UTF-16 LE/BE 自动转码为 UTF-8
 
@@ -512,7 +538,7 @@ lr_bytecode_cache_clear(rt);           // 封装 lr_iome586_clear
 - 手动失效：`lr_iome586_invalidate(&rt->iome586, "script.js")`
 - **落盘撤回**：begin 时保留 `.bak` 备份，`lr_iome586_revert` 可回滚到上一版归档（CLI：`--iome586-revert <js>`）
 
----
+***
 
 ## 7. 内置浏览器 API
 
@@ -590,7 +616,7 @@ localStorage.clear();
 
 ### 7.8 Fetch
 
-> **注意：** L/R_JS **不内置任何网络功能**。引擎本身不发任何网络包；`fetch()` 通过 `LR_HttpWrapper` 接口将请求委托给宿主应用程序（浏览器、WebUI 等）。
+> **注意：** L/R\_JS **不内置任何网络功能**。引擎本身不发任何网络包；`fetch()` 通过 `LR_HttpWrapper` 接口将请求委托给宿主应用程序（浏览器、WebUI 等）。
 > 宿主必须调用 `lr_http_set_wrapper()` 注册包装器，否则 `fetch()` 返回 rejected Promise。
 > 网络相关能力均通过宿主委派实现：`fetch`（`LR_HttpWrapper`）与 `WebSocket`（`LR_WsWrapper`，见 §7.9）。
 
@@ -602,7 +628,7 @@ console.log(json);
 
 ### 7.9 WebSocket
 
-> **注意：** 与 `fetch` 一样，L/R_JS **不内置 WebSocket 协议**。连接通过 `LR_WsWrapper` 接口委托给宿主；引擎本身不收发任何 WebSocket 帧。宿主在 `connect`/`send`/`close` 回调中处理真实 I/O，并通过引擎侧 `lr_ws_on_*` 函数把事件回灌给 JS（**必须在引擎线程调用**，例如宿主接入引擎事件循环的 I/O 泵中）。
+> **注意：** 与 `fetch` 一样，L/R\_JS **不内置 WebSocket 协议**。连接通过 `LR_WsWrapper` 接口委托给宿主；引擎本身不收发任何 WebSocket 帧。宿主在 `connect`/`send`/`close` 回调中处理真实 I/O，并通过引擎侧 `lr_ws_on_*` 函数把事件回灌给 JS（**必须在引擎线程调用**，例如宿主接入引擎事件循环的 I/O 泵中）。
 
 #### C API
 
@@ -705,7 +731,7 @@ worker.onmessage = (e) => console.log("Worker says:", e.data);
 worker.terminate();
 ```
 
----
+***
 
 ## 8. 高级特性
 
@@ -831,16 +857,16 @@ FRAME <width> <height> <data_size>\n
 
 #### 管道类型
 
-| 类型 | 创建函数 | 说明 |
-|------|----------|------|
-| Socket | `lr_render_pipe_sink_socket(path)` | Unix 域套接字 |
-| Shared Memory | `lr_render_pipe_sink_shm(ptr, size)` | 共享内存 |
-| Callback | `lr_render_pipe_sink_callback(fn, user)` | 用户回调 |
-| File | `lr_render_pipe_sink_file(pattern)` | PPM 文件（调试） |
+| 类型            | 创建函数                                     | 说明         |
+| ------------- | ---------------------------------------- | ---------- |
+| Socket        | `lr_render_pipe_sink_socket(path)`       | Unix 域套接字  |
+| Shared Memory | `lr_render_pipe_sink_shm(ptr, size)`     | 共享内存       |
+| Callback      | `lr_render_pipe_sink_callback(fn, user)` | 用户回调       |
+| File          | `lr_render_pipe_sink_file(pattern)`      | PPM 文件（调试） |
 
 ### 8.6 HTTP 包装器（外部 HTTP 委派）
 
-> L/R_JS 本身不内置 HTTP 客户端。`fetch()` 通过 `LR_HttpWrapper` 接口将 HTTP 请求委托给宿主应用程序（浏览器、WebUI 等）。
+> L/R\_JS 本身不内置 HTTP 客户端。`fetch()` 通过 `LR_HttpWrapper` 接口将 HTTP 请求委托给宿主应用程序（浏览器、WebUI 等）。
 
 #### C API
 
@@ -923,7 +949,7 @@ try {
 
 ### 8.7 文件系统 API（fs）
 
-> L/R_JS 提供基本的文件操作 API。对于需要系统权限的操作（如写入系统目录），通过 `LR_FileWrapper` 委托给宿主程序，
+> L/R\_JS 提供基本的文件操作 API。对于需要系统权限的操作（如写入系统目录），通过 `LR_FileWrapper` 委托给宿主程序，
 > 宿主负责申请 OS 级权限（Windows UAC、Linux polkit 等）。每批次特权操作需要重新申请权限。
 
 #### JS API
@@ -967,18 +993,18 @@ if (fs.exists("/path/to/file.txt")) {
 
 #### 权限模型
 
-| 操作 | 普通文件 | 需要权限的文件 |
-|------|---------|--------------|
-| `readFile` | 直接读取 | 失败 → 调用 wrapper |
-| `writeFile` | 直接写入 | 失败 → 调用 wrapper |
-| `appendFile` | 直接追加 | 失败 → 调用 wrapper |
-| `readdir` | 直接列出 | 失败 → 调用 wrapper |
-| `mkdir` | 直接创建 | 失败 → 调用 wrapper |
-| `rmdir` | 直接删除 | 失败 → 调用 wrapper |
-| `unlink` | 直接删除 | 失败 → 调用 wrapper |
-| `rename` | 直接重命名 | 失败 → 调用 wrapper |
-| `stat` | 直接查询 | 失败 → 调用 wrapper |
-| `exists` | 直接查询 | 不支持特权 |
+| 操作           | 普通文件  | 需要权限的文件         |
+| ------------ | ----- | --------------- |
+| `readFile`   | 直接读取  | 失败 → 调用 wrapper |
+| `writeFile`  | 直接写入  | 失败 → 调用 wrapper |
+| `appendFile` | 直接追加  | 失败 → 调用 wrapper |
+| `readdir`    | 直接列出  | 失败 → 调用 wrapper |
+| `mkdir`      | 直接创建  | 失败 → 调用 wrapper |
+| `rmdir`      | 直接删除  | 失败 → 调用 wrapper |
+| `unlink`     | 直接删除  | 失败 → 调用 wrapper |
+| `rename`     | 直接重命名 | 失败 → 调用 wrapper |
+| `stat`       | 直接查询  | 失败 → 调用 wrapper |
+| `exists`     | 直接查询  | 不支持特权           |
 
 #### C API（宿主集成）
 
@@ -1053,7 +1079,7 @@ lr_file_set_wrapper(rt, &wrapper);
 
 ### 8.8 终端 API（term）
 
-> L/R_JS 提供终端命令执行 API。对于需要系统权限的命令（如访问系统资源），通过 `LR_TerminalWrapper` 委托给宿主程序，
+> L/R\_JS 提供终端命令执行 API。对于需要系统权限的命令（如访问系统资源），通过 `LR_TerminalWrapper` 委托给宿主程序，
 > 宿主负责申请 OS 级权限（Windows UAC、Linux polkit 等）。每批次特权操作需要重新申请权限。
 
 #### JS API
@@ -1094,11 +1120,11 @@ term.spawn("some-command", {
 
 #### 权限模型
 
-| 操作 | 普通命令 | 需要权限的命令 |
-|------|---------|--------------|
-| `run` | 直接执行 (`popen`) | 失败 → 调用 wrapper |
-| `runBatch` | 逐个直接执行 | 失败 → 调用 wrapper（每批次重新授权） |
-| `spawn` | 直接执行，逐行回调 | 失败 → 调用 wrapper（整批输出） |
+| 操作         | 普通命令           | 需要权限的命令                  |
+| ---------- | -------------- | ------------------------ |
+| `run`      | 直接执行 (`popen`) | 失败 → 调用 wrapper          |
+| `runBatch` | 逐个直接执行         | 失败 → 调用 wrapper（每批次重新授权） |
+| `spawn`    | 直接执行，逐行回调      | 失败 → 调用 wrapper（整批输出）    |
 
 #### C API（宿主集成）
 
@@ -1172,7 +1198,7 @@ lr_terminal_set_wrapper(rt, &wrapper);
 
 ### 8.9 系统信息 API（system）
 
-> L/R_JS 提供只读的系统信息 API，可在 JS 中获取操作系统名称、版本号、内核版本、CPU、GPU、RAM 等信息。
+> L/R\_JS 提供只读的系统信息 API，可在 JS 中获取操作系统名称、版本号、内核版本、CPU、GPU、RAM 等信息。
 > 所有数据通过标准 Linux `/proc` 和 `/sys` 文件系统读取，无需特权操作。
 
 #### JS API
@@ -1239,33 +1265,33 @@ console.log(info);
 
 #### 返回值说明
 
-| 函数 | 返回值类型 | 说明 |
-|------|-----------|------|
-| `system.name()` | `string` | 操作系统名称（如 "Ubuntu"） |
-| `system.version()` | `string` | 操作系统版本号 |
-| `system.kernel()` | `string` | Linux 内核版本 |
-| `system.arch()` | `string` | CPU 架构（如 "x86_64"） |
-| `system.cpu()` | `string` | CPU 型号名称 |
-| `system.cpuCount()` | `number` | 在线 CPU 核心数 |
-| `system.gpu()` | `string` | GPU 设备信息（PCI vendor:device） |
-| `system.ram()` | `{total, used, free}` | RAM 信息（字节为单位） |
-| `system.uptime()` | `number` | 系统运行时间（秒） |
-| `system.hostname()` | `string` | 主机名 |
-| `system.info()` | `object` | 一次性返回所有系统信息 |
+| 函数                  | 返回值类型                 | 说明                          |
+| ------------------- | --------------------- | --------------------------- |
+| `system.name()`     | `string`              | 操作系统名称（如 "Ubuntu"）          |
+| `system.version()`  | `string`              | 操作系统版本号                     |
+| `system.kernel()`   | `string`              | Linux 内核版本                  |
+| `system.arch()`     | `string`              | CPU 架构（如 "x86\_64"）         |
+| `system.cpu()`      | `string`              | CPU 型号名称                    |
+| `system.cpuCount()` | `number`              | 在线 CPU 核心数                  |
+| `system.gpu()`      | `string`              | GPU 设备信息（PCI vendor:device） |
+| `system.ram()`      | `{total, used, free}` | RAM 信息（字节为单位）               |
+| `system.uptime()`   | `number`              | 系统运行时间（秒）                   |
+| `system.hostname()` | `string`              | 主机名                         |
+| `system.info()`     | `object`              | 一次性返回所有系统信息                 |
 
 #### 数据来源
 
-| 信息 | 来源 |
-|------|------|
-| OS 名称/版本 | `/etc/os-release` |
-| 内核版本 | `uname()` |
-| CPU 信息 | `/proc/cpuinfo` |
-| GPU 信息 | `/sys/class/drm/card*/device/` |
-| RAM 信息 | `/proc/meminfo` |
-| 运行时间 | `/proc/uptime` |
-| 主机名 | `gethostname()` |
+| 信息       | 来源                             |
+| -------- | ------------------------------ |
+| OS 名称/版本 | `/etc/os-release`              |
+| 内核版本     | `uname()`                      |
+| CPU 信息   | `/proc/cpuinfo`                |
+| GPU 信息   | `/sys/class/drm/card*/device/` |
+| RAM 信息   | `/proc/meminfo`                |
+| 运行时间     | `/proc/uptime`                 |
+| 主机名      | `gethostname()`                |
 
----
+***
 
 ### 8.10 线程池
 
@@ -1281,57 +1307,57 @@ lr_thread_pool_init(&rt->thread_pool, &tcfg);
 lr_thread_pool_submit(&rt->thread_pool, my_task, my_data);
 ```
 
----
+***
 
 ## 9. CLI 参考
 
 ### 9.1 完整参数列表
 
-| 参数 | 说明 |
-|------|------|
-| `-e <code>` | 执行字符串代码 |
-| `-m <file>` | 作为 ES Module 执行 |
-| `-i, --interactive` | 启动 REPL 交互模式 |
-| `-h, --help` | 显示帮助 |
-| `-v, --version` | 显示版本 |
-| `--strict` | 启用严格模式 |
-| `--debug` | 启用调试模式 |
-| `--memory-limit <bytes>` | 堆内存限制 |
-| `--gc-threshold <bytes>` | GC 阈值 |
-| `--gc-stress` | GC 压力测试模式 |
-| `--gc-generational` | 启用分代 GC |
-| `--gc-incremental` | 启用增量 GC（默认） |
-| `--gc-manual` | 禁用自动 GC |
-| `--gc-nursery-size <mb>` | 设置 nursery 大小 |
-| `--gc-pause-target <ms>` | 设置目标最大暂停 |
-| `--gc-stats` | 退出时打印 GC 统计 |
-| `--iome586 <dir>` | 启用 IOME586 结果缓存（别名 `--bytecode-cache`） |
-| `--iome586-stats` | 退出时打印缓存统计（别名 `--bytecode-stats`） |
-| `--iome586-revert <js>` | 撤回指定脚本的缓存落盘（回滚到 .bak） |
-| `--iome586-no-strings` | 缓存快照中不记录任何字符串字面量值（敏感值防护） |
-| `--iome586-restore-globals` | 允许暖跑时把归档中的全局变量绑定还原回全局对象（默认关闭，按需开启） |
-| `--sandbox-log <dir>` | 启用沙箱日志 |
-| `--min-memory <bytes>` | 最小系统内存要求 |
-| `--no-memory-check` | 跳过系统内存检查 |
-| `--dump-bytecode` | 导出编译字节码 |
-| `--strip-debug` | 剥离调试信息 |
-| `--timeout <ms>` | 执行超时 |
-| `--log-level <0-4>` | 日志级别 |
-| `--stack-size <bytes>` | 栈大小 |
+| 参数                          | 说明                                     |
+| --------------------------- | -------------------------------------- |
+| `-e <code>`                 | 执行字符串代码                                |
+| `-m <file>`                 | 作为 ES Module 执行                        |
+| `-i, --interactive`         | 启动 REPL 交互模式                           |
+| `-h, --help`                | 显示帮助                                   |
+| `-v, --version`             | 显示版本                                   |
+| `--strict`                  | 启用严格模式                                 |
+| `--debug`                   | 启用调试模式                                 |
+| `--memory-limit <bytes>`    | 堆内存限制                                  |
+| `--gc-threshold <bytes>`    | GC 阈值                                  |
+| `--gc-stress`               | GC 压力测试模式                              |
+| `--gc-generational`         | 启用分代 GC                                |
+| `--gc-incremental`          | 启用增量 GC（默认）                            |
+| `--gc-manual`               | 禁用自动 GC                                |
+| `--gc-nursery-size <mb>`    | 设置 nursery 大小                          |
+| `--gc-pause-target <ms>`    | 设置目标最大暂停                               |
+| `--gc-stats`                | 退出时打印 GC 统计                            |
+| `--iome586 <dir>`           | 启用 IOME586 结果缓存（别名 `--bytecode-cache`） |
+| `--iome586-stats`           | 退出时打印缓存统计（别名 `--bytecode-stats`）       |
+| `--iome586-revert <js>`     | 撤回指定脚本的缓存落盘（回滚到 .bak）                  |
+| `--iome586-no-strings`      | 缓存快照中不记录任何字符串字面量值（敏感值防护）               |
+| `--iome586-restore-globals` | 允许暖跑时把归档中的全局变量绑定还原回全局对象（默认关闭，按需开启）     |
+| `--sandbox-log <dir>`       | 启用沙箱日志                                 |
+| `--min-memory <bytes>`      | 最小系统内存要求                               |
+| `--no-memory-check`         | 跳过系统内存检查                               |
+| `--dump-bytecode`           | 导出编译字节码                                |
+| `--strip-debug`             | 剥离调试信息                                 |
+| `--timeout <ms>`            | 执行超时                                   |
+| `--log-level <0-4>`         | 日志级别                                   |
+| `--stack-size <bytes>`      | 栈大小                                    |
 
 ### 9.2 REPL 命令
 
-| 命令 | 说明 |
-|------|------|
-| `.exit`, `.quit` | 退出 REPL |
-| `.help` | 显示帮助 |
-| `.clear` | 清屏 |
-| `.gc` | 触发 GC |
-| `.gc_stats` | 显示 GC 统计 |
-| `.bc_stats` | 显示 IOME586 缓存统计 |
-| `.memory` | 显示内存使用 |
+| 命令               | 说明              |
+| ---------------- | --------------- |
+| `.exit`, `.quit` | 退出 REPL         |
+| `.help`          | 显示帮助            |
+| `.clear`         | 清屏              |
+| `.gc`            | 触发 GC           |
+| `.gc_stats`      | 显示 GC 统计        |
+| `.bc_stats`      | 显示 IOME586 缓存统计 |
+| `.memory`        | 显示内存使用          |
 
----
+***
 
 ## 10. 构建指南
 
@@ -1378,7 +1404,7 @@ make clean && make -j$(sysctl -n hw.logicalcpu)
 LR_OSX_SDK=/path/to/MacOSX12.3.sdk ./build_macos.sh
 ```
 
-产物为 `releases/LR_JS-0.1.1-macos-{x86_64,arm64}.tar.gz`，内含 `lib/liblr_js.a`、`lib/liblr_js.dylib`、`bin/lr_js` 与 `lr_js.h`。
+产物为 `releases/LR_JS-0.2.0-macos-{x86_64,arm64}.tar.gz`，内含 `lib/liblr_js.a`、`lib/liblr_js.dylib`、`bin/lr_js` 与 `lr_js.h`。
 
 实现要点：脚本绕过 `o64-clang`/`oa64-clang` 启动器，直接调用真实的、带目标架构的 clang，并从其文件名提取精确 `-target` triple（如 `x86_64-apple-darwin21.4`），以匹配 `x86_64-apple-darwin21.4-ld` 链接器；SDK 自动检测优先匹配 clang 内嵌的 darwin 版本，否则回退到最旧的可用 SDK。
 
@@ -1427,60 +1453,61 @@ cd LR_JS
 make CC="$CC" clean && make CC="$CC"
 ```
 
----
+***
 
 ## 11. 性能基准
 
-| 测试项目 | 耗时 | 说明 |
-|----------|------|------|
-| 空脚本启动 | < 1ms | 运行时创建 |
-| console.log | < 1ms | 基本 I/O |
-| 100K 对象循环 | ~50ms | 内存分配 |
-| 50K 对象 (分代 GC) | ~45ms | GC 暂停 < 4ms |
-| 50K 对象 (增量 GC) | ~48ms | GC 暂停 < 2ms |
-| IOME586 缓存命中 | < 5ms | 跳过词法/解析 |
+| 测试项目           | 耗时     | 说明          |
+| -------------- | ------ | ----------- |
+| 空脚本启动          | < 1ms  | 运行时创建       |
+| console.log    | < 1ms  | 基本 I/O      |
+| 100K 对象循环      | \~50ms | 内存分配        |
+| 50K 对象 (分代 GC) | \~45ms | GC 暂停 < 4ms |
+| 50K 对象 (增量 GC) | \~48ms | GC 暂停 < 2ms |
+| IOME586 缓存命中   | < 5ms  | 跳过词法/解析     |
 
----
+***
 
 ## 12. 错误码
 
-| 错误码 | 说明 |
-|--------|------|
-| -1 | 通用错误 |
-| -2 | 内存不足 |
-| -3 | 超时 |
-| -4 | 语法错误 |
-| -5 | 运行时错误 |
-| -6 | 系统内存不足 |
-| -7 | 沙箱限制 |
-| -8 | 网络错误 |
+| 错误码 | 说明     |
+| --- | ------ |
+| -1  | 通用错误   |
+| -2  | 内存不足   |
+| -3  | 超时     |
+| -4  | 语法错误   |
+| -5  | 运行时错误  |
+| -6  | 系统内存不足 |
+| -7  | 沙箱限制   |
+| -8  | 网络错误   |
 
----
+***
 
 ## 13. 版本历史
 
-| 版本 | 日期 | 说明 |
-|------|------|------|
+| 版本    | 日期      | 说明                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0.2.0 | 2026-08 | **字节码 VM 成熟版**：直接/间接线程式字节码 VM（GCC/Clang computed goto，MSVC switch-based dispatch）；IOME586 memo cache 纯函数结果缓存（冷跑 56.3% 命中率，热跑 71.2%）；fib20 热跑 29.7× 快于 V8；dot/sum/mixed/impure 等纯计算负载 1.5\~3.5× 快于 V8；`lr_memory_usage()` JS 全局函数暴露内存统计；`lr_js_version` / `__LR_PARALLEL_THREADS__` 全局变量；内存使用负值修复；16 线程并行执行；AST 树遍历解释器退役；线程池、渲染器桥接、多平台支持（FreeBSD/OpenBSD/NetBSD/Android/iOS）；新增 `enable_thread_pool`/`thread_pool_size`/`enable_sandbox`/`enable_perf_optimizations`/`enable_renderer`/`module_paths`/I/O 重定向等配置字段                                                                              |
 | 0.1.1 | 2026-07 | **全量字节码 VM**：栈式 VM（`lr_bytecode.c`）覆盖字面量、标识符、全部一元/二元/复合赋值/`**`/位运算/比较/`in`/`instanceof`/`typeof`/`delete`、`&&`/`\|\|`/`??` 短路、条件表达式、模板字符串（C 层拼接）、数组/对象字面量、成员与计算成员读写、函数/方法/构造调用、`for`/`while`/`do-while`/`for-of`（原生迭代协议）/`switch`/带标签 `break`/`continue`/`return`/`throw`/块级作用域。JS 运算与数据解析全部在 C 层完成（int32 快路径、字符串拼接、抽象/严格相等、关系比较）。闭包、类、生成器、async/await、try/catch、解构、模块、`for-in`、`super` 等语义经逃逸分析后以 `BC_EVAL_NODE` 回落到同一解释器状态，保证语义一致且无双重执行。字节码序列化 `LRBC` v2 并入 IOME586 归档（含 AST 节点引用时标记为不可直接恢复，暖跑由 AST 重新编译）。跨平台验证：MSVC/MinGW/GCC/Clang，Windows/macOS/Linux，x86/x64/ARM。文档新增 §6.1.0 缓存内容与可恢复性说明 |
-| 0.1.0 | 2026-07 | 初始版本：ES2022+ 支持、多线程沙箱、渲染器桥接、系统内存限制、分代/增量 GC、`.lrfile` 字节码缓存与沙箱日志、IOME586 结果缓存（LZ4 归档、边运行边缓存、15% 规则、BOM、撤回）、AST 序列化 `LRA` v3（字面量显式类型标记），修复暖跑中 `true`→`false` 的 bug；追加能力：顶层 `var`/`function` 在非模块 Script 下绑定到全局对象（符合 `GlobalDeclarationInstantiation`，`let`/`const`/`class` 不挂载），模块内 `import.meta`，`RegExp` 的 `d`（match indices）标志，Windows 控制台 UTF-8 输出；IOME586 安全加固（敏感全局值排除、`snapshot_strings` 默认开启、去除自密钥 XOR、`restore_globals` 默认关闭、BOM 基线重映射保护），新增 CLI `--iome586-no-strings` / `--iome586-restore-globals` |
+| 0.1.0 | 2026-07 | 初始版本：ES2022+ 支持、多线程沙箱、渲染器桥接、系统内存限制、分代/增量 GC、`.lrfile` 字节码缓存与沙箱日志、IOME586 结果缓存（LZ4 归档、边运行边缓存、15% 规则、BOM、撤回）、AST 序列化 `LRA` v3（字面量显式类型标记），修复暖跑中 `true`→`false` 的 bug；追加能力：顶层 `var`/`function` 在非模块 Script 下绑定到全局对象（符合 `GlobalDeclarationInstantiation`，`let`/`const`/`class` 不挂载），模块内 `import.meta`，`RegExp` 的 `d`（match indices）标志，Windows 控制台 UTF-8 输出；IOME586 安全加固（敏感全局值排除、`snapshot_strings` 默认开启、去除自密钥 XOR、`restore_globals` 默认关闭、BOM 基线重映射保护），新增 CLI `--iome586-no-strings` / `--iome586-restore-globals`                                                                                   |
 
----
+***
 
 ## 14. 许可证
 
 MIT License
 
----
+***
 
 ## 参考链接
 
-- FNV-1a: https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function
+- FNV-1a: <https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function>
 
----
+***
 
 ## 15. Promise API
 
-L/R_JS 实现完整的 Promise/A+ 规范，支持 ES2022 所有 Promise 静态方法。
+L/R\_JS 实现完整的 Promise/A+ 规范，支持 ES2022 所有 Promise 静态方法。
 
 ### 15.1 构造函数
 
@@ -1569,11 +1596,11 @@ fetch("https://api.example.com/data")
     });
 ```
 
----
+***
 
 ## 16. Worker API
 
-L/R_JS 支持 Web Worker 多线程执行，每个 Worker 在独立线程中运行隔离的 JS 运行时，通过消息传递与主线程通信。
+L/R\_JS 支持 Web Worker 多线程执行，每个 Worker 在独立线程中运行隔离的 JS 运行时，通过消息传递与主线程通信。
 
 ### 16.1 构造函数
 
@@ -1660,11 +1687,11 @@ self.onmessage = (e) => {
 };
 ```
 
----
+***
 
 ## 17. 无锁队列（C API）
 
-L/R_JS 提供基于 CAS 的无锁队列（MPSC：Multiple Producer, Single Consumer），使用链表 + stub 节点设计避免 ABA 问题。
+L/R\_JS 提供基于 CAS 的无锁队列（MPSC：Multiple Producer, Single Consumer），使用链表 + stub 节点设计避免 ABA 问题。
 
 ### 17.1 数据结构
 
@@ -1721,13 +1748,13 @@ lr_lfq_destroy(&queue, free_data_cb);   // 回调释放每个节点
 
 ### 17.3 线程安全说明
 
-| 操作 | 安全性 |
-|------|--------|
-| `lr_lfq_push` | 多生产者安全（CAS 循环，有限重试） |
-| `lr_lfq_pop` | 仅单消费者安全（或外部序列化） |
-| `lr_lfq_peek` | 仅单消费者安全 |
-| `lr_lfq_count` | 近似值，仅诊断用途 |
-| `lr_lfq_drain` | 仅单消费者安全 |
+| 操作             | 安全性                 |
+| -------------- | ------------------- |
+| `lr_lfq_push`  | 多生产者安全（CAS 循环，有限重试） |
+| `lr_lfq_pop`   | 仅单消费者安全（或外部序列化）     |
+| `lr_lfq_peek`  | 仅单消费者安全             |
+| `lr_lfq_count` | 近似值，仅诊断用途           |
+| `lr_lfq_drain` | 仅单消费者安全             |
 
 ### 17.4 嵌入示例
 
@@ -1758,27 +1785,27 @@ void consumer(LR_LFQueue *queue) {
 }
 ```
 
----
+***
 
 ## 18. 跨平台兼容层
 
-L/R_JS 通过 `lr_platform.h` 提供统一的跨平台抽象层，支持 Linux、macOS、Windows 7+、FreeBSD、OpenBSD、NetBSD。
+L/R\_JS 通过 `lr_platform.h` 提供统一的跨平台抽象层，支持 Linux、macOS、Windows 7+、FreeBSD、OpenBSD、NetBSD。
 
 ### 18.1 支持的平台
 
-| 宏 | 平台 |
-|-----|------|
-| `LR_PLATFORM_WINDOWS` | Windows 7+ (MSVC/MinGW) |
-| `LR_PLATFORM_LINUX` | Linux (GCC/Clang) |
-| `LR_PLATFORM_MACOS` | macOS (Apple Clang) |
-| `LR_PLATFORM_BSD` | FreeBSD / OpenBSD / NetBSD |
+| 宏                     | 平台                         |
+| --------------------- | -------------------------- |
+| `LR_PLATFORM_WINDOWS` | Windows 7+ (MSVC/MinGW)    |
+| `LR_PLATFORM_LINUX`   | Linux (GCC/Clang)          |
+| `LR_PLATFORM_MACOS`   | macOS (Apple Clang)        |
+| `LR_PLATFORM_BSD`     | FreeBSD / OpenBSD / NetBSD |
 
 ### 18.2 编译器检测
 
-| 宏 | 编译器 |
-|-----|---------|
+| 宏                  | 编译器           |
+| ------------------ | ------------- |
 | `LR_COMPILER_MSVC` | MSVC (cl.exe) |
-| 默认 | GCC / Clang |
+| 默认                 | GCC / Clang   |
 
 ### 18.3 编译选项
 
@@ -1801,7 +1828,7 @@ x86_64-w64-mingw32-gcc -O2 -g -Wall -Wextra -D_GNU_SOURCE -pthread \
 
 ### 18.4 原子操作 API
 
-L/R_JS 提供统一的原子操作层，在 Windows 上使用 `Interlocked*` 系列函数，在 POSIX 系统上使用 GCC `__sync_*` 内置函数。
+L/R\_JS 提供统一的原子操作层，在 Windows 上使用 `Interlocked*` 系列函数，在 POSIX 系统上使用 GCC `__sync_*` 内置函数。
 
 ```c
 // 32 位 CAS
@@ -1849,17 +1876,17 @@ void lr_read_barrier(void);
 
 ### 18.6 跨平台 API 映射
 
-| 功能 | POSIX | Windows |
-|------|-------|---------|
-| 文件操作 | `open/close/read/write/lseek` | `_open/_close/_read/_write/_lseek` |
-| Socket 关闭 | `close(s)` | `closesocket(s)` |
-| 动态库加载 | `dlopen/dlsym/dlclose` | `LoadLibrary/GetProcAddress/FreeLibrary` |
-| 线程 | `pthread` | `lr_pthread_win.h` 兼容层 |
-| 高精度时间 | `gettimeofday` | `QueryPerformanceCounter` |
-| 随机数 | `/dev/urandom` | `CryptGenRandom` |
-| 内存信息 | `sysconf` | `GlobalMemoryStatusEx` |
-| Socket 初始化 | 无需操作 | `WSAStartup` |
-| 目录分隔符 | `/` | `\\` |
+| 功能         | POSIX                         | Windows                                  |
+| ---------- | ----------------------------- | ---------------------------------------- |
+| 文件操作       | `open/close/read/write/lseek` | `_open/_close/_read/_write/_lseek`       |
+| Socket 关闭  | `close(s)`                    | `closesocket(s)`                         |
+| 动态库加载      | `dlopen/dlsym/dlclose`        | `LoadLibrary/GetProcAddress/FreeLibrary` |
+| 线程         | `pthread`                     | `lr_pthread_win.h` 兼容层                   |
+| 高精度时间      | `gettimeofday`                | `QueryPerformanceCounter`                |
+| 随机数        | `/dev/urandom`                | `CryptGenRandom`                         |
+| 内存信息       | `sysconf`                     | `GlobalMemoryStatusEx`                   |
+| Socket 初始化 | 无需操作                          | `WSAStartup`                             |
+| 目录分隔符      | `/`                           | `\\`                                     |
 
 ### 18.7 平台特定头文件
 
@@ -1871,11 +1898,11 @@ void lr_read_barrier(void);
 #include "lr_pthread_win.h"  // MSVC 的 pthread 模拟
 ```
 
----
+***
 
 ## 19. 任务调度器（C API）
 
-L/R_JS 提供基于优先级的异步任务调度器，支持一次性、重复和定时任务。
+L/R\_JS 提供基于优先级的异步任务调度器，支持一次性、重复和定时任务。
 
 ### 19.1 API
 
@@ -1921,11 +1948,11 @@ typedef enum {
 } LR_TaskPriority;
 ```
 
----
+***
 
 ## 20. Map & Set API
 
-L/R_JS 实现完整的 ES2022 Map 和 Set 对象，使用 C 哈希表作为底层存储。
+L/R\_JS 实现完整的 ES2022 Map 和 Set 对象，使用 C 哈希表作为底层存储。
 
 ### 20.1 Map
 
@@ -1960,11 +1987,11 @@ set.size;                     // 条目数（只读 getter）
 set.forEach(callback, thisArg); // 遍历所有值
 ```
 
----
+***
 
 ## 21. Proxy & Reflect API
 
-L/R_JS 支持 ES2022 Proxy 和 Reflect，实现 7 个核心 trap。
+L/R\_JS 支持 ES2022 Proxy 和 Reflect，实现 7 个核心 trap。
 
 ### 21.1 Proxy
 
@@ -2001,11 +2028,11 @@ Reflect.setPrototypeOf(target, proto);
 Reflect.isExtensible(target);
 ```
 
----
+***
 
 ## 22. 错误与堆栈跟踪
 
-L/R_JS 支持完整的错误堆栈跟踪，格式兼容 V8。
+L/R\_JS 支持完整的错误堆栈跟踪，格式兼容 V8。
 
 ### 22.1 Error.prototype.stack
 
@@ -2038,50 +2065,58 @@ console.log(err.stack);  // 带有堆栈信息，但不包含 captureStackTrace 
 Error.stackTraceLimit = 20;  // 控制堆栈帧数上限（默认 10）
 ```
 
----
+***
 
 ## 23. 性能优化
 
-L/R_JS 引擎包含多项性能优化：
+L/R\_JS 引擎包含多项性能优化：
 
 ### 23.1 AST 节点池
+
 - 解析器预分配 4096 个 AST 节点，减少 `malloc` 调用
 - 全局缓存常量节点（0、1、true、false、null、undefined）
 
 ### 23.2 字符串驻留
+
 - 256 槽哈希表对标识符和字符串字面量进行原子化
 - 避免重复的 `strdup` 和字符串比较
 
 ### 23.3 直接线程化
+
 - 解释器使用函数指针表替代 `switch` 语句
 - 减少分支预测失败，提高执行效率
 
 ### 23.4 内联缓存
+
 - 64 槽属性访问缓存，缓存最近访问的属性偏移
 - 减少属性查找的开销
 
 ### 23.5 整数快速路径
+
 - 二元运算的 `int32 + int32` 快速路径（14 种运算）
 - 避免对象装箱和函数调用开销
 
 ### 23.6 形状缓存
+
 - 128 槽形状缓存，缓存 `get_property`/`set_property` 的 (对象, 属性) 对
 - 加速属性访问
 
 ### 23.7 小字符串缓存
+
 - 128 槽缓存长度 <= 32 的字符串
 - 避免短字符串的重复分配
 
 ### 23.8 GC 调优
+
 - 初始 GC 阈值: 1MB
 - 新生代大小: 8MB
 - GC 暂停目标: 10ms
 
----
+***
 
 ## 24. ES2022 核心内置对象
 
-L/R_JS 实现完整的 ES2022 核心内置对象，包括 Object、Array、String、Number、Boolean、Function、Math、JSON、Date、RegExp、Symbol、Error 子类、WeakMap、WeakSet。
+L/R\_JS 实现完整的 ES2022 核心内置对象，包括 Object、Array、String、Number、Boolean、Function、Math、JSON、Date、RegExp、Symbol、Error 子类、WeakMap、WeakSet。
 
 ### 24.1 Object
 
@@ -2370,7 +2405,7 @@ ws.has(value);
 ws.delete(value);
 ```
 
----
+***
 
 ## 25. ES2022+ 语法特性
 
@@ -2380,7 +2415,7 @@ ws.delete(value);
 globalThis === window;  // true（浏览器语义下全局对象即 window）
 ```
 
-**顶层 `var` / `function` 绑定到全局对象（仅非模块 Script 模式）。** 依据 ECMAScript
+**顶层** **`var`** **/** **`function`** **绑定到全局对象（仅非模块 Script 模式）。** 依据 ECMAScript
 `GlobalDeclarationInstantiation` 规范：在非模块的 Script 中，顶层的 `var` 和 `function`
 声明会成为全局对象的属性；而 `let` / `const` / `class` 属于声明式绑定，不会挂载到全局对象。
 ES 模块（`.mjs` 或 `-m`）下所有顶层声明都保存在模块命名空间，绝不污染全局对象。
@@ -2411,6 +2446,7 @@ topVar;                      // 100（双向绑定：外部写全局对象反射
 ```
 
 ### 25.2 for...of 循环
+
 ```javascript
 for (const v of [1, 2, 3]) {
     console.log(v);
@@ -2418,6 +2454,7 @@ for (const v of [1, 2, 3]) {
 ```
 
 ### 25.3 逻辑赋值运算符
+
 ```javascript
 x ||= y;  // x = x || y
 x &&= y;  // x = x && y
@@ -2425,6 +2462,7 @@ x ??= y;  // x = x ?? y
 ```
 
 ### 25.4 数字分隔符
+
 ```javascript
 const million = 1_000_000;  // 1000000
 const bits = 0xFF_FF_FF;    // 16777215
@@ -2432,7 +2470,9 @@ const binary = 0b1010_0001; // 161
 ```
 
 ### 25.5 `import.meta`
+
 模块（`.mjs` 或 `-m`）内部可访问 `import.meta`，提供当前模块元信息：
+
 ```javascript
 // module.mjs
 import.meta.url;       // "file:///abs/path/module.mjs"
@@ -2440,4 +2480,5 @@ import.meta.filename;  // 绝对路径
 import.meta.dirname;   // 所在目录
 console.log(import.meta.url);
 ```
+
 非模块脚本中访问 `import.meta` 会报错。

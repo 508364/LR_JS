@@ -18,6 +18,7 @@
 #include "lr_compress.h"
 #include "lr_runtime.h"
 #include "engine/lr_engine.h"
+#include "engine/lr_jit.h"
 
 /* ── Hashing / checksums ───────────────────────────────────────────────── */
 
@@ -74,6 +75,49 @@ static void xor_key(uint8_t *data, size_t len, uint64_t key)
     for (size_t i = 0; i < len; i++)
         data[i] ^= k[i & 7];
 }
+
+/* ── CAS spinlock ─────────────────────────────────────────────────────────
+ * User-space spin-wait using test-and-set.  No kernel involvement for the
+ * short file-I/O critical sections in this module.  Backoff is a simple
+ * CPU yield (rep nop / yield) — critical sections are tiny so we never
+ * spin for long.                                                          */
+static inline void iome_spin_lock(volatile int32_t *lock)
+{
+    while (LR_ATOMIC_TEST_AND_SET(lock)) {
+        /* Spin with CPU yield hint to avoid wasting pipeline bandwidth */
+#if defined(__x86_64__) || defined(__i386__)
+        __asm__ __volatile__("rep; nop" ::: "memory");
+#elif defined(__aarch64__)
+        __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__arm__)
+        __asm__ __volatile__("nop" ::: "memory");
+#else
+        /* Fallback: compiler barrier */
+        __asm__ __volatile__("" ::: "memory");
+#endif
+    }
+    lr_write_barrier();  /* ensure subsequent reads/writes happen after lock */
+}
+
+static inline void iome_spin_unlock(volatile int32_t *lock)
+{
+    lr_write_barrier();  /* ensure all writes complete before releasing */
+    LR_ATOMIC_CLEAR(lock);
+}
+
+/* Convenience macros */
+#define IOME_LOCK(c)   iome_spin_lock(&(c)->spinlock)
+#define IOME_UNLOCK(c) iome_spin_unlock(&(c)->spinlock)
+
+/* Atomic statistics helpers — no lock needed */
+#define IOME_STAT_INC(c, field) \
+    lr_atomic_fetch_add_64((volatile int64_t *)&(c)->field, 1)
+#define IOME_STAT_ADD(c, field, val) \
+    lr_atomic_fetch_add_64((volatile int64_t *)&(c)->field, (int64_t)(val))
+#define IOME_STAT_SET(c, field, val) \
+    lr_atomic_store_64((volatile int64_t *)&(c)->field, (int64_t)(val))
+#define IOME_STAT_GET(c, field) \
+    lr_atomic_load_64((volatile int64_t *)&(c)->field)
 
 /* ── Small file helpers ────────────────────────────────────────────────── */
 
@@ -191,7 +235,7 @@ void lr_iome586_init(LR_Iome586Cache *c, LR_Runtime *rt, const char *dir)
     c->compression = 1;
     c->snapshot_strings = 1;   /* sensitive names are always excluded */
     c->restore_globals = 0;    /* warm re-run recomputes; restore is opt-in */
-    pthread_mutex_init(&c->mutex, NULL);
+    c->spinlock = 0;
     if (dir && dir[0]) {
         c->cache_dir = strdup(dir);
         c->enabled = 1;
@@ -210,7 +254,13 @@ void lr_iome586_destroy(LR_Iome586Cache *c)
         c->baseline_names = NULL;
         c->baseline_count = 0;
     }
-    pthread_mutex_destroy(&c->mutex);
+    /* spinlock is a plain int32, nothing to destroy */
+}
+
+/* Comparison function for sorted baseline_names (used by bsearch + qsort) */
+static int baseline_name_cmp(const void *a, const void *b)
+{
+    return strcmp(*(const char **)a, *(const char **)b);
 }
 
 /* ── Builtin baseline ("remap set") ────────────────────────────────────── */
@@ -249,6 +299,11 @@ int lr_iome586_capture_baseline(LR_Iome586Cache *c, LRContext *ctx)
     }
     c->baseline_count = n;
     lr_free_property_enum(ctx, tab, len);
+
+    /* Sort for O(log n) bsearch lookup */
+    if (n > 1) {
+        qsort(c->baseline_names, n, sizeof(char *), baseline_name_cmp);
+    }
     return (int)n;
 }
 
@@ -259,16 +314,15 @@ static int is_builtin_global(const char *name);   /* fwd (static list) */
 static int in_engine_namespace(const LR_Iome586Cache *c, const char *name)
 {
     if (c && c->baseline_names && c->baseline_count) {
-        for (uint32_t i = 0; i < c->baseline_count; i++)
-            if (strcmp(c->baseline_names[i], name) == 0) return 1;
-        return 0;
+        return bsearch(&name, c->baseline_names, c->baseline_count,
+                       sizeof(char *), baseline_name_cmp) != NULL;
     }
     return is_builtin_global(name);
 }
 
 int lr_iome586_set_dir(LR_Iome586Cache *c, const char *dir)
 {
-    pthread_mutex_lock(&c->mutex);
+    IOME_LOCK(c);
     free(c->cache_dir);
     c->cache_dir = NULL;
     c->enabled = 0;
@@ -277,7 +331,7 @@ int lr_iome586_set_dir(LR_Iome586Cache *c, const char *dir)
         c->cache_dir = strdup(dir);
         c->enabled = 1;
     }
-    pthread_mutex_unlock(&c->mutex);
+    IOME_UNLOCK(c);
     return 0;
 }
 
@@ -289,16 +343,21 @@ typedef struct {
     int      error;
 } Blob;
 
+static void blob_ensure(Blob *b, size_t needed)
+{
+    if (b->error || b->cap >= needed) return;
+    size_t nc = b->cap ? b->cap : 2048;
+    while (nc < needed) nc *= 2;
+    uint8_t *nd = realloc(b->data, nc);
+    if (!nd) { b->error = 1; return; }
+    b->data = nd; b->cap = nc;
+}
+
 static void blob_put(Blob *b, const void *src, size_t n)
 {
     if (b->error) return;
-    if (b->len + n > b->cap) {
-        size_t nc = b->cap ? b->cap : 512;
-        while (nc < b->len + n) nc *= 2;
-        uint8_t *nd = realloc(b->data, nc);
-        if (!nd) { b->error = 1; return; }
-        b->data = nd; b->cap = nc;
-    }
+    blob_ensure(b, b->len + n);
+    if (b->error) return;
     memcpy(b->data + b->len, src, n);
     b->len += n;
 }
@@ -348,37 +407,45 @@ static void blob_value(Blob *b, LRContext *ctx, LRValue v)
     }
 }
 
-/* Names that exist on the global object before any user script runs
- * (builtins). Snapshotting them would bloat the archive, so they are
- * filtered by a "not a builtin at init time" check via shadow list.
- * Cheap approach: skip names that resolve to objects/functions AND are
- * known builtin roots. User data objects are still recorded as tag 6. */
+/* ── Sorted builtin global names for O(log n) lookup ──────────────────────
+ * Must be kept in ASCII-sorted order for bsearch().  If you add a name,
+ * insert it at the correct position so the array stays sorted.            */
+static const char * const builtin_globals_sorted[] = {
+    "AbortController", "AbortSignal", "AggregateError", "Array",
+    "ArrayBuffer", "BigInt", "BigInt64Array", "BigUint64Array",
+    "Boolean", "CustomEvent", "DataView", "Date", "Error",
+    "EvalError", "Event", "EventTarget", "FinalizationRegistry",
+    "Float32Array", "Float64Array", "Function", "Infinity",
+    "Int16Array", "Int32Array", "Int8Array", "Intl",
+    "JSON", "Map", "Math", "NaN", "Number", "Object",
+    "Promise", "Proxy", "RangeError", "Reflect", "RegExp",
+    "ReferenceError", "Set", "SharedArrayBuffer", "String",
+    "Symbol", "SyntaxError", "TypeError", "URIError",
+    "Uint16Array", "Uint32Array", "Uint8Array", "Uint8ClampedArray",
+    "URL", "URLSearchParams", "WeakMap", "WeakRef", "WeakSet",
+    "WebSocket", "Worker", "atob", "btoa", "clearInterval",
+    "clearTimeout", "console", "crypto", "decodeURI",
+    "decodeURIComponent", "encodeURI", "encodeURIComponent",
+    "escape", "eval", "fetch", "fs", "globalThis",
+    "isFinite", "isNaN", "localStorage", "navigator",
+    "os", "parseFloat", "parseInt", "performance",
+    "queueMicrotask", "sessionStorage", "setInterval",
+    "setTimeout", "structuredClone", "terminal",
+    "TextDecoder", "TextEncoder", "undefined", "unescape"
+};
+#define NUM_BUILTIN_GLOBALS \
+    (sizeof(builtin_globals_sorted) / sizeof(builtin_globals_sorted[0]))
+
+static int builtin_global_cmp(const void *a, const void *b)
+{
+    return strcmp(*(const char **)a, *(const char **)b);
+}
+
+/* O(log n) binary search for builtin global lookup */
 static int is_builtin_global(const char *name)
 {
-    static const char *skip[] = {
-        "globalThis", "console", "Math", "JSON", "Object", "Array", "String",
-        "Number", "Boolean", "Symbol", "BigInt", "Date", "RegExp", "Error",
-        "TypeError", "RangeError", "SyntaxError", "ReferenceError",
-        "EvalError", "URIError", "AggregateError", "Promise", "Proxy",
-        "Reflect", "Map", "Set", "WeakMap", "WeakSet", "WeakRef",
-        "FinalizationRegistry", "ArrayBuffer", "SharedArrayBuffer",
-        "DataView", "Int8Array", "Uint8Array", "Uint8ClampedArray",
-        "Int16Array", "Uint16Array", "Int32Array", "Uint32Array",
-        "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
-        "Function", "eval", "parseInt", "parseFloat", "isNaN", "isFinite",
-        "encodeURI", "decodeURI", "encodeURIComponent", "decodeURIComponent",
-        "escape", "unescape", "NaN", "Infinity", "undefined",
-        "setTimeout", "clearTimeout", "setInterval", "clearInterval",
-        "queueMicrotask", "fetch", "URL", "URLSearchParams", "TextEncoder",
-        "TextDecoder", "atob", "btoa", "Event", "EventTarget", "CustomEvent",
-        "AbortController", "AbortSignal", "performance", "crypto",
-        "localStorage", "sessionStorage", "WebSocket", "Worker", "navigator",
-        "structuredClone", "Intl", "fs", "terminal", "os",
-        NULL
-    };
-    for (int i = 0; skip[i]; i++)
-        if (strcmp(name, skip[i]) == 0) return 1;
-    return 0;
+    return bsearch(&name, builtin_globals_sorted, NUM_BUILTIN_GLOBALS,
+                   sizeof(const char *), builtin_global_cmp) != NULL;
 }
 
 /* Sensitive-looking global names must never have their VALUES persisted to
@@ -505,7 +572,7 @@ static int write_container(LR_Iome586Cache *c, const char *path,
     }
     if (compressed) {
         flags |= LR_IOME586_FLAG_COMPRESSED;
-        c->bytes_saved += (int64_t)(payload_raw_len - stored_len);
+        IOME_STAT_ADD(c, bytes_saved, (int64_t)(payload_raw_len - stored_len));
     }
     /* No XOR keying: the old key (source_hash) lived in the same header,
      * making it obfuscation rather than encryption. Integrity is covered by
@@ -547,7 +614,7 @@ static int write_container(LR_Iome586Cache *c, const char *path,
     int rc = -1;
     if (!f.error)
         rc = write_all(path, f.data, f.len);
-    if (rc == 0) c->bytes_stored += (int64_t)f.len;
+    if (rc == 0) IOME_STAT_ADD(c, bytes_stored, (int64_t)f.len);
     free(f.data);
     return rc;
 }
@@ -581,7 +648,7 @@ int lr_iome586_begin(LR_Iome586Cache *c, const char *script_path,
     archive_path(c, nh, w->path_final, sizeof(w->path_final), 0);
     backup_path(c, nh, w->path_bak, sizeof(w->path_bak));
 
-    pthread_mutex_lock(&c->mutex);
+    IOME_LOCK(c);
 
     /* Keep the previous archive as .bak so the store can be rolled back.
      * Accept either the .lrfile or the legacy .lrfile.lz4 name. */
@@ -614,7 +681,7 @@ int lr_iome586_begin(LR_Iome586Cache *c, const char *script_path,
         rc = write_container(c, w->path_final, LR_IOME586_STATUS_WRITING,
                              flags, w, 0.0, payload.data, payload.len);
     free(payload.data);
-    pthread_mutex_unlock(&c->mutex);
+    IOME_UNLOCK(c);
 
     if (rc != 0) {
         /* Could not start the archive: roll the backup straight back. */
@@ -641,13 +708,14 @@ int lr_iome586_commit(LR_Iome586Cache *c, LR_Iome586Writer *w,
     double total = (double)(w->parse_us + exec_us);
     double gain = total > 0.0 ? (double)w->parse_us / total : 0.0;
     if (gain < LR_IOME586_MIN_GAIN) {
-        pthread_mutex_lock(&c->mutex);
+        IOME_LOCK(c);
         remove(w->path_final);
         if (w->have_bak) move_file(w->path_bak, w->path_final);
-        c->skip_count++;
-        pthread_mutex_unlock(&c->mutex);
+        IOME_UNLOCK(c);
+        IOME_STAT_INC(c, skip_count);
         free(w->ast);
         w->ast = NULL;
+        free(w->mir_data); w->mir_data = NULL; w->mir_len = 0;
         return 1;
     }
 
@@ -731,18 +799,23 @@ int lr_iome586_commit(LR_Iome586Cache *c, LR_Iome586Writer *w,
     if (w->bc_data && w->bc_len > 0)
         entry_add(&payload, "bytecode", w->bc_data, w->bc_len);
 
+    /* MIR: serialized MIR program for cross-platform codegen cache */
+    if (w->mir_data && w->mir_len > 0)
+        entry_add(&payload, "mir", w->mir_data, w->mir_len);
+
     int rc = -1;
-    pthread_mutex_lock(&c->mutex);
+    IOME_LOCK(c);
     if (!payload.error)
         rc = write_container(c, w->path_final, LR_IOME586_STATUS_ARCHIVED,
                              w->flags, w, gain, payload.data, payload.len);
     if (rc == 0) {
-        c->store_count++;
+        IOME_UNLOCK(c);
+        IOME_STAT_INC(c, store_count);
     } else {
         remove(w->path_final);
         if (w->have_bak) move_file(w->path_bak, w->path_final);
+        IOME_UNLOCK(c);
     }
-    pthread_mutex_unlock(&c->mutex);
 
     free(payload.data);
     free(w->ast);  w->ast = NULL;
@@ -758,19 +831,30 @@ void lr_iome586_set_bytecode(LR_Iome586Writer *w, const uint8_t *data, size_t le
     if (w->bc_data) { memcpy(w->bc_data, data, len); w->bc_len = len; }
 }
 
+void lr_iome586_set_mir(LR_Iome586Writer *w, const uint8_t *data, size_t len)
+{
+    if (!w || !data || !len) return;
+    free(w->mir_data);
+    w->mir_data = (uint8_t *)malloc(len);
+    if (w->mir_data) { memcpy(w->mir_data, data, len); w->mir_len = len; }
+}
+
 void lr_iome586_abort(LR_Iome586Cache *c, LR_Iome586Writer *w)
 {
     if (!w->active) return;
     w->active = 0;
-    pthread_mutex_lock(&c->mutex);
+    IOME_LOCK(c);
     remove(w->path_final);
+    int did_revert = 0;
     if (w->have_bak) {
         move_file(w->path_bak, w->path_final);   /* automatic rollback */
-        c->revert_count++;
+        did_revert = 1;
     }
-    pthread_mutex_unlock(&c->mutex);
+    IOME_UNLOCK(c);
+    if (did_revert) IOME_STAT_INC(c, revert_count);
     free(w->ast); w->ast = NULL;
     free(w->bc_data); w->bc_data = NULL; w->bc_len = 0;
+    free(w->mir_data); w->mir_data = NULL; w->mir_len = 0;
 }
 
 /* ── Load ──────────────────────────────────────────────────────────────── */
@@ -802,7 +886,7 @@ int lr_iome586_load(LR_Iome586Cache *c, const char *script_path,
         archive_path(c, nh, path, sizeof(path), 1);
         fdata = read_all(path, &flen);
     }
-    if (!fdata) { c->miss_count++; return -1; }
+    if (!fdata) { IOME_STAT_INC(c, miss_count); return -1; }
 
     /* Header */
     size_t need = 8 + 4 * 4 + 8 * 4 + 4 * 4;
@@ -892,16 +976,19 @@ int lr_iome586_load(LR_Iome586Cache *c, const char *script_path,
             } else if (!strcmp(name, "bytecode")) {
                 mf->bytecode = malloc(dlen ? dlen : 1);
                 if (mf->bytecode) { memcpy(mf->bytecode, d, dlen); mf->bytecode_len = dlen; }
+            } else if (!strcmp(name, "mir")) {
+                mf->mir_data = malloc(dlen ? dlen : 1);
+                if (mf->mir_data) { memcpy(mf->mir_data, d, dlen); mf->mir_len = dlen; }
             }
         }
     }
     free(raw);
     free(fdata);
 
-    if (!mf->ast) { lr_iome586_manifest_free(mf); c->miss_count++; return -1; }
+    if (!mf->ast) { lr_iome586_manifest_free(mf); IOME_STAT_INC(c, miss_count); return -1; }
 
-    c->hit_count++;
-    c->bytes_loaded += (int64_t)flen;
+    IOME_STAT_INC(c, hit_count);
+    IOME_STAT_ADD(c, bytes_loaded, (int64_t)flen);
     return 0;
 
 stale:
@@ -914,14 +1001,14 @@ stale:
         backup_path(c, nh, bak, sizeof(bak));
         if (move_file(path, bak) != 0) remove(path);
     }
-    c->invalid_count++;
+    IOME_STAT_INC(c, invalid_count);
     lr_iome586_manifest_free(mf);
     return -1;
 
 corrupt:
     free(fdata);
     remove(path);
-    c->invalid_count++;
+    IOME_STAT_INC(c, invalid_count);
     lr_iome586_manifest_free(mf);
     return -1;
 }
@@ -932,6 +1019,7 @@ void lr_iome586_manifest_free(LR_Iome586Manifest *mf)
     free(mf->config);  free(mf->init);   free(mf->state);
     free(mf->ast);     free(mf->nodes);  free(mf->globals);
     free(mf->bytecode);
+    free(mf->mir_data);
     memset(mf, 0, sizeof(*mf));
 }
 
@@ -1028,13 +1116,15 @@ int lr_iome586_revert(LR_Iome586Cache *c, const char *script_path)
     backup_path(c, hash, bak, sizeof(bak));
     archive_path(c, hash, final_p, sizeof(final_p), 0);
 
-    pthread_mutex_lock(&c->mutex);
+    IOME_LOCK(c);
     int rc = -1;
+    int did_revert = 0;
     if (file_exists(bak)) {
-        rc = move_file(bak, final_p);
-        if (rc == 0) c->revert_count++;
+        rc = move_file(bak, final_p) == 0 ? 0 : -1;
+        if (rc == 0) did_revert = 1;
     }
-    pthread_mutex_unlock(&c->mutex);
+    IOME_UNLOCK(c);
+    if (did_revert) IOME_STAT_INC(c, revert_count);
     return rc;
 }
 
@@ -1049,24 +1139,33 @@ void lr_iome586_invalidate(LR_Iome586Cache *c, const char *script_path)
     archive_path(c, hash, p2, sizeof(p2), 0);
     backup_path(c, hash, p3, sizeof(p3));
 
-    pthread_mutex_lock(&c->mutex);
+    IOME_LOCK(c);
     remove(p1); remove(p2); remove(p3);
-    c->invalid_count++;
-    pthread_mutex_unlock(&c->mutex);
+    IOME_UNLOCK(c);
+    IOME_STAT_INC(c, invalid_count);
 }
 
 void lr_iome586_clear(LR_Iome586Cache *c)
 {
-    pthread_mutex_lock(&c->mutex);
-    c->store_count = 0;
-    c->bytes_stored = 0;
-    pthread_mutex_unlock(&c->mutex);
+    IOME_STAT_SET(c, store_count, 0);
+    IOME_STAT_SET(c, bytes_stored, 0);
 }
 
 /* ── Statistics ────────────────────────────────────────────────────────── */
 
 void lr_iome586_stats(LR_Iome586Cache *c, FILE *fp)
 {
+    /* Snapshot all counters atomically */
+    int64_t hits   = IOME_STAT_GET(c, hit_count);
+    int64_t misses = IOME_STAT_GET(c, miss_count);
+    int64_t stores = IOME_STAT_GET(c, store_count);
+    int64_t skips  = IOME_STAT_GET(c, skip_count);
+    int64_t inval  = IOME_STAT_GET(c, invalid_count);
+    int64_t rev    = IOME_STAT_GET(c, revert_count);
+    int64_t bs     = IOME_STAT_GET(c, bytes_stored);
+    int64_t bl     = IOME_STAT_GET(c, bytes_loaded);
+    int64_t bsv    = IOME_STAT_GET(c, bytes_saved);
+
     fprintf(fp, "\n");
     fprintf(fp, "╔══════════════════════════════════════════════════════════════╗\n");
     fprintf(fp, "║  IOME586 Result Cache Statistics                             ║\n");
@@ -1076,20 +1175,295 @@ void lr_iome586_stats(LR_Iome586Cache *c, FILE *fp)
     fprintf(fp, "║  Container:   .lrfile (LZ4 package, hash-keyed)              ║\n");
     fprintf(fp, "╠══════════════════════════════════════════════════════════════╣\n");
     fprintf(fp, "║  Hits:    %10lld    Misses:   %10lld             ║\n",
-            (long long)c->hit_count, (long long)c->miss_count);
+            (long long)hits, (long long)misses);
     fprintf(fp, "║  Stores:  %10lld    Skipped:  %10lld (<15%% gain) ║\n",
-            (long long)c->store_count, (long long)c->skip_count);
+            (long long)stores, (long long)skips);
     fprintf(fp, "║  Invalid: %10lld    Reverts:  %10lld             ║\n",
-            (long long)c->invalid_count, (long long)c->revert_count);
+            (long long)inval, (long long)rev);
     fprintf(fp, "║  Stored:  %10.2f KB  Loaded:   %10.2f KB           ║\n",
-            (double)c->bytes_stored / 1024.0, (double)c->bytes_loaded / 1024.0);
+            (double)bs / 1024.0, (double)bl / 1024.0);
     fprintf(fp, "║  Saved:   %10.2f KB (LZ4)                              ║\n",
-            (double)c->bytes_saved / 1024.0);
+            (double)bsv / 1024.0);
     fprintf(fp, "║  Hit rate: %6.1f%%                                          ║\n",
-            (c->hit_count + c->miss_count) > 0
-              ? 100.0 * (double)c->hit_count /
-                (double)(c->hit_count + c->miss_count)
+            (hits + misses) > 0
+              ? 100.0 * (double)hits / (double)(hits + misses)
               : 0.0);
     fprintf(fp, "╚══════════════════════════════════════════════════════════════╝\n");
     fprintf(fp, "\n");
+}
+
+/* ── Distillation ──────────────────────────────────────────────────────── */
+/* Note: distillation runs inline (no sandbox threads) to avoid
+ * LR_THREAD_LOCAL cached-AST-node issues in the engine's parser. */
+
+void lr_iome586_distill_config_default(LR_DistillConfig *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->max_sandboxes = LR_DISTILL_DEFAULT_SANDBOXES;
+    cfg->max_rounds    = LR_DISTILL_DEFAULT_ROUNDS;
+    cfg->timeout_ms    = 0;
+    cfg->verbose       = 0;
+    cfg->enable_jit    = 1;
+    cfg->use_parallel  = 1;
+}
+
+/* ── Count lines in a source buffer ─────────────────────────────────────── */
+
+static int count_lines(const char *src, size_t len)
+{
+    int n = 1;
+    for (size_t i = 0; i < len; i++) {
+        if (src[i] == '\n') n++;
+    }
+    return n;
+}
+
+/* ── Extract a line range from source (start_line=1-based, inclusive) ──── */
+
+static char *extract_lines(const char *src, size_t src_len,
+                           int start_line, int end_line)
+{
+    if (start_line < 1) start_line = 1;
+    if (end_line < start_line) end_line = start_line;
+
+    /* Find the start position */
+    const char *begin = src;
+    int line = 1;
+    while (line < start_line && (size_t)(begin - src) < src_len) {
+        if (*begin == '\n') line++;
+        begin++;
+    }
+
+    /* Find the end position */
+    const char *end = begin;
+    while (line <= end_line && (size_t)(end - src) < src_len) {
+        if (*end == '\n') line++;
+        end++;
+    }
+
+    size_t out_len = (size_t)(end - begin);
+    char *out = (char *)malloc(out_len + 1);
+    if (!out) return NULL;
+    memcpy(out, begin, out_len);
+    out[out_len] = '\0';
+    return out;
+}
+
+/* ── Distillation analysis ──────────────────────────────────────────────── */
+
+LR_DistillAnalysis *lr_iome586_distill_analyze(LRContext *ctx,
+    const char *source, size_t source_len)
+{
+    (void)ctx;
+    if (!source || !source_len) return NULL;
+
+    LR_DistillAnalysis *analysis = (LR_DistillAnalysis *)
+        calloc(1, sizeof(LR_DistillAnalysis));
+    if (!analysis) return NULL;
+
+    /* Simple line-based analysis: each line is a potential position.
+     * Skip empty lines and comment-only lines. */
+    int max_positions = count_lines(source, source_len);
+    if (max_positions < 1) { free(analysis); return NULL; }
+
+    analysis->positions = (LR_DistillPosition *)
+        calloc((size_t)max_positions, sizeof(LR_DistillPosition));
+    if (!analysis->positions) { free(analysis); return NULL; }
+
+    int pos = 0;
+    const char *p = source;
+    const char *line_start = source;
+    int line = 1;
+    size_t remaining = source_len;
+
+    while (remaining > 0 && pos < max_positions) {
+        /* Find end of line */
+        const char *nl = (const char *)memchr(p, '\n', remaining);
+        size_t line_len = nl ? (size_t)(nl - p) : remaining;
+        int is_blank = 1;
+        for (size_t i = 0; i < line_len; i++) {
+            char ch = line_start[i];
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
+                is_blank = 0;
+                break;
+            }
+        }
+        if (!is_blank) {
+            analysis->positions[pos].line = line;
+            analysis->positions[pos].column = 1;
+            analysis->positions[pos].source_text = (char *)malloc(line_len + 1);
+            if (analysis->positions[pos].source_text) {
+                memcpy(analysis->positions[pos].source_text, line_start, line_len);
+                analysis->positions[pos].source_text[line_len] = '\0';
+            }
+            pos++;
+        }
+        line++;
+        if (nl) {
+            p = nl + 1;
+            line_start = p;
+            remaining = source_len - (size_t)(p - source);
+        } else {
+            break;
+        }
+    }
+
+    analysis->num_positions = pos;
+    return analysis;
+}
+
+void lr_iome586_distill_analysis_free(LR_DistillAnalysis *analysis)
+{
+    if (!analysis) return;
+    for (int32_t i = 0; i < analysis->num_positions; i++) {
+        free(analysis->positions[i].source_text);
+    }
+    free(analysis->positions);
+    free(analysis);
+}
+
+/* ── Run distillation (inline, no sandbox threads) ──────────────────────── */
+
+LR_DistillResult *lr_iome586_distill_run(LR_Runtime *rt,
+    const char *source, size_t source_len,
+    const LR_DistillConfig *config)
+{
+    if (!rt || !source || !source_len) return NULL;
+
+    LR_DistillConfig cfg;
+    if (config) {
+        cfg = *config;
+    } else {
+        lr_iome586_distill_config_default(&cfg);
+    }
+
+    if (cfg.max_rounds < 1) cfg.max_rounds = 1;
+
+    int total_lines = count_lines(source, source_len);
+
+    LR_DistillResult *result = (LR_DistillResult *)
+        calloc(1, sizeof(LR_DistillResult));
+    if (!result) return NULL;
+
+    result->num_rounds = cfg.max_rounds;
+    result->rounds = (LR_DistillRound *)
+        calloc((size_t)cfg.max_rounds, sizeof(LR_DistillRound));
+    if (!result->rounds) {
+        free(result);
+        return NULL;
+    }
+
+    int64_t total_start = lr_get_time_us();
+
+    /* Run each distillation round */
+    for (int r = 0; r < cfg.max_rounds; r++) {
+        int64_t round_start = lr_get_time_us();
+        int num_chunks = cfg.max_sandboxes;
+        if (num_chunks < 1) num_chunks = 1;
+        if (num_chunks > total_lines) num_chunks = total_lines;
+        if (num_chunks < 1) num_chunks = 1;
+
+        int lines_per_chunk = (total_lines + num_chunks - 1) / num_chunks;
+        if (lines_per_chunk < 1) lines_per_chunk = 1;
+
+        if (cfg.verbose) {
+            fprintf(stderr, "[IOME586] Distill round %d/%d: %d chunks, "
+                    "~%d lines/chunk\n",
+                    r + 1, cfg.max_rounds, num_chunks, lines_per_chunk);
+        }
+
+        /* Allocate per-round results */
+        result->rounds[r].num_chunks = num_chunks;
+        result->rounds[r].results = (char **)
+            calloc((size_t)num_chunks, sizeof(char *));
+        result->rounds[r].num_sandboxes = num_chunks;
+
+        /* For each round, shift the chunk boundaries by round * offset */
+        int round_offset = r * (lines_per_chunk / cfg.max_rounds + 1);
+
+        for (int c = 0; c < num_chunks; c++) {
+            int start_line = c * lines_per_chunk + 1 + round_offset;
+            int end_line = (c + 1) * lines_per_chunk + round_offset;
+            if (end_line > total_lines) end_line = total_lines;
+            if (start_line > total_lines) {
+                start_line = total_lines;
+                end_line = total_lines;
+            }
+
+            char *chunk = extract_lines(source, source_len, start_line, end_line);
+            if (!chunk) chunk = strdup("");
+
+            /* Evaluate in the main runtime */
+            int ret = lr_eval(rt, chunk, strlen(chunk), "(distill)");
+            result->rounds[r].results[c] = (ret == 0) ? strdup("(ok)") : strdup("(error)");
+            free(chunk);
+        }
+
+        int64_t round_end = lr_get_time_us();
+        result->rounds[r].elapsed_ms = (double)(round_end - round_start) / 1000.0;
+
+        /* Capture JIT stats if available */
+        if (cfg.enable_jit && rt && rt->lr_rt && rt->lr_rt->jit_runtime) {
+            LRJITRuntime *jit = (LRJITRuntime *)rt->lr_rt->jit_runtime;
+            result->rounds[r].jit_compiles = jit->compile_count;
+            result->rounds[r].jit_bailouts = jit->bailout_count;
+            result->rounds[r].jit_executions = jit->exec_count;
+            result->rounds[r].jit_code_size = jit->total_code_size;
+        }
+
+        if (cfg.verbose) {
+            fprintf(stderr, "[IOME586] Round %d done: %.2f ms\n",
+                    r + 1, result->rounds[r].elapsed_ms);
+        }
+    }
+
+    int64_t total_end = lr_get_time_us();
+    result->total_ms = (double)(total_end - total_start) / 1000.0;
+
+    /* Aggregate JIT stats */
+    if (cfg.enable_jit && rt && rt->lr_rt && rt->lr_rt->jit_runtime) {
+        LRJITRuntime *jit = (LRJITRuntime *)rt->lr_rt->jit_runtime;
+        result->jit_total_compiles = jit->compile_count;
+        result->jit_total_bailouts = jit->bailout_count;
+        result->jit_total_executions = jit->exec_count;
+        result->jit_total_code_size = jit->total_code_size;
+    }
+
+    /* Build combined result from last round */
+    if (cfg.max_rounds > 0 && result->rounds[cfg.max_rounds - 1].num_chunks > 0) {
+        LR_DistillRound *last = &result->rounds[cfg.max_rounds - 1];
+        size_t total = 0;
+        for (int c = 0; c < last->num_chunks; c++) {
+            if (last->results[c])
+                total += strlen(last->results[c]) + 1;
+        }
+        result->combined = (char *)malloc(total + 1);
+        if (result->combined) {
+            result->combined[0] = '\0';
+            for (int c = 0; c < last->num_chunks; c++) {
+                if (last->results[c]) {
+                    if (result->combined[0])
+                        strcat(result->combined, "\n");
+                    strcat(result->combined, last->results[c]);
+                }
+            }
+            result->total_positions = last->num_chunks;
+        }
+    }
+
+    return result;
+}
+
+void lr_iome586_distill_result_free(LR_DistillResult *result)
+{
+    if (!result) return;
+    for (int32_t r = 0; r < result->num_rounds; r++) {
+        for (int32_t c = 0; c < result->rounds[r].num_chunks; c++) {
+            free(result->rounds[r].results[c]);
+        }
+        free(result->rounds[r].results);
+    }
+    free(result->rounds);
+    free(result->combined);
+    free(result);
 }

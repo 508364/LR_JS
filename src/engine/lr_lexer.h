@@ -55,12 +55,12 @@ typedef enum {
     TOK_PRIVATE_NAME,
     TOK_DEBUGGER,
     TOK_ERROR,
-} TokenType;
+} LRTokType;
 
 /* ── Token ────────────────────────────────────────────────────────────── */
 
 typedef struct {
-    TokenType type;
+    LRTokType type;
     const char *start;  /* pointer into source */
     size_t len;
     double num_val;     /* for TOK_NUMBER */
@@ -98,7 +98,7 @@ void lexer_skip(Lexer *lex);
 Token lexer_template_next(Lexer *lex);
 
 /* Utility: get string representation of a token type */
-const char *token_type_name(TokenType type);
+const char *token_type_name(LRTokType type);
 
 /* Free string data allocated in a token */
 void token_free_data(Token *tok);

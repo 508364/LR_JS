@@ -32,6 +32,7 @@ typedef struct LRMapData {
     int32_t     count;
     int32_t     capacity;
     int32_t     iter_count;  /* incremented on modification for iterator invalidation */
+    LRRuntime  *rt;          /* owning engine runtime (for teardown check) */
 } LRMapData;
 
 /* ── Public API ────────────────────────────────────────────────────────── */

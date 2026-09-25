@@ -42,7 +42,7 @@ struct LR_Scheduler {
     LR_ThreadPool    *pool;            /* Thread pool for execution */
     LR_SchedTask     *task_head;       /* Priority queue of scheduled tasks */
     int               next_task_id;
-    int               running;
+    volatile int      running;
 
     /* Stats */
     int64_t           tasks_scheduled;
@@ -50,6 +50,7 @@ struct LR_Scheduler {
     int64_t           tasks_dropped;
 
     pthread_mutex_t   mutex;
+    pthread_cond_t    sched_cond;      /* Signals when new tasks are scheduled */
 };
 
 /* ── API ───────────────────────────────────────────────────────────────── */

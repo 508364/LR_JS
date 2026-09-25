@@ -140,7 +140,6 @@ static int32_t set_hash_value(LRContext *ctx, LRValue val)
 
 static LRSetData *set_data_new(LRContext *ctx)
 {
-    (void)ctx;
     LRSetData *sd = (LRSetData *)calloc(1, sizeof(LRSetData));
     if (!sd) return NULL;
     sd->capacity = SET_INITIAL_CAPACITY;
@@ -151,6 +150,7 @@ static LRSetData *set_data_new(LRContext *ctx)
     }
     sd->count = 0;
     sd->iter_count = 0;
+    sd->rt = ctx ? ctx->rt : NULL;
     return sd;
 }
 
@@ -166,14 +166,22 @@ static void set_data_free(LRContext *ctx, LRSetData *sd)
     free(sd);
 }
 
-/* Wrapper for opaque_free callback - called during final cleanup */
+/* Wrapper for opaque_free callback - called during final cleanup.
+ * See lr_map_free_opaque for the tearing_down rationale. */
 void lr_set_free_opaque(void *opaque)
 {
     LRSetData *sd = (LRSetData *)opaque;
     if (!sd) return;
-    for (int32_t i = 0; i < sd->capacity; i++) {
-        if (sd->entries[i].alive) {
-            lr_free_value(NULL, sd->entries[i].value);
+    if (!(sd->rt && sd->rt->tearing_down)) {
+        /* Use the first context from the runtime to properly free values,
+         * so that strings are released via lr_string_free (which clears
+         * the small-string cache) and not via free() directly (which would
+         * leave dangling cache entries and cause heap-use-after-free). */
+        LRContext *ctx = sd->rt ? sd->rt->ctx_list : NULL;
+        for (int32_t i = 0; i < sd->capacity; i++) {
+            if (sd->entries[i].alive) {
+                lr_free_value(ctx, sd->entries[i].value);
+            }
         }
     }
     free(sd->entries);
@@ -245,6 +253,7 @@ typedef struct LRSetIteratorData {
     int32_t    index;       /* Current index in the hash table */
     int32_t    iter_count;  /* Snapshot of iter_count at creation */
     int32_t    kind;        /* 0=keys/values, 1=entries */
+    LRRuntime *rt;          /* engine runtime (for teardown-safe freeing) */
 } LRSetIteratorData;
 
 static LRSetIteratorData *set_iterator_data_new(LRContext *ctx, LRValue set_obj, int32_t kind)
@@ -254,6 +263,7 @@ static LRSetIteratorData *set_iterator_data_new(LRContext *ctx, LRValue set_obj,
     it->set_obj = lr_dup_value(ctx, set_obj);
     it->index = 0;
     it->kind = kind;
+    it->rt = ctx ? ctx->rt : NULL;
 
     LRSetData *sd = (LRSetData *)lr_get_opaque(set_obj);
     it->iter_count = sd ? sd->iter_count : 0;
@@ -265,6 +275,27 @@ static void set_iterator_data_free(LRContext *ctx, LRSetIteratorData *it)
     if (!it) return;
     lr_free_value(ctx, it->set_obj);
     free(it);
+}
+
+/* opaque_free callback for the iterator object.  During runtime teardown the
+ * set object may already have been freed by the obj_list walk, so we must not
+ * release our saved reference then (avoid use-after-free / double-free). */
+static void set_iterator_opaque_free(void *p)
+{
+    LRSetIteratorData *it = (LRSetIteratorData *)p;
+    if (!it) return;
+    if (it->rt && !it->rt->tearing_down) {
+        lr_free_value(NULL, it->set_obj);
+    }
+    free(it);
+}
+
+/* Symbol.iterator on a Set iterator returns itself (so spread / for-of work) */
+static LRValue js_set_iterator_symbol_iter(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    return lr_dup_value(ctx, this_val);
 }
 
 static LRValue js_set_iterator_next(JSContext *ctx, JSValueConst this_val,
@@ -340,13 +371,17 @@ static LRValue create_set_iterator(JSContext *ctx, LRValue this_val, int32_t kin
         return iter_obj;
     }
 
-    /* Store iterator data in opaque */
-    lr_set_opaque(iter_obj, it);
+    /* Store iterator data in opaque (releasing the set ref on destruction) */
+    lr_set_opaque_with_free(iter_obj, it, set_iterator_opaque_free);
 
     /* Add next method */
     LRValue next_fn = lr_new_cfunction(ctx, js_set_iterator_next, "next", 0);
-    lr_set_property_str(ctx, iter_obj, "next", next_fn);
-    lr_free_value(ctx, next_fn);
+    lr_set_property_str(ctx, iter_obj, "next", next_fn);  /* takes ownership */
+
+    /* Make the iterator itself iterable (spread / for-of) */
+    LRValue iter_fn = lr_new_cfunction(ctx, js_set_iterator_symbol_iter,
+                                       "Symbol.iterator", 0);
+    lr_set_property_str(ctx, iter_obj, "Symbol.iterator", iter_fn);
 
     return iter_obj;
 }
@@ -682,6 +717,7 @@ void lr_set_init(struct LR_Runtime *rt)
         JS_CFUNC_DEF("values", 0, js_set_values),
         JS_CFUNC_DEF("entries", 0, js_set_entries),
         JS_CFUNC_DEF("forEach", 2, js_set_forEach),
+        JS_CFUNC_DEF("Symbol.iterator", 0, js_set_values),
     };
 
     JS_SetPropertyFunctionList(ctx, set_proto,

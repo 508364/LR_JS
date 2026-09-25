@@ -121,20 +121,26 @@ typedef struct LR_Iome586Cache {
     char           **baseline_names;
     uint32_t         baseline_count;
 
-    /* Statistics */
-    int64_t          hit_count;
-    int64_t          miss_count;
-    int64_t          store_count;
-    int64_t          skip_count;     /* archives discarded by the 15% rule */
-    int64_t          invalid_count;  /* stale / corrupt archives dropped */
-    int64_t          revert_count;
-    int64_t          bytes_stored;
-    int64_t          bytes_loaded;
-    int64_t          bytes_saved;    /* saved by LZ4 */
+    /* Statistics — accessed via atomic ops, no lock required */
+    volatile int64_t  hit_count;
+    volatile int64_t  miss_count;
+    volatile int64_t  store_count;
+    volatile int64_t  skip_count;     /* archives discarded by the 15% rule */
+    volatile int64_t  invalid_count;  /* stale / corrupt archives dropped */
+    volatile int64_t  revert_count;
+    volatile int64_t  bytes_stored;
+    volatile int64_t  bytes_loaded;
+    volatile int64_t  bytes_saved;    /* saved by LZ4 */
 
-    pthread_mutex_t  mutex;
-    LR_Runtime      *runtime;
-} LR_Iome586Cache;
+    /* ── CAS-based spinlock ──────────────────────────────────────────────
+     * Replaces the former pthread_rwlock + pthread_mutex.  Statistics are
+     * updated via atomic fetch-add and never touch the spinlock.  Only file
+     * I/O critical sections (store / abort / invalidate) acquire it, and
+     * they do so with a CAS spin that stays in user space — no kernel
+     * context switch for the (very short) critical sections.                */
+    volatile int32_t  spinlock;
+    LR_Runtime       *runtime;
+} LR_CACHE_ALIGNED LR_Iome586Cache;
 
 /* ── Loaded manifest (fully restorable view of an archive) ──────────────── */
 
@@ -162,6 +168,7 @@ typedef struct LR_Iome586Manifest {
     uint8_t  *nodes;    size_t nodes_len;
     uint8_t  *globals;  size_t globals_len;
     uint8_t  *bytecode; size_t bytecode_len;
+    uint8_t  *mir_data;   size_t mir_len;      /* cross-platform MIR cache (optional) */
 } LR_Iome586Manifest;
 
 /* ── Two-phase writer (write-while-running) ─────────────────────────────── */
@@ -182,6 +189,8 @@ typedef struct LR_Iome586Writer {
     size_t    ast_len;
     uint8_t  *bc_data;        /* serialized bytecode (set before commit) */
     size_t    bc_len;
+    uint8_t  *mir_data;       /* serialized MIR cache (set before commit) */
+    size_t    mir_len;
 } LR_Iome586Writer;
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
@@ -234,6 +243,9 @@ int  lr_iome586_commit(LR_Iome586Cache *c, LR_Iome586Writer *w,
 /* Store bytecode for the current writer (call after compilation, before commit). */
 void lr_iome586_set_bytecode(LR_Iome586Writer *w, const uint8_t *data, size_t len);
 
+/* Store serialized MIR for the current writer (call after JIT compile, before commit). */
+void lr_iome586_set_mir(LR_Iome586Writer *w, const uint8_t *data, size_t len);
+
 /* Abort a begun archive: removes the WRITING file and restores the previous
  * archive from ".bak" if one existed (automatic rollback). */
 void lr_iome586_abort(LR_Iome586Cache *c, LR_Iome586Writer *w);
@@ -253,5 +265,102 @@ void lr_iome586_clear(LR_Iome586Cache *c);
 
 uint64_t lr_iome586_hash64(const uint8_t *data, size_t len);
 uint32_t lr_iome586_crc32(const uint8_t *data, size_t len);
+
+/* ── Distillation (Parallel Sandbox Pipeline) ─────────────────────────────
+ *
+ * IOME586 distillation enables parallel execution of script chunks across
+ * multiple sandboxed runtimes.  The pipeline:
+ *
+ *   1. Parse the script and count top-level statements.
+ *   2. Divide the source into N work chunks (by line, roughly even).
+ *   3. Spawn sandboxes; each evaluates one chunk in parallel.
+ *   4. Collect per-chunk results into a shared result set.
+ *   5. Optionally repeat for multiple rounds (default 3), each round
+ *      splitting the work differently to explore more parallelism.
+ *
+ * The metaphor: "a group of people circling an engine, each installing
+ * their part, then moving to the next section."
+ * ──────────────────────────────────────────────────────────────────────── */
+
+#define LR_DISTILL_DEFAULT_SANDBOXES  16
+#define LR_DISTILL_DEFAULT_ROUNDS      3
+#define LR_DISTILL_MAX_SANDBOXES      64
+
+/* Per-position analysis result */
+typedef struct LR_DistillPosition {
+    int32_t  line;              /* source line (1-based) */
+    int32_t  column;            /* source column */
+    char    *source_text;        /* extracted source text (caller frees) */
+} LR_DistillPosition;
+
+/* Analysis: the set of parallelizable positions found in a script */
+typedef struct LR_DistillAnalysis {
+    int32_t             num_positions;
+    LR_DistillPosition *positions;
+} LR_DistillAnalysis;
+
+/* One round of distillation */
+typedef struct LR_DistillRound {
+    int32_t  num_chunks;
+    char   **results;           /* per-chunk result strings (caller frees each) */
+    double   elapsed_ms;        /* round wall-clock time */
+    int32_t  num_sandboxes;     /* sandboxes used this round */
+    /* JIT stats for this round */
+    int      jit_compiles;      /* number of JIT compilations */
+    int      jit_bailouts;      /* number of bailouts */
+    int      jit_executions;    /* number of JIT native executions */
+    size_t   jit_code_size;     /* total native code bytes */
+} LR_DistillRound;
+
+/* Complete distillation result (aggregated across rounds) */
+typedef struct LR_DistillResult {
+    int32_t          num_rounds;
+    LR_DistillRound *rounds;
+    char            *combined;       /* all chunks concatenated (last round) */
+    double           total_ms;
+    int32_t          total_positions;
+    /* Aggregate JIT stats */
+    int              jit_total_compiles;
+    int              jit_total_bailouts;
+    int              jit_total_executions;
+    size_t           jit_total_code_size;
+} LR_DistillResult;
+
+/* Distillation configuration */
+typedef struct LR_DistillConfig {
+    int32_t  max_sandboxes;     /* max parallel sandboxes (default 16) */
+    int32_t  max_rounds;        /* distillation rounds (default 3) */
+    int32_t  timeout_ms;        /* per-sandbox timeout (0 = no limit) */
+    int      verbose;           /* print progress to stderr */
+    int      enable_jit;        /* 1 = enable JIT with results caching (default 1) */
+    int      use_parallel;      /* 1 = parallel sandbox execution (default 1) */
+} LR_DistillConfig;
+
+/* ── Distillation API ──────────────────────────────────────────────────── */
+
+/* Analyse a script and return the parallelisable positions found.
+ * Returns NULL on parse failure.  Caller must free with
+ * lr_iome586_distill_analysis_free(). */
+LR_DistillAnalysis *lr_iome586_distill_analyze(LRContext *ctx,
+    const char *source, size_t source_len);
+
+/* Free an analysis result. */
+void lr_iome586_distill_analysis_free(LR_DistillAnalysis *analysis);
+
+/* Run distillation on a script.
+ *   rt      – the main runtime (used for sandbox creation, timeout, logging)
+ *   source  – the JS source text
+ *   config  – distillation parameters (NULL = use defaults)
+ * Returns NULL on error.  Caller must free with
+ * lr_iome586_distill_result_free(). */
+LR_DistillResult *lr_iome586_distill_run(LR_Runtime *rt,
+    const char *source, size_t source_len,
+    const LR_DistillConfig *config);
+
+/* Free a distillation result. */
+void lr_iome586_distill_result_free(LR_DistillResult *result);
+
+/* Fill a config with default values. */
+void lr_iome586_distill_config_default(LR_DistillConfig *cfg);
 
 #endif /* LR_IOME586_H */

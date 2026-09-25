@@ -15,10 +15,15 @@
 #include "../src/lr_runtime.h"
 #include "../src/lr_thread_pool.h"
 #include "../src/engine/lr_engine.h"
+#include "lr_jit.h"
 
 /* ── Global runtime for signal handling ────────────────────────────────── */
 
 static LR_Runtime *g_rt = NULL;
+
+/* Global debug verbosity switch, defined in the JIT runtime.  Set to 1 when
+ * --debug is passed so internal JIT/MIR diagnostics are emitted. */
+extern int g_lr_debug;
 
 static void sigint_handler(int sig)
 {
@@ -173,6 +178,7 @@ int main(int argc, char *argv[])
     int print_gc_stats = 0;
     int print_bytecode_stats = 0;
     int print_debug_info = 0;
+    int no_jit = 0;
     const char *bytecode_cache_dir = NULL;
     const char *iome586_revert_script = NULL;
     int iome586_no_strings = 0;
@@ -281,6 +287,9 @@ int main(int argc, char *argv[])
         } else if (strcmp(argv[i], "--debug") == 0) {
             cfg.log_level = LR_LOG_DEBUG;
             print_debug_info = 1;
+            g_lr_debug = 1;
+        } else if (strcmp(argv[i], "--no-jit") == 0) {
+            no_jit = 1;
         } else if (strcmp(argv[i], "--stack-size") == 0) {
             if (i + 1 < argc) {
                 cfg.max_stack_size = (size_t)atoll(argv[++i]);
@@ -316,6 +325,11 @@ int main(int argc, char *argv[])
     if (iome586_restore_globals)
         g_rt->iome586.restore_globals = 1;
 
+    /* Disable JIT (--no-jit) */
+    if (no_jit && g_rt && g_rt->lr_rt && g_rt->lr_rt->jit_runtime) {
+        lr_jit_set_enabled((LRJITRuntime *)g_rt->lr_rt->jit_runtime, 0);
+    }
+
     /* Debug info dump (--debug) */
     if (print_debug_info) {
         printf("[debug] version=%s\n", LR_JS_VERSION_STRING);
@@ -345,6 +359,17 @@ int main(int argc, char *argv[])
             lr_socket_cleanup();
             return rc == 0 ? 0 : 1;
         }
+    }
+
+    /* Expose runtime metadata to JS global scope */
+    {
+        JSContext *jsctx = g_rt->lr_ctx;
+        JSValue global = JS_GetGlobalObject(jsctx);
+        JS_SetPropertyStr(jsctx, global, "lr_js_version",
+            JS_NewString(jsctx, LR_JS_VERSION_STRING));
+        JS_SetPropertyStr(jsctx, global, "__LR_PARALLEL_THREADS__",
+            JS_NewInt32(jsctx, parallel_threads));
+        JS_FreeValue(jsctx, global);
     }
 
     if (eval_code) {

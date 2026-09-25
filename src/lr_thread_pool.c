@@ -59,12 +59,19 @@ int lr_shared_results_append(LR_SharedResults *sr, const char *str) {
     int idx = LR_ATOMIC_INC((volatile int32_t *)&sr->write_idx) - 1;
     if (idx >= sr->capacity) return -1;
     sr->entries[idx] = str ? strdup(str) : NULL;
+    /* Update count after the entry is fully written (store barrier ensures ordering) */
+    lr_memory_barrier();
+    LR_ATOMIC_INC((volatile int32_t *)&sr->count);
     return idx;
 }
 
 void lr_shared_results_free(LR_SharedResults *sr) {
     if (!sr) return;
-    for (int i = 0; i < sr->write_idx && i < sr->capacity; i++)
+    /* Take a snapshot of write_idx to avoid races with concurrent writers.
+     * The memory barrier ensures we see all entries up to the snapshot point. */
+    lr_memory_barrier();
+    int n = sr->write_idx < sr->capacity ? sr->write_idx : sr->capacity;
+    for (int i = 0; i < n; i++)
         free(sr->entries[i]);
     free(sr->entries);
     free(sr);
@@ -89,6 +96,9 @@ static void *lr_worker_thread(void *arg)
     }
 
     while (!w->should_stop) {
+        /* Acquire barrier: ensure we see the latest should_stop write */
+        lr_read_barrier();
+
         /* Try to pop a task from the lock-free queue (non-blocking) */
         LR_LFQNode *node = lr_lfq_pop(&w->task_queue);
 
@@ -140,8 +150,8 @@ static void *lr_worker_thread(void *arg)
             }
 
             int64_t elapsed = get_time_us() - start;
-            w->tasks_completed++;
-            w->total_exec_time_us += elapsed;
+            lr_atomic_fetch_add_64((volatile int64_t *)&w->tasks_completed, 1);
+            lr_atomic_fetch_add_64((volatile int64_t *)&w->total_exec_time_us, elapsed);
 
             /* Store result */
             task->result_code = result;
@@ -155,14 +165,63 @@ static void *lr_worker_thread(void *arg)
                 task->on_complete(task->userdata, result, err);
             }
 
+            /* Notify completion: decrement global pending counter.
+             * If it reaches zero, signal waiters. */
+            LR_ThreadPool *pool_ptr = (LR_ThreadPool *)w->pool;
+            if (pool_ptr) {
+                int64_t rem = lr_atomic_fetch_add_64(
+                    (volatile int64_t *)&pool_ptr->tasks_pending, -1) - 1;
+                if (rem == 0) {
+                    pthread_mutex_lock(&pool_ptr->done_mutex);
+                    pthread_cond_signal(&pool_ptr->done_cond);
+                    pthread_mutex_unlock(&pool_ptr->done_mutex);
+                }
+            }
+
             lr_task_free(task);
         } else {
-            /* Queue is empty, sleep until signaled */
-            pthread_mutex_lock(&w->signal_mutex);
-            if (!w->should_stop && lr_lfq_is_empty(&w->task_queue)) {
-                pthread_cond_wait(&w->signal_cond, &w->signal_mutex);
+            /* ── Work-stealing: try to steal from neighbours ──────────────
+             * Before going to sleep, probe up to 2 neighbours in random
+             * order.  This mitigates load imbalance without O(n) overhead.
+             * We first check the global pending counter to avoid pointless
+             * stealing when there's no work anywhere.                       */
+            LR_ThreadPool *pool = (LR_ThreadPool *)w->pool;
+            int stolen = 0;
+            if (pool && pool->num_workers > 1 &&
+                lr_atomic_load_64((volatile int64_t *)&pool->tasks_pending) > 0) {
+                /* Probe up to 2 victims (pseudo-random offset) */
+                unsigned probe = (unsigned)(w->worker_id * 2654435761u);
+                int n = pool->num_workers;
+                int max_probe = n < 3 ? n : 2;
+                for (int i = 0; i < max_probe; i++) {
+                    int victim_id = (int)((probe + i) % n);
+                    if (victim_id == w->worker_id) continue;
+                    LR_Worker *victim = pool->workers[victim_id];
+                    if (!victim || !victim->running) continue;
+
+                    LR_LFQNode *stolen_node = lr_lfq_pop(&victim->task_queue);
+                    if (stolen_node) {
+                        lr_lfq_push(&w->task_queue, stolen_node);
+                        lr_atomic_fetch_add_64(
+                            (volatile int64_t *)&pool->steal_attempts, 1);
+                        lr_atomic_fetch_add_64(
+                            (volatile int64_t *)&pool->steal_successes, 1);
+                        stolen = 1;
+                        break;
+                    }
+                    lr_atomic_fetch_add_64(
+                        (volatile int64_t *)&pool->steal_attempts, 1);
+                }
             }
-            pthread_mutex_unlock(&w->signal_mutex);
+
+            if (!stolen) {
+                /* Queue is empty and stealing failed, sleep until signaled */
+                pthread_mutex_lock(&w->signal_mutex);
+                if (!w->should_stop && lr_lfq_is_empty(&w->task_queue)) {
+                    pthread_cond_wait(&w->signal_cond, &w->signal_mutex);
+                }
+                pthread_mutex_unlock(&w->signal_mutex);
+            }
         }
     }
 
@@ -172,6 +231,8 @@ static void *lr_worker_thread(void *arg)
         w->runtime = NULL;
     }
 
+    /* Release barrier: ensure all prior writes are visible before setting running=0 */
+    lr_write_barrier();
     w->running = 0;
     return NULL;
 }
@@ -188,13 +249,18 @@ LR_ThreadPool *lr_thread_pool_create(int num_workers)
 
     pool->num_workers = num_workers;
     pool->running = 1;
+    pool->round_robin_idx = 0;
+    pool->next_task_id = 1;
     pool->workers = calloc((size_t)num_workers, sizeof(LR_Worker *));
     if (!pool->workers) {
         free(pool);
         return NULL;
     }
 
-    pthread_mutex_init(&pool->id_mutex, NULL);
+    /* Initialize completion notification */
+    pthread_mutex_init(&pool->done_mutex, NULL);
+    pthread_cond_init(&pool->done_cond, NULL);
+    pool->tasks_pending = 0;
 
     /* Create worker threads */
     pthread_attr_t attr;
@@ -205,6 +271,7 @@ LR_ThreadPool *lr_thread_pool_create(int num_workers)
         pool->workers[i] = calloc(1, sizeof(LR_Worker));
         LR_Worker *w = pool->workers[i];
         w->worker_id = i;
+        w->pool = pool;
         w->running = 1;
         w->should_stop = 0;
 
@@ -240,16 +307,17 @@ static void lr_thread_pool_enqueue(LR_Worker *w, LR_Task *task)
 
 int lr_thread_pool_submit(LR_ThreadPool *pool, LR_Task *task)
 {
-    if (!pool || !task || !pool->running) return -1;
+    if (!pool || !task) return -1;
+    /* Acquire barrier: ensure we see the latest running flag */
+    lr_read_barrier();
+    if (!pool->running) return -1;
 
-    /* Round-robin distribution */
-    pthread_mutex_lock(&pool->id_mutex);
-    task->task_id = pool->next_task_id++;
+    /* Round-robin distribution — all atomic, no mutex */
+    task->task_id = lr_atomic_fetch_add_32(&pool->next_task_id, 1);
     task->submit_time_us = get_time_us();
-    int idx = pool->round_robin_idx;
-    pool->round_robin_idx = (pool->round_robin_idx + 1) % pool->num_workers;
-    pool->tasks_submitted++;
-    pthread_mutex_unlock(&pool->id_mutex);
+    int idx = lr_atomic_fetch_add_32(&pool->round_robin_idx, 1) % pool->num_workers;
+    lr_atomic_fetch_add_64((volatile int64_t *)&pool->tasks_submitted, 1);
+    lr_atomic_fetch_add_64((volatile int64_t *)&pool->tasks_pending, 1);
 
     lr_thread_pool_enqueue(pool->workers[idx], task);
     return task->task_id;
@@ -257,14 +325,17 @@ int lr_thread_pool_submit(LR_ThreadPool *pool, LR_Task *task)
 
 int lr_thread_pool_submit_to(LR_ThreadPool *pool, int worker_id, LR_Task *task)
 {
-    if (!pool || !task || !pool->running) return -1;
+    if (!pool || !task) return -1;
+    /* Acquire barrier: ensure we see the latest running flag */
+    lr_read_barrier();
+    if (!pool->running) return -1;
     if (worker_id < 0 || worker_id >= pool->num_workers) return -1;
 
-    pthread_mutex_lock(&pool->id_mutex);
-    task->task_id = pool->next_task_id++;
+    /* Atomic task ID assignment — no mutex */
+    task->task_id = lr_atomic_fetch_add_32(&pool->next_task_id, 1);
     task->submit_time_us = get_time_us();
-    pool->tasks_submitted++;
-    pthread_mutex_unlock(&pool->id_mutex);
+    lr_atomic_fetch_add_64((volatile int64_t *)&pool->tasks_submitted, 1);
+    lr_atomic_fetch_add_64((volatile int64_t *)&pool->tasks_pending, 1);
 
     lr_thread_pool_enqueue(pool->workers[worker_id], task);
     return task->task_id;
@@ -274,21 +345,19 @@ void lr_thread_pool_wait_all(LR_ThreadPool *pool)
 {
     if (!pool) return;
 
-    /* Wait until all queues are empty */
-    for (int i = 0; i < pool->num_workers; i++) {
-        LR_Worker *w = pool->workers[i];
-        if (!w || !w->running) continue;
-
-        while (!lr_lfq_is_empty(&w->task_queue)) {
-            lr_sleep_ms(1);  /* 1ms sleep */
-        }
+    pthread_mutex_lock(&pool->done_mutex);
+    while (lr_atomic_load_64((volatile int64_t *)&pool->tasks_pending) > 0) {
+        pthread_cond_wait(&pool->done_cond, &pool->done_mutex);
     }
+    pthread_mutex_unlock(&pool->done_mutex);
 }
 
 void lr_thread_pool_destroy(LR_ThreadPool *pool)
 {
     if (!pool) return;
 
+    /* Release barrier: ensure all prior writes are visible before setting running=0 */
+    lr_write_barrier();
     pool->running = 0;
 
     /* Send terminate tasks to all workers */
@@ -296,6 +365,8 @@ void lr_thread_pool_destroy(LR_ThreadPool *pool)
         LR_Worker *w = pool->workers[i];
         if (!w || !w->running) continue;
 
+        /* Release barrier: ensure all prior writes are visible before setting should_stop */
+        lr_write_barrier();
         w->should_stop = 1;
 
         /* Push a terminate task to wake up the worker */
@@ -335,7 +406,9 @@ void lr_thread_pool_destroy(LR_ThreadPool *pool)
     }
 
     free(pool->workers);
-    pthread_mutex_destroy(&pool->id_mutex);
+    pthread_mutex_destroy(&pool->done_mutex);
+    pthread_cond_destroy(&pool->done_cond);
+    /* next_task_id and round_robin_idx are plain atomics, nothing to destroy */
     free(pool);
 }
 
@@ -354,7 +427,7 @@ void lr_thread_pool_stats(LR_ThreadPool *pool,
         LR_Worker *w = pool->workers[i];
         if (!w) continue;
         pending += lr_lfq_count(&w->task_queue);
-        completed += w->tasks_completed;
+        completed += lr_atomic_load_64((volatile int64_t *)&w->tasks_completed);
     }
 
     if (out_pending) *out_pending = pending;

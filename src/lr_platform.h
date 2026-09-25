@@ -52,6 +52,18 @@
 #define LR_PLATFORM_BSD 0
 #endif
 
+#if defined(__ANDROID__)
+#define LR_PLATFORM_ANDROID 1
+#else
+#define LR_PLATFORM_ANDROID 0
+#endif
+
+#if defined(__OHOS__)
+#define LR_PLATFORM_HONEMONG 1
+#else
+#define LR_PLATFORM_HONEMONG 0
+#endif
+
 /* MSVC compiler detection */
 #if defined(_MSC_VER)
 #define LR_COMPILER_MSVC 1
@@ -82,7 +94,7 @@
 #define vsnprintf _vsnprintf
 #endif
 
-/* POSIX localtime_r/gmtime_r wrappers */
+/* POSIX localtime_r/gmtime_r wrappers (MSVC) */
 static __inline struct tm *localtime_r(const time_t *t, struct tm *result)
 {
     if (localtime_s(result, t) != 0) return NULL;
@@ -132,10 +144,27 @@ static __inline struct tm *gmtime_r(const time_t *t, struct tm *result)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <io.h>
+#include <direct.h>
 #include <process.h>
 #include <sys/stat.h>
 #include <sys/timeb.h>
 #include <intrin.h>
+
+/* POSIX localtime_r/gmtime_r wrappers (MinGW: <time.h> does not declare them
+ * unless _GNU_SOURCE/_POSIX_SOURCE is defined; provide our own for all
+ * Windows compilers). */
+#if !defined(_MSC_VER)
+static __inline struct tm *localtime_r(const time_t *t, struct tm *result)
+{
+    if (localtime_s(result, t) != 0) return NULL;
+    return result;
+}
+static __inline struct tm *gmtime_r(const time_t *t, struct tm *result)
+{
+    if (gmtime_s(result, t) != 0) return NULL;
+    return result;
+}
+#endif
 
 /* Link Windows socket library */
 #pragma comment(lib, "ws2_32.lib")
@@ -149,10 +178,20 @@ static __inline struct tm *gmtime_r(const time_t *t, struct tm *result)
 #define lr_write      _write
 #define lr_lseek      _lseek
 #define lr_ftruncate  _chsize
-#define lr_fstat      _fstat
-#define lr_stat       _stat
 #define lr_unlink     _unlink
 #define lr_access     _access
+
+/* stat/fstat: the CRT *_stat* family takes `struct _stat64i32*` while our
+ * code uses POSIX `struct stat` (layout-identical, but a distinct C type on
+ * MinGW). Provide a type-safe inline wrapper instead of a bare macro. */
+LR_INLINE int lr_stat(const char *path, struct stat *st)
+{
+    return _stat64i32(path, (struct _stat64i32 *)st);
+}
+LR_INLINE int lr_fstat(int fd, struct stat *st)
+{
+    return _fstat64i32(fd, (struct _stat64i32 *)st);
+}
 #ifndef R_OK
 #define R_OK          4
 #endif
@@ -423,6 +462,40 @@ LR_INLINE long lr_get_avail_mem_pages(void)
 
 #endif
 
+/* ── Executable memory (JIT code buffer) ──────────────────────────────────
+ * Allocates RWX memory for generated native code. On POSIX this is a plain
+ * anonymous mmap; on Windows it is VirtualAlloc with PAGE_EXECUTE_READWRITE.
+ * Used by the template JIT (lr_jit.c).                                     */
+
+#if LR_PLATFORM_WINDOWS
+
+LR_INLINE void *lr_mmap_exec(size_t len)
+{
+    return VirtualAlloc(NULL, len, MEM_RESERVE | MEM_COMMIT,
+                        PAGE_EXECUTE_READWRITE);
+}
+
+LR_INLINE int lr_munmap_exec(void *ptr, size_t len)
+{
+    (void)len;
+    return VirtualFree(ptr, 0, MEM_RELEASE) ? 0 : -1;
+}
+
+#else
+
+LR_INLINE void *lr_mmap_exec(size_t len)
+{
+    return mmap(NULL, len, PROT_READ | PROT_WRITE | PROT_EXEC,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+}
+
+LR_INLINE int lr_munmap_exec(void *ptr, size_t len)
+{
+    return munmap(ptr, len);
+}
+
+#endif
+
 /* ── Socket initialization (Winsock) ───────────────────────────────────── */
 
 #if LR_PLATFORM_WINDOWS
@@ -630,6 +703,16 @@ LR_INLINE int64_t lr_atomic_load_64(volatile int64_t *ptr)
     return (int64_t)InterlockedCompareExchange64((volatile LONGLONG *)ptr, 0, 0);
 }
 
+LR_INLINE int64_t lr_atomic_fetch_add_64(volatile int64_t *ptr, int64_t val)
+{
+    return (int64_t)InterlockedExchangeAdd64((volatile LONGLONG *)ptr, (LONGLONG)val);
+}
+
+LR_INLINE void lr_atomic_store_64(volatile int64_t *ptr, int64_t val)
+{
+    InterlockedExchange64((volatile LONGLONG *)ptr, (LONGLONG)val);
+}
+
 #else /* ── GCC/Clang (Linux, macOS, BSD) Atomic Operations ────────────────── */
 
 /* 32-bit CAS */
@@ -729,7 +812,64 @@ LR_INLINE int64_t lr_atomic_load_64(volatile int64_t *ptr)
     return __sync_val_compare_and_swap(ptr, 0, 0);
 }
 
+/* 64-bit fetch-and-add */
+LR_INLINE int64_t lr_atomic_fetch_add_64(volatile int64_t *ptr, int64_t val)
+{
+    return __sync_fetch_and_add(ptr, val);
+}
+
+/* 64-bit atomic store (CAS-based) */
+LR_INLINE void lr_atomic_store_64(volatile int64_t *ptr, int64_t val)
+{
+    __sync_synchronize();
+    *ptr = val;
+    __sync_synchronize();
+}
+
 #endif
+
+/* ── Branch prediction hints ───────────────────────────────────────────────
+ * These wrap __builtin_expect when available, otherwise evaluate to the
+ * condition itself.  Use them on hot paths to help the CPU's branch
+ * predictor fill the pipeline correctly.                                      */
+#if defined(__GNUC__) || defined(__clang__)
+  #define LR_LIKELY(x)   __builtin_expect(!!(x), 1)
+  #define LR_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+  #define LR_LIKELY(x)   (x)
+  #define LR_UNLIKELY(x) (x)
+#endif
+
+/* Shorter aliases for everyday use (wrap in do-while or expression). */
+#define likely(x)   LR_LIKELY(x)
+#define unlikely(x) LR_UNLIKELY(x)
+
+/* ── Cache-line alignment ──────────────────────────────────────────────────
+ * Align hot data structures to a 64-byte cache line boundary so that:
+ *   - frequently-accessed fields are never split across two lines;
+ *   - adjacent structures/different-thread data do not cause false sharing.
+ * LR_CACHE_ALIGNED is a storage-class suffix (place after the `}` of a
+ * struct definition, or after the variable name).
+ * LR_CACHE_PADDED adds a trailing pad to push the struct size to a full
+ * multiple of 64 bytes.                                                       */
+#define LR_CACHE_LINE_SIZE  64
+
+#if defined(__GNUC__) || defined(__clang__)
+  #define LR_CACHE_ALIGNED  __attribute__((aligned(LR_CACHE_LINE_SIZE)))
+  #define LR_ALIGNED(n)     __attribute__((aligned(n)))
+#elif defined(_MSC_VER)
+  #define LR_CACHE_ALIGNED  __declspec(align(LR_CACHE_LINE_SIZE))
+  #define LR_ALIGNED(n)     __declspec(align(n))
+#else
+  #define LR_CACHE_ALIGNED
+  #define LR_ALIGNED(n)
+#endif
+
+/* Convenience: pad a struct to a cache line so adjacent objects live on
+ * different lines.  Use as the LAST member of a struct definition.
+ * Numbered variants allow multiple pads in the same struct.                */
+#define LR_CACHE_PAD   char __cache_pad[LR_CACHE_LINE_SIZE]
+#define LR_CACHE_PAD2  char __cache_pad2[LR_CACHE_LINE_SIZE]
 
 /* ── Convenience macros for common CAS patterns ─────────────────────────── */
 

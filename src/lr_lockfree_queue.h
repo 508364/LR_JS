@@ -107,18 +107,18 @@ LR_INLINE LR_LFQNode *lr_lfq_pop(LR_LFQueue *q)
 
     if (next_next) {
         /* There are more nodes after this one; advance head to next */
-        q->head = next;
+        lr_atomic_store_ptr((volatile void **)&q->head, next);
     } else {
         /* This is the last node; create a new stub so head/tail stay valid
          * even after the caller frees the returned node. */
         LR_LFQNode *new_stub = (LR_LFQNode *)calloc(1, sizeof(LR_LFQNode));
         if (new_stub) {
             new_stub->next = NULL;
-            q->head = new_stub;
-            q->tail = new_stub;
+            lr_atomic_store_ptr((volatile void **)&q->head, new_stub);
+            lr_atomic_store_ptr((volatile void **)&q->tail, new_stub);
         } else {
             /* OOM fallback: advance head anyway (caller must not free) */
-            q->head = next;
+            lr_atomic_store_ptr((volatile void **)&q->head, next);
         }
     }
 
@@ -161,8 +161,8 @@ LR_INLINE LR_LFQNode *lr_lfq_drain(LR_LFQueue *q)
     /* Reset queue to empty */
     LR_LFQNode *new_stub = (LR_LFQNode *)calloc(1, sizeof(LR_LFQNode));
     if (new_stub) {
-        q->head = new_stub;
-        q->tail = new_stub;
+        lr_atomic_store_ptr((volatile void **)&q->head, new_stub);
+        lr_atomic_store_ptr((volatile void **)&q->tail, new_stub);
         lr_atomic_store_32((volatile int32_t *)&q->count, 0);
     }
 

@@ -143,7 +143,6 @@ static int32_t hash_value(LRContext *ctx, LRValue val)
 
 static LRMapData *map_data_new(LRContext *ctx)
 {
-    (void)ctx;
     LRMapData *md = (LRMapData *)calloc(1, sizeof(LRMapData));
     if (!md) return NULL;
     md->capacity = MAP_INITIAL_CAPACITY;
@@ -154,6 +153,7 @@ static LRMapData *map_data_new(LRContext *ctx)
     }
     md->count = 0;
     md->iter_count = 0;
+    md->rt = ctx ? ctx->rt : NULL;
     return md;
 }
 
@@ -170,15 +170,31 @@ static void map_data_free(LRContext *ctx, LRMapData *md)
     free(md);
 }
 
-/* Wrapper for opaque_free callback - called during final cleanup */
+/* Wrapper for opaque_free callback - called during final cleanup.
+ *
+ * When called from lr_runtime_free (md->rt->tearing_down), the runtime is
+ * freeing all objects via its object list.  The map's key/value objects may
+ * have already been freed earlier in the iteration, so we must NOT call
+ * lr_free_value() on them — that would decrement refcounts on already-freed
+ * memory (heap-use-after-free).  The runtime's object-list walk frees every
+ * object, so skipping the release here loses nothing during teardown.
+ * During normal execution (refcount-driven destruction), release them so
+ * the stored dups don't leak. */
 void lr_map_free_opaque(void *opaque)
 {
     LRMapData *md = (LRMapData *)opaque;
     if (!md) return;
-    for (int32_t i = 0; i < md->capacity; i++) {
-        if (md->entries[i].alive) {
-            lr_free_value(NULL, md->entries[i].key);
-            lr_free_value(NULL, md->entries[i].value);
+    if (!(md->rt && md->rt->tearing_down)) {
+        /* Use the first context from the runtime to properly free values,
+         * so that strings are released via lr_string_free (which clears
+         * the small-string cache) and not via free() directly (which would
+         * leave dangling cache entries and cause heap-use-after-free). */
+        LRContext *ctx = md->rt ? md->rt->ctx_list : NULL;
+        for (int32_t i = 0; i < md->capacity; i++) {
+            if (md->entries[i].alive) {
+                lr_free_value(ctx, md->entries[i].key);
+                lr_free_value(ctx, md->entries[i].value);
+            }
         }
     }
     free(md->entries);
@@ -214,6 +230,9 @@ static int map_data_resize(LRContext *ctx, LRMapData *md, int32_t new_capacity)
     return 0;
 }
 
+/* tombstone sentinel: alive=0 with this hash means "deleted slot" */
+#define MAP_TOMBSTONE_HASH ((int32_t)0x80000000)
+
 static int map_data_set(LRContext *ctx, LRMapData *md, LRValue key, LRValue value)
 {
     /* Check load factor and resize if needed */
@@ -225,11 +244,13 @@ static int map_data_set(LRContext *ctx, LRMapData *md, LRValue key, LRValue valu
     int32_t idx = hash & (md->capacity - 1);
     int32_t tombstone = -1;
 
-    while (1) {
-        if (!md->entries[idx].alive) {
-            /* Empty slot or tombstone */
+    for (int32_t i = 0; i < md->capacity; i++) {
+        if (md->entries[idx].hash == MAP_TOMBSTONE_HASH && !md->entries[idx].alive) {
+            /* Tombstone slot — remember it but keep scanning for existing key */
+            if (tombstone < 0) tombstone = idx;
+        } else if (!md->entries[idx].alive) {
+            /* Fresh empty slot */
             if (tombstone < 0) {
-                /* Fresh empty slot */
                 md->entries[idx].key = lr_dup_value(ctx, key);
                 md->entries[idx].value = lr_dup_value(ctx, value);
                 md->entries[idx].hash = hash;
@@ -238,7 +259,6 @@ static int map_data_set(LRContext *ctx, LRMapData *md, LRValue key, LRValue valu
                 md->iter_count++;
                 return 0;
             } else {
-                /* Use tombstone slot */
                 md->entries[tombstone].key = lr_dup_value(ctx, key);
                 md->entries[tombstone].value = lr_dup_value(ctx, value);
                 md->entries[tombstone].hash = hash;
@@ -247,21 +267,18 @@ static int map_data_set(LRContext *ctx, LRMapData *md, LRValue key, LRValue valu
                 md->iter_count++;
                 return 0;
             }
-        }
-        if (md->entries[idx].hash == hash &&
-            same_value_zero(ctx, md->entries[idx].key, key)) {
+        } else if (md->entries[idx].hash == hash &&
+                   same_value_zero(ctx, md->entries[idx].key, key)) {
             /* Update existing entry */
             lr_free_value(ctx, md->entries[idx].value);
             md->entries[idx].value = lr_dup_value(ctx, value);
             return 0;
         }
-        /* Mark first tombstone we encounter */
-        if (tombstone < 0) {
-            /* If this is a tombstone (alive=0 but we already entered the loop
-             * because we check alive first, this path is for alive entries only) */
-        }
         idx = (idx + 1) & (md->capacity - 1);
     }
+
+    /* Should not reach here if load factor is enforced, but guard against it */
+    return -1;
 }
 
 /* ── Map Iterator ──────────────────────────────────────────────────────── */
@@ -271,6 +288,7 @@ typedef struct LRMapIteratorData {
     int32_t    index;       /* Current index in the hash table */
     int32_t    iter_count;  /* Snapshot of iter_count at creation */
     int32_t    kind;        /* 0=keys, 1=values, 2=entries */
+    LRRuntime *rt;          /* engine runtime (for teardown-safe freeing) */
 } LRMapIteratorData;
 
 static LRMapIteratorData *map_iterator_data_new(LRContext *ctx, LRValue map_obj, int32_t kind)
@@ -280,6 +298,7 @@ static LRMapIteratorData *map_iterator_data_new(LRContext *ctx, LRValue map_obj,
     it->map_obj = lr_dup_value(ctx, map_obj);
     it->index = 0;
     it->kind = kind;
+    it->rt = ctx ? ctx->rt : NULL;
 
     LRMapData *md = (LRMapData *)lr_get_opaque(map_obj);
     it->iter_count = md ? md->iter_count : 0;
@@ -291,6 +310,27 @@ static void map_iterator_data_free(LRContext *ctx, LRMapIteratorData *it)
     if (!it) return;
     lr_free_value(ctx, it->map_obj);
     free(it);
+}
+
+/* opaque_free callback for the iterator object.  During runtime teardown the
+ * map object may already have been freed by the obj_list walk, so we must not
+ * release our saved reference then (avoid use-after-free / double-free). */
+static void map_iterator_opaque_free(void *p)
+{
+    LRMapIteratorData *it = (LRMapIteratorData *)p;
+    if (!it) return;
+    if (it->rt && !it->rt->tearing_down) {
+        lr_free_value(NULL, it->map_obj);
+    }
+    free(it);
+}
+
+/* Symbol.iterator on a Map iterator returns itself (so spread / for-of work) */
+static LRValue js_map_iterator_symbol_iter(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    return lr_dup_value(ctx, this_val);
 }
 
 static LRValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
@@ -370,13 +410,17 @@ static LRValue create_map_iterator(JSContext *ctx, LRValue this_val, int32_t kin
         return iter_obj;
     }
 
-    /* Store iterator data in opaque */
-    lr_set_opaque(iter_obj, it);
+    /* Store iterator data in opaque (releasing the map ref on destruction) */
+    lr_set_opaque_with_free(iter_obj, it, map_iterator_opaque_free);
 
     /* Add next method */
     LRValue next_fn = lr_new_cfunction(ctx, js_map_iterator_next, "next", 0);
-    lr_set_property_str(ctx, iter_obj, "next", next_fn);
-    lr_free_value(ctx, next_fn);
+    lr_set_property_str(ctx, iter_obj, "next", next_fn);  /* takes ownership */
+
+    /* Make the iterator itself iterable (spread / for-of) */
+    LRValue iter_fn = lr_new_cfunction(ctx, js_map_iterator_symbol_iter,
+                                       "Symbol.iterator", 0);
+    lr_set_property_str(ctx, iter_obj, "Symbol.iterator", iter_fn);
 
     return iter_obj;
 }
@@ -622,6 +666,7 @@ static LRValue js_map_delete(JSContext *ctx, JSValueConst this_val,
             lr_free_value(ctx, md->entries[idx].value);
             md->entries[idx].key = LR_VALUE_UNDEFINED;
             md->entries[idx].value = LR_VALUE_UNDEFINED;
+            md->entries[idx].hash = MAP_TOMBSTONE_HASH;
             md->entries[idx].alive = 0;
             md->count--;
             md->iter_count++;
@@ -772,6 +817,7 @@ void lr_map_init(struct LR_Runtime *rt)
         JS_CFUNC_DEF("values", 0, js_map_values),
         JS_CFUNC_DEF("entries", 0, js_map_entries),
         JS_CFUNC_DEF("forEach", 2, js_map_forEach),
+        JS_CFUNC_DEF("Symbol.iterator", 0, js_map_entries),
     };
 
     JS_SetPropertyFunctionList(ctx, map_proto,

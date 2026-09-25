@@ -555,6 +555,10 @@ static LRValue lr_worker_constructor(LRContext *ctx, LRValue new_target,
     /* Register in global registry */
     lr_worker_register(wd);
 
+    /* Notify the atomics layer that multi-threaded access is now possible.
+     * This disables the single-threaded fast path in atomics_cas_apply. */
+    g_lr_atomics_has_workers = 1;
+
     /* Start worker thread */
     pthread_attr_t attr;
     pthread_attr_init(&attr);

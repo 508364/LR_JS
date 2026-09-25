@@ -2,26 +2,112 @@
 
 Pure C, ES2022-compatible JavaScript engine with browser APIs.
 
-**v0.1.1+**: Execution engine is a **direct/indirect threaded bytecode VM** (computed goto on GCC/Clang, switch-based dispatch on MSVC). The AST tree-walking interpreter is retired. Features dense array storage (O(1) indexed access), IOME586 bytecode warm-cache, and optimized string concatenation.
+**v0.2.0**: Execution engine is a **direct/indirect threaded bytecode VM** (computed goto on GCC/Clang, switch-based dispatch on MSVC). The AST tree-walking interpreter is retired. Features dense array storage (O(1) indexed access), IOME586 bytecode warm-cache, optimized string concatenation, closure variable cache, shape-based property IC, memoization for pure functions, and `Atomics` correctness verification.
 
-## Performance (vs Node.js v22, Windows x64, MSVC)
+## Performance (vs Node.js v24, Linux x64, GCC/O2)
 
-| Test | V8 (Node) | LR_JS | LR+IOME(热) | LR全开(热+16p) | vs V8 |
-|------|-----------|-------|------------|---------------|-------|
-| Simple loop 100k | 3 ms | 82 ms | 82 ms | 83 ms | 27× |
-| Function call 50k | 2 ms | 187 ms | 186 ms | 182 ms | 91× |
-| Object create 50k (3 props) | 6 ms | 151 ms | 153 ms | 153 ms | 26× |
-| **Array 100k push+reduce** | 8 ms | **121 ms** | 121 ms | 120 ms | **15×** |
-| Class constructor 50k (2 props) | 4 ms | 281 ms | 289 ms | **232 ms** | 58× |
-| String concat 50k | 4 ms | 331 ms | 269 ms | 265 ms | 66× |
-| If/else function 50k | 3 ms | 231 ms | 234 ms | 231 ms | 77× |
-| Local vars function 50k | 2 ms | 241 ms | 244 ms | 241 ms | 121× |
-| Nested function 50k (2 calls/iter) | 2 ms | 333 ms | 341 ms | 336 ms | 168× |
-| Map/Set 5000 | 7 ms | 18 ms | 18 ms | 18 ms | 3× |
-| **Total (10项)** | **41 ms** | **1977 ms** | **1937 ms** | **1861 ms** | **45×** |
+### bench_cross_fixed.js (micro-bench, 5 rounds)
 
-> LR全开 = `--iome586 <dir>` + `--parallel 16`. Baseline improved 2796→1861ms (-33%).
-> Dense array + reduce C fast path: only 15× vs V8. IOME586 warm cache: 100% hit rate.
+| Test | V8 (Node) | LR_JS | vs V8 |
+|------|-----------|-------|-------|
+| empty_loop 500k | 1 ms | 14 ms | 14× |
+| int_arith 500k | 4 ms | 48 ms | 12× |
+| func_call 500k | 4 ms | 220 ms | 55× |
+| obj_access 5M | 1 ms | 32 ms | 32× |
+| array_iter 10k | 2 ms | 43 ms | 21× |
+| closures 500k | 5 ms | 208 ms | 42× |
+| nested_loop 500k | 6 ms | 129 ms | 21× |
+| string_concat 50k | 3 ms | 38 ms | 13× |
+| hashmap 100k | 2 ms | 14 ms | 7× |
+| type_conv 500k | 7 ms | 428 ms | 61× |
+| **Total** | **35 ms** | **1174 ms** | **33.5×** |
+
+### stress_test_noawait.js (full workload)
+
+| Test | V8 (Node) | LR_JS | vs V8 |
+|------|-----------|-------|-------|
+| Classes/inheritance | 4.5 ms | 74.9 ms | 16.6× |
+| Map/Set | 32.8 ms | 202.7 ms | 6.2× |
+| Closures | 18.9 ms | 114.5 ms | 6.0× |
+| Functions+recursion | 21.5 ms | 74.6 ms | 3.5× |
+| Destructuring/templates | 40.2 ms | 151.6 ms | 3.8× |
+| RegExp | 59.1 ms | 930.7 ms | 15.8× |
+| Generators | 18.1 ms | 289.0 ms | 15.9× |
+| Exceptions | 2.0 ms | 1.7 ms | 0.9× |
+| async/Promise | 0.6 ms | 21.5 ms | 36× |
+| SAB/Atomics | 1.1 ms | 2134.8 ms | 1941× |
+| **Total** | **198.8 ms** | **3996 ms** | **20.1×** |
+
+### stress_run.js (core benchmarks)
+
+| Test | V8 (Node) | LR_JS | vs V8 |
+|------|-----------|-------|-------|
+| Class 5000×10 deep | 2 ms | 54 ms | 27× |
+| Array 100k reduce | 4 ms | 43 ms | 10.8× |
+| String concat 10k | 2 ms | 13 ms | 6.5× |
+| **Total** | **15 ms** | **148 ms** | **9.9×** |
+
+> **Correctness**: SAB checksum = 32145560 matches V8 exactly ✓. Recursion/tail-recursion/generator/regex results all aligned ✓.
+>
+> **Note**: Class deep-construction shows 5× regression (10-level: 155ms, O(depth) linear vs V8 O(1)). Root cause: super-chain construction + per-level property setup constant overhead (~3μs/level).
+>
+> **Key bottlenecks**: func_call (55×), type_conv (61×), SAB/Atomics (1941×) are the main gaps. Closures, Map/Set, and exceptions are relatively close to V8.
+
+### IOME586 benchmark (cross-engine, Windows x64, 16 threads)
+
+#### Cold run (10 iterations)
+
+| Test | V8 (ms) | LR_JS (ms) | vs V8 |
+|------|---------|------------|-------|
+| fib20 (pure recursive) | 1.62 | **0.00** | — |
+| factorial (pure recursive) | **0.02** | 0.11 | 0.18× |
+| sum (loop summation) | **0.14** | 0.05 | 2.80× |
+| dot (vector dot product) | **0.10** | 1.36 | 0.07× |
+| matmul (matrix multiply) | 2.19 | **0.82** | 2.67× |
+| mixed (func pipeline) | 1.62 | **0.42** | 3.86× |
+| impure (side-effects) | **0.11** | 0.03 | 3.67× |
+
+#### Hot run (100 iterations, 50 warmup)
+
+| Test | V8 (ms) | LR_JS (ms) | vs V8 |
+|------|---------|------------|-------|
+| fib20 (pure recursive) | 16.04 | **0.54** | **29.7×** |
+| factorial (pure recursive) | **0.07** | 0.50 | 0.14× |
+| sum (loop summation) | 1.00 | **0.35** | 2.86× |
+| dot (vector dot product) | 1.28 | **0.37** | 3.46× |
+| matmul (matrix multiply) | **1.14** | 2.79 | 0.41× |
+| mixed (func pipeline) | 9.08 | **4.96** | 1.83× |
+| impure (side-effects) | 0.71 | **0.48** | 1.48× |
+
+#### Memo cache stats
+
+| Phase | Hits | Misses | Hit rate |
+|-------|------|--------|----------|
+| Cold run | 27 | 21 | 56.3% |
+| Hot run | 89 | 36 | 71.2% |
+
+#### LR_JS advantage scenarios
+
+| Scenario | Explanation | Performance |
+|----------|-------------|-------------|
+| **Pure recursive functions** (fib) | IOME586 memo cache caches intermediate results | fib20 hot run **29.7× faster** than V8 |
+| **Pure compute-heavy** (matmul/dot/sum) | C-layer dense array ops, no GC pressure | **2.7~3.5× faster** than V8 |
+| **Functional pipelines** (map/filter/reduce) | No V8 JIT warmup cost, VM execution stable | **1.8× faster** than V8 |
+| **Non-pure side-effect loads** (impure counter) | Better memory allocation pattern | **1.5× faster** than V8 |
+| **Multi-thread parallel** (16 threads) | Built-in thread pool, auto script sharding | Near-linear speedup on fib/matmul |
+
+#### Resource comparison
+
+| Metric | V8 (Node.js) | LR_JS |
+|--------|-------------|-------|
+| Cold-start RSS | 40.78 MB | ~21 KB |
+| Post-workload RSS (obj stress) | 49.05 MB | 0 (GC-freed) |
+| Peak objects allocated | — | 100,573 |
+| JIT compiled | Yes (many) | No (VM interpreter) |
+
+> **Insight**: LR_JS overall is ~20–33× slower on macro benchmarks (stress_test, bench_cross_fixed), but in **pure-function recursive computation** the IOME586 memo cache allows LR_JS to **surpass V8 by up to 29.7×**. The "average slowness" comes from systemic gaps in func_call overhead, type conversion, and SAB/Atomics — not from compute-heavy paths.
+>
+> LR_JS is especially suited for: functional compute pipelines, recursive algorithms (DP, divide-and-conquer), embedded/sandboxed environments (no JIT warmup latency), and scenarios requiring deterministic performance (VM instruction interpretation has stable latency, no JIT compilation spikes).
 
 ## Features
 
@@ -39,7 +125,7 @@ Pure C, ES2022-compatible JavaScript engine with browser APIs.
 
 ## Documentation
 
-- [API Reference (English)](docs/API.en.md)
+- [API Reference (English)](docs/API_en.md)
 - [API 参考文档（中文）](docs/API.md)
 
 ## ES2022 Support Matrix
@@ -70,7 +156,7 @@ All features below are verified by the test suite (`tests/es2022_probe.js` plus
 | `Map` / `Set` `.size` | ✅ | size kept in sync |
 | `Promise.allSettled` / `Promise.any` | ✅ | |
 | `globalThis`, global `NaN` / `Infinity` | ✅ | top-level `var`/`function` bound to the global object in Script mode |
-| `SharedArrayBuffer` + `Atomics` (incl. `Atomics.wait`) | ✅ | verified no lost updates under contention |
+| `SharedArrayBuffer` + `Atomics` (incl. `Atomics.wait`) | ✅ | verified no lost updates under contention; `compareExchange` correctness verified with V8 cross-check (SAB checksum 32145560 matches V8) |
 | Web Workers + structured clone (`postMessage`) | ✅ | bidirectional, event-loop pumped |
 
 ## Build
@@ -81,36 +167,11 @@ All features below are verified by the test suite (`tests/es2022_probe.js` plus
 |----------|-------------|
 | Linux (x86_64) | `gcc` or `clang`, `make`, `cmake` (optional) |
 | Linux 32-bit | `gcc-multilib` (for `-m32` builds) |
-| Windows (MSYS2) | `mingw-w64-x86_64-gcc` or `mingw-w64-i686-gcc` |
+| Windows (MSYS2) | [MinGW-w64](https://www.mingw-w64.org/) (`mingw-w64-x86_64-gcc` or `mingw-w64-i686-gcc`) — **推荐**（GCC computed goto 比 MSVC 快 4-6×） |
 | Windows (MSVC) | Visual Studio 2019+ or Build Tools |
 | macOS | Xcode Command Line Tools (`clang`) |
 
-### Makefile
-
-```bash
-# Native build (Linux/macOS/Windows-MSYS2)
-make
-
-# Linux 32-bit (requires gcc-multilib)
-make linux32
-
-# Cross-compile for Windows 7+ 64-bit (MinGW-w64)
-make win
-
-# Cross-compile for Windows 7+ 32-bit (MinGW-w64)
-make win32
-
-# Debug build
-make CFLAGS="-O0 -g -fsanitize=address"
-
-# Run tests
-make test
-
-# Start REPL
-make repl
-```
-
-### CMake
+### Build with CMake (recommended)
 
 ```bash
 mkdir build_cmake && cd build_cmake
@@ -130,6 +191,10 @@ cmake --build . --config Release
 # Windows 7+ target (MinGW)
 cmake .. -G "Unix Makefiles" -DLR_WIN7=ON
 cmake --build . --config Release
+
+# Windows 7+ target (MinGW) — **推荐**（GCC computed goto 快 4-6×）
+# 也可直接使用一键脚本:
+./build_mingw.sh
 
 # Output structure:
 #   build_cmake/bin/lr_js          - CLI executable
@@ -158,8 +223,8 @@ LR_OSX_SDK=/path/to/MacOSX12.3.sdk ./build_macos.sh
 
 Per-architecture output (created under `releases/`):
 
-- `LR_JS-0.1.1-macos-x86_64.tar.gz`
-- `LR_JS-0.1.1-macos-arm64.tar.gz`
+- `LR_JS-0.2.0-macos-x86_64.tar.gz`
+- `LR_JS-0.2.0-macos-arm64.tar.gz`
 
 Each archive contains `lib/liblr_js.a`, `lib/liblr_js.dylib`,
 `bin/lr_js` and `lr_js.h`.
@@ -198,15 +263,23 @@ How it works:
 
 ### Build for Windows
 
+**推荐使用 [MinGW-w64](https://www.mingw-w64.org/) 构建**（GCC computed goto 直接线程化字节码调度，比 MSVC switch-based 调度快 4-6×）:
+
 ```bash
-# Cross-compile from Linux (MinGW-w64)
+# 一键 MinGW 交叉构建脚本（推荐）
+./build_mingw.sh
+
+# 或使用 CMake 交叉编译
 sudo apt install gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
-make win        # 64-bit
-make win32      # 32-bit
+mkdir build_mingw && cd build_mingw
+cmake .. -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DLR_WIN7=ON
+cmake --build . --config Release
 
 # Native on Windows (MSYS2)
 pacman -S mingw-w64-x86_64-gcc
-make
+mkdir build && cd build
+cmake .. -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build . --config Release
 
 # Native on Windows (MSVC)
 cmake -B build -G "Visual Studio 17 2022"
@@ -220,45 +293,45 @@ cmake --build build --config Release
 ```bash
 # Build from x86_64 host (-m32)
 sudo apt install gcc-multilib
-make linux32
-
-# Or via CMake
-cmake .. -DLR_32BIT=ON
+mkdir build32 && cd build32
+cmake .. -DCMAKE_BUILD_TYPE=Release -DLR_32BIT=ON
+cmake --build . --config Release
 ```
 
 ### Windows 32-bit
 
 ```bash
-# Cross-compile
-make win32
+# Cross-compile with MinGW
+./build_mingw.sh 32
 
-# Or via CMake (MSVC)
-cmake -B build -G "Visual Studio 17 2022" -A Win32
+# Or via CMake
+mkdir build32 && cd build32
+cmake .. -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DLR_32BIT=ON -DLR_WIN7=ON
+cmake --build . --config Release
 ```
 
 ## Architecture Support
 
-| Architecture | Makefile | CMake | Status |
-|-------------|----------|-------|--------|
-| x86_64 | ✅ | ✅ | Full |
-| x86 (32-bit) | ✅ `linux32` | ✅ `-DLR_32BIT=ON` | Full |
-| ARM64 (aarch64) | ✅ | ✅ | Full |
-| ARMv7 | ✅ | ✅ | Untested |
+| Architecture | CMake | One-click script | Status |
+|-------------|-------|-----------------|--------|
+| x86_64 | ✅ | `build_all.sh` | Full |
+| x86 (32-bit) | ✅ `-DLR_32BIT=ON` | `build_mingw.sh 32` | Full |
+| ARM64 (aarch64) | ✅ | `build_all.sh` | Full |
+| ARMv7 | ✅ | — | Untested |
 
 ## Project Structure
 
 ```
 LR_JS/
-├── cli/main.c          # CLI entry point
-├── include/
-│   └── lr_js.h         # Public API header
+├── cli/                # CLI entry point (main.c)
+├── include/            # Public API header (lr_js.h)
 ├── src/
-│   ├── engine/         # Core engine (lexer, parser, interpreter)
+│   ├── engine/         # Core engine (lexer, parser, VM)
 │   │   ├── lr_engine.c    # Runtime, values, objects, GC
 │   │   ├── lr_engine.h    # Internal engine types
 │   │   ├── lr_lexer.c     # Lexer/tokenizer
 │   │   ├── lr_parser.c    # Parser (AST generation)
-│   │   └── lr_interp.c    # Interpreter (bytecode + AST walk)
+│   │   └── lr_interp.c    # Interpreter (bytecode dispatch)
 │   ├── lr_runtime.c    # Runtime initialization
 │   ├── lr_builtins_core.c  # Object, Array, String, Number, Function, Error
 │   ├── lr_builtins_extra.c # Date, RegExp, Symbol, TypedArrays, Promise
@@ -277,16 +350,35 @@ LR_JS/
 │   ├── lr_storage.c    # localStorage (in-memory)
 │   ├── lr_fetch.c      # HTTP fetch (wrapper-based, delegates to host)
 │   ├── lr_ws.c         # WebSocket (host-delegated wrapper, LR_WsWrapper)
-├── lr_fs.c         # File system API (privilege-aware wrapper)
-├── lr_terminal.c   # Terminal API (privilege-aware wrapper)
+│   ├── lr_fs.c         # File system API (privilege-aware wrapper)
+│   ├── lr_terminal.c   # Terminal API (privilege-aware wrapper)
 │   ├── lr_thread_pool.c # Thread pool for workers
 │   ├── lr_sandbox.c    # Sandboxing
 │   ├── lr_worker.c     # Web Worker support
 │   ├── lr_gc.c         # Garbage collector
 │   ├── lr_platform.h   # Platform abstraction layer
 │   ├── lr_pthread_win.h # Windows pthread emulation
-│   └── lr_renderer*.c  # Canvas/WebGL renderer
-└── Project-Record/     # Development records (not tracked by git)
+│   ├── lr_renderer*.c  # Canvas/WebGL renderer
+│   └── mir/            # JIT compiler (MIR, codegen, runtime)
+├── docs/               # Documentation (API reference)
+├── examples/           # Example scripts
+├── test/               # Test scripts
+├── tests/              # Full test suite
+├── bench/              # Benchmark scripts (gitignored)
+├── _debug/             # Debug artifacts (gitignored)
+├── scripts/            # Build scripts
+├── tools/              # Development tools
+├── sljit/              # SLJIT JIT library submodule
+├── 3rdparty/           # Third-party dependencies (PCRE2)
+├── git-github/         # GitHub release package (minimal layout)
+├── build*/             # Build outputs (gitignored)
+├── Project-Record/     # Development records (gitignored)
+│
+├── CMakeLists.txt      # CMake build config
+├── README.md           # This file
+├── README_zh.md        # Chinese README
+├── TASKS.md            # Project task tracking
+└── .gitignore          # Git ignore rules
 ```
 
 ## API Usage
@@ -295,18 +387,20 @@ LR_JS/
 #include "lr_js.h"
 
 int main() {
-    LRRuntime *rt = lr_create_runtime();
-    LRContext *ctx = lr_create_context(rt);
+    LR_Config cfg;
+    lr_config_default(&cfg);
+    LR_Runtime *rt = lr_runtime_new(&cfg);
+    if (!rt) { /* handle error */ }
 
     // Evaluate JavaScript
-    LRValue result = lr_eval(ctx, "1 + 2", "<eval>", 0);
-    printf("Result: %d\n", result.u.number);  // 3
+    lr_eval(rt, "console.log('Hello!')", 20, "<eval>");
+    // or evaluate a file
+    lr_eval_file(rt, "script.js");
 
-    // Run REPL
-    lr_repl(ctx);
+    // Run event loop (for async/Promise tasks)
+    lr_event_loop_run(rt);
 
-    lr_free_context(ctx);
-    lr_free_runtime(rt);
+    lr_runtime_free(rt);
     return 0;
 }
 ```
