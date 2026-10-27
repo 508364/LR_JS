@@ -1,5 +1,8 @@
 # L/R_JS - Lightweight/Runtime JavaScript Engine
 
+2026-10-27
+This repository has been discontinued.
+
 Pure C, ES2022-compatible JavaScript engine with browser APIs.
 
 **v0.2.0**: Execution engine is a **direct/indirect threaded bytecode VM** (computed goto on GCC/Clang, switch-based dispatch on MSVC). The AST tree-walking interpreter is retired. Features dense array storage (O(1) indexed access), IOME586 bytecode warm-cache, optimized string concatenation, closure variable cache, shape-based property IC, memoization for pure functions, and `Atomics` correctness verification.
